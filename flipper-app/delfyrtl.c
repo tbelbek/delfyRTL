@@ -158,6 +158,12 @@ char message[128];
 static char recon_text[1024];
 static char recon_title[24];
 static bool hop_on = false;
+// E: guided-audit context (written to /ext/delfy/audit.json when a grab finishes)
+static bool audit_mode = false;
+static char audit_ssid[33];
+static char audit_bssid[18];
+static int audit_ch = 0;
+static int audit_sec = 0;
 //Objeto del APP
 
 typedef struct delfyRTL {
@@ -223,6 +229,7 @@ typedef enum {
 #define TOOL_STOP    9
 #define TOOL_DASTOP  10
 #define TOOL_CAPSTOP 11
+#define TOOL_AUDIT   12
 
 typedef enum {
     SsidAPInputSceneSaveEvent,
@@ -312,6 +319,31 @@ static void hs_write_pcap(uint16_t* out_frames) {
     storage_file_free(file);
     furi_record_close(RECORD_STORAGE);
     if(out_frames) *out_frames = written;
+}
+
+// E: write a small audit summary next to the capture.
+static void audit_write_json(const char* kind, int frames) {
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    storage_common_mkdir(st, "/ext/delfy");
+    File* f = storage_file_alloc(st);
+    if(storage_file_open(f, "/ext/delfy/audit.json", FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        char buf[256];
+        int n = snprintf(
+            buf,
+            sizeof(buf),
+            "{\"ssid\":\"%s\",\"bssid\":\"%s\",\"channel\":%d,\"security\":%d,\"kind\":\"%s\",\"frames\":%d}\n",
+            audit_ssid,
+            audit_bssid,
+            audit_ch,
+            audit_sec,
+            kind,
+            frames);
+        storage_file_write(f, buf, n);
+        storage_file_close(f);
+    }
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+    audit_mode = false;
 }
 
 static void listed_wifis_item_callback(void* context, uint32_t index);
@@ -919,9 +951,33 @@ static void delfy_start_pmkid(delfyRTL* app, bool grab) {
     scene_manager_next_scene(app->scene_manager, popupScene);
 }
 
+// E: guided audit for the selected AP — grab + write /ext/delfy/audit.json.
+static void delfy_start_audit(delfyRTL* app) {
+    int ch;
+    char hex[13];
+    delfy_sel_ap(app, &ch, hex);
+    audit_mode = true;
+    audit_ch = ch;
+    audit_sec = 0;
+    audit_ssid[0] = '\0';
+    audit_bssid[0] = '\0';
+    if(app->selectedWifi >= 0 && app->selectedWifi < app->wifiCount) {
+        strncpy(audit_ssid, app->wifiList[app->selectedWifi].APssid, sizeof(audit_ssid) - 1);
+        strncpy(audit_bssid, app->wifiList[app->selectedWifi].APbssid, sizeof(audit_bssid) - 1);
+        audit_sec = app->wifiList[app->selectedWifi].security;
+    }
+    recon_text[0] = '\0';
+    snprintf(recon_title, sizeof(recon_title), "Audit");
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "HSGRAB %d %s 20\n", ch, hex[0] ? hex : "FFFFFFFFFFFF");
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    snprintf(message, sizeof(message), "Audit ch %d...", ch);
+    snprintf(popupHeader, sizeof(popupHeader), "Audit");
+    scene_manager_next_scene(app->scene_manager, popupScene);
+}
+
 // A: capability check from the board's IDENT. Unknown/old fw -> permissive.
-static bool delfy_has_cap(delfyRTL* app, char cap) {
-    if(app->fw_caps[0] == '\0') return true;
+static bool delfy_has_cap(delfyRTL* app, char cap) {    if(app->fw_caps[0] == '\0') return true;
     return strchr(app->fw_caps, cap) != NULL;
 }
 
@@ -977,6 +1033,7 @@ static void tools_item_callback(void* context, uint32_t index) {
     switch(index) {
     case TOOL_CAPTURE: delfy_start_capture(app, false); break;
     case TOOL_GRAB: delfy_start_capture(app, true); break;
+    case TOOL_AUDIT: delfy_start_audit(app); break;
     case TOOL_PMF: delfy_start_pmf(app); break;
     case TOOL_STA: delfy_start_sta(app); break;
     case TOOL_PMKID: delfy_start_pmkid(app, false); break;
@@ -1004,6 +1061,7 @@ void tools_menu_scene_on_enter(void* context) {
         submenu_add_item(app->submenu, "PMKID (passive)", TOOL_PMKID, tools_item_callback, app);
         submenu_add_item(app->submenu, "PMKID grab (deauth)", TOOL_PKGRAB, tools_item_callback, app);
         submenu_add_item(app->submenu, "Capture: STOP", TOOL_CAPSTOP, tools_item_callback, app);
+        submenu_add_item(app->submenu, "Guided audit (this AP)", TOOL_AUDIT, tools_item_callback, app);
     }
     if(delfy_has_cap(app, 'S')) {
         submenu_add_item(app->submenu, "PMF/WPA3 scan", TOOL_PMF, tools_item_callback, app);
@@ -1731,6 +1789,7 @@ void uart_process_line(FuriString* line, void* context) {
     } else if(strncmp(furi_string_get_cstr(line), "HSDONE:", 7) == 0) {
         uint16_t written = 0;
         hs_write_pcap(&written);
+        if(audit_mode) audit_write_json("handshake", (int)written);
         snprintf(
             message,
             sizeof(message),
@@ -1750,6 +1809,7 @@ void uart_process_line(FuriString* line, void* context) {
     } else if(strncmp(furi_string_get_cstr(line), "STA:", 4) == 0) {
         recon_append(furi_string_get_cstr(line) + 4);
     } else if(strncmp(furi_string_get_cstr(line), "PMKIDDONE:", 10) == 0) {
+        if(audit_mode) audit_write_json("pmkid", 0);
         snprintf(recon_title, sizeof(recon_title), "PMKID");
         scene_manager_next_scene(app->scene_manager, pmfScene);
     } else if(strncmp(furi_string_get_cstr(line), "PMKID:", 6) == 0 ||
