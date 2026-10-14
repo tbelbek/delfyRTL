@@ -205,6 +205,7 @@ typedef enum {
     Exit = 5,
     ChannelMap = 6,
     BleScan = 7,
+    BleBeacon = 8,
 } MainMenuIndex;
 
 // Tools submenu item IDs — stable across capability-gating (dispatch keys off these,
@@ -347,6 +348,10 @@ void delfyRTL_menu_callback(void* context, uint32_t index) {
         FURI_LOG_I("delfyRTL", "BleScan");
         scene_manager_handle_custom_event(app->scene_manager, BleScan);
         break;
+    case BleBeacon:
+        FURI_LOG_I("delfyRTL", "BleBeacon");
+        scene_manager_handle_custom_event(app->scene_manager, BleBeacon);
+        break;
     case Exit:
         uart_helper_send(app->uart_helper, "STOP", 5);
         FURI_LOG_I("delfyRTL", "Exit");
@@ -371,6 +376,8 @@ void main_menu_scene_on_enter(void* context) {
     menu_add_item(app->menu, "Channel Map", &I_Scan_Wifi, ChannelMap, delfyRTL_menu_callback, app);
     if(delfy_has_cap(app, 'L'))
         menu_add_item(app->menu, "BLE Scan", &I_Scan_Wifi, BleScan, delfyRTL_menu_callback, app);
+    if(delfy_has_cap(app, 'I'))
+        menu_add_item(app->menu, "BLE iBeacon", &I_Scan_Wifi, BleBeacon, delfyRTL_menu_callback, app);
     menu_add_item(app->menu, "Help", &I_help, Help, delfyRTL_menu_callback, app);
     menu_add_item(app->menu, "Exit", &I_exit, Exit, delfyRTL_menu_callback, app);
     menu_set_selected_item(app->menu, app->menuIndex);
@@ -414,6 +421,16 @@ bool main_menu_scene_on_event(void* context, SceneManagerEvent event) {
             snprintf(recon_title, sizeof(recon_title), "BLE");
             uart_helper_send(app->uart_helper, "BLESCAN 8\n", 10);
             snprintf(message, sizeof(message), "Scanning BLE...");
+            snprintf(popupHeader, sizeof(popupHeader), "BLE");
+            scene_manager_next_scene(app->scene_manager, popupScene);
+            break;
+        case BleBeacon:
+            // Broadcast a demo iBeacon (fixed UUID/major/minor) for 30s.
+            {
+                const char* c = "BLEIBEACON 0102030405060708090A0B0C0D0E0F10 1 1 30\n";
+                uart_helper_send(app->uart_helper, c, strlen(c));
+            }
+            snprintf(message, sizeof(message), "iBeacon 30s...");
             snprintf(popupHeader, sizeof(popupHeader), "BLE");
             scene_manager_next_scene(app->scene_manager, popupScene);
             break;

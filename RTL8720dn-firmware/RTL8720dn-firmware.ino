@@ -672,7 +672,7 @@ static void pmkid_stream(int ch) {
 // caps letters (5Ghost-compatible): D=deauth S=stascan E=evil/AP B=beacon H=handshake.
 // We advertise "DSEBH" (no BLE -> no L/I/C/K).
 #define DELFY_FW_VERSION "1.0.0"
-#define DELFY_FW_CAPS    "DSEBHL"
+#define DELFY_FW_CAPS    "DSEBHLI"
 
 // --- C: P3 multi-target deauth list (DEAUTHADD / DEAUTHRUN) -------------------
 #define DAUTH_MAX 8
@@ -1115,6 +1115,62 @@ void loop() {
       BLE.configScan()->startScan((uint32_t)secs * 1000u);
       ble_stream();
       BLE.end();
+    }else if(readString.substring(0,10)=="BLEIBEACON"){
+      // P9: advertise an iBeacon. Args: BLEIBEACON <uuid-32hex> <major> <minor> [secs]
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int s3 = (s2 > 0) ? readString.indexOf(' ', s2+1) : -1;
+      int s4 = (s3 > 0) ? readString.indexOf(' ', s3+1) : -1;
+      String uuid = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1) : String("");
+      int major = (s2 > 0) ? readString.substring(s2+1, s3>0?s3:readString.length()-1).toInt() : 0;
+      int minor = (s3 > 0) ? readString.substring(s3+1, s4>0?s4:readString.length()-1).toInt() : 0;
+      int secs = (s4 > 0) ? readString.substring(s4+1, readString.length()-1).toInt() : 10;
+      if(secs < 1 || secs > 120) secs = 10;
+      if(uuid.length() != 32){
+        Serial.println("ERR:BLEIBEACON:uuid"); Serial1.println("ERR:BLEIBEACON:uuid");
+      }else{
+        uint8_t b[31]; uint8_t n = 0;
+        b[n++]=0x02; b[n++]=0x01; b[n++]=0x06;                          // flags
+        b[n++]=0x1A; b[n++]=0xFF; b[n++]=0x4C; b[n++]=0x00; b[n++]=0x02; b[n++]=0x15; // Apple iBeacon
+        for(int i = 0; i < 16; i++) b[n++] = (uint8_t)strtoul(uuid.substring(i*2, i*2+2).c_str(), NULL, 16);
+        b[n++]=(uint8_t)((major >> 8) & 0xFF); b[n++]=(uint8_t)(major & 0xFF);
+        b[n++]=(uint8_t)((minor >> 8) & 0xFF); b[n++]=(uint8_t)(minor & 0xFF);
+        b[n++]=0xC5; // tx power -59 dBm
+        BLE.init();
+        BLE.beginPeripheral();
+        BLEAdvert* ad = BLE.configAdvert();
+        ad->setAdvData(b, n);
+        ad->startAdv();
+        Serial.println("BLEIBEACON:on"); Serial1.println("BLEIBEACON:on");
+        for(int i=0;i<secs;i++) delay(1000);
+        ad->stopAdv();
+        BLE.end();
+        Serial.println("BLEIBEACON:off"); Serial1.println("BLEIBEACON:off");
+      }
+    }else if(readString.substring(0,6)=="BLEADV"){
+      // P9: advertise raw adv-data bytes. Args: BLEADV <hex> [secs]
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      String hex = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1) : String("");
+      int secs = (s2 > 0) ? readString.substring(s2+1, readString.length()-1).toInt() : 10;
+      if(secs < 1 || secs > 120) secs = 10;
+      uint8_t buf[31]; uint8_t n = 0;
+      for(int i = 0; i + 1 < (int)hex.length() && n < 31; i += 2)
+        buf[n++] = (uint8_t)strtoul(hex.substring(i, i+2).c_str(), NULL, 16);
+      if(n == 0){
+        Serial.println("ERR:BLEADV:badhex"); Serial1.println("ERR:BLEADV:badhex");
+      }else{
+        BLE.init();
+        BLE.beginPeripheral();
+        BLEAdvert* ad = BLE.configAdvert();
+        ad->setAdvData(buf, n);
+        ad->startAdv();
+        Serial.println("BLEADV:on"); Serial1.println("BLEADV:on");
+        for(int i=0;i<secs;i++) delay(1000);
+        ad->stopAdv();
+        BLE.end();
+        Serial.println("BLEADV:off"); Serial1.println("BLEADV:off");
+      }
     }else if(readString.substring(0,3)=="HOP"){
       // P1: channel hop. Args: HOP <interval_ms>  (0 = stop). Cycles 1..13.
       int ms = readString.substring(4, readString.length()-1).toInt();
