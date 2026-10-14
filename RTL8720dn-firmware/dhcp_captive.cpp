@@ -16,12 +16,30 @@ extern "C" struct netif xnetif[];
 static struct udp_pcb *dhcp_pcb = NULL;
 static struct netif *ap_netif = NULL;
 
-// Pick the netif that owns the AP IP (192.168.1.1), regardless of index/mode.
+// apbegin always brings the SoftAP up at 192.168.1.1 (WiFiDrv default; setting it via
+// WiFi.config() before apbegin breaks the channel ioctl). Retarget that netif to our
+// captive subnet (DHCP_AP_IP) here instead, after the AP is already up.
+static void retarget_ap_netif(void) {
+    for (int i = 0; i < 2; i++) {
+        ip4_addr_t *a = ip_2_ip4(&xnetif[i].ip_addr);
+        if (ip4_addr1(a) == 192 && ip4_addr2(a) == 168 && ip4_addr3(a) == 1 && ip4_addr4(a) == 1) {
+            ip4_addr_t nip, nmask, ngw;
+            IP4_ADDR(&nip,  DHCP_AP_IP[0], DHCP_AP_IP[1], DHCP_AP_IP[2], DHCP_AP_IP[3]);
+            IP4_ADDR(&nmask, DHCP_AP_MASK[0], DHCP_AP_MASK[1], DHCP_AP_MASK[2], DHCP_AP_MASK[3]);
+            IP4_ADDR(&ngw,  DHCP_AP_IP[0], DHCP_AP_IP[1], DHCP_AP_IP[2], DHCP_AP_IP[3]);
+            netif_set_addr(&xnetif[i], &nip, &nmask, &ngw);
+            printf("DHCP: retargeted netif %d -> %d.%d.%d.%d\n", i,
+                   DHCP_AP_IP[0], DHCP_AP_IP[1], DHCP_AP_IP[2], DHCP_AP_IP[3]);
+        }
+    }
+}
+
+// Pick the netif that owns the AP IP (DHCP_AP_IP), regardless of index/mode.
 static struct netif *find_ap_netif(void) {
     for (int i = 0; i < 2; i++) {
-        uint32_t ip = ip_addr_get_ip4_u32(&xnetif[i].ip_addr);
-        uint8_t a = ip & 0xFF, b = (ip >> 8) & 0xFF, c = (ip >> 16) & 0xFF, d = (ip >> 24) & 0xFF;
-        if (a == DHCP_AP_IP[0] && b == DHCP_AP_IP[1] && c == DHCP_AP_IP[2] && d == DHCP_AP_IP[3])
+        ip4_addr_t *a = ip_2_ip4(&xnetif[i].ip_addr);
+        if (ip4_addr1(a) == DHCP_AP_IP[0] && ip4_addr2(a) == DHCP_AP_IP[1] &&
+            ip4_addr3(a) == DHCP_AP_IP[2] && ip4_addr4(a) == DHCP_AP_IP[3])
             return &xnetif[i];
     }
     return &xnetif[1];  // fallback: SoftAP index in concurrent mode
@@ -56,6 +74,7 @@ static void dhcp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 
 void start_DHCP_Server() {
     if (dhcp_pcb != NULL) return;
+    retarget_ap_netif();          // move SoftAP from 192.168.1.1 to our captive subnet
     ap_netif = find_ap_netif();
     dhcp_pcb = udp_new();
     if (dhcp_pcb == NULL) { printf("DHCP: udp_new failed\n"); return; }

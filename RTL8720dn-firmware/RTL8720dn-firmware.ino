@@ -148,9 +148,6 @@ void createAP(char* ssid, char* channel, char* password){
   DEBUG_SER_PRINT("CREATING AP");
   DEBUG_SER_PRINT(ssid);
   DEBUG_SER_PRINT(channel);
-  // Dedicated captive-portal subnet (192.168.4.1/24) so we never collide with a
-  // typical home LAN at 192.168.1.x. Must be set before apbegin.
-  WiFi.config(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
   while (status != WL_CONNECTED) {
     DEBUG_SER_PRINT("CREATING AP 2");
       if(strcmp(password,"")==0){
