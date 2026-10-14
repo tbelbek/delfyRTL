@@ -1171,6 +1171,38 @@ void loop() {
         BLE.end();
         Serial.println("BLEADV:off"); Serial1.println("BLEADV:off");
       }
+    }else if(readString.substring(0,12)=="BLEGATTPROBE"){
+      // P10: connect + enumerate GATT. Args: BLEGATTPROBE <aa:bb:..> [type 0=pub 1=rand]
+      // Services/characteristics print to USB serial (SDK only exposes printServices()).
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      String addr = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1) : String("");
+      int at = (s2 > 0) ? readString.substring(s2+1, readString.length()-1).toInt() : 1;
+      if(addr.length() != 17){
+        Serial.println("ERR:BLEGATTPROBE:addr"); Serial1.println("ERR:BLEGATTPROBE:addr");
+      }else{
+        BLE.init();
+        BLE.beginCentral(0);
+        char ab[18]; addr.toCharArray(ab, sizeof(ab));
+        BLEConnect* conn = BLE.configConnection();
+        Serial.println("GATT: connecting..."); Serial1.println("GATT: connecting...");
+        bool cok = conn->connect(
+          ab,
+          (T_GAP_REMOTE_ADDR_TYPE)(at ? GAP_REMOTE_ADDR_LE_RANDOM : GAP_REMOTE_ADDR_LE_PUBLIC),
+          8000);
+        if(cok){
+          BLEClient* cl = BLE.addClient(0);
+          for(int i = 0; i < 30 && !cl->connected(); i++) delay(100);
+          cl->discoverServices();
+          for(int i = 0; i < 50 && !cl->discoveryDone(); i++) delay(100);
+          cl->printServices();  // service + characteristic UUIDs -> USB serial
+          conn->disconnect();
+          Serial.println("GATT:done"); Serial1.println("GATT:done");
+        }else{
+          Serial.println("GATT:connect-failed"); Serial1.println("GATT:connect-failed");
+        }
+        BLE.end();
+      }
     }else if(readString.substring(0,3)=="HOP"){
       // P1: channel hop. Args: HOP <interval_ms>  (0 = stop). Cycles 1..13.
       int ms = readString.substring(4, readString.length()-1).toInt();
