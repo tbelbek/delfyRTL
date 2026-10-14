@@ -157,6 +157,7 @@ char credentials[1000];
 char message[128];
 static char recon_text[1024];
 static char recon_title[24];
+static char wpa_lines[512]; // PMKID WPA*01* lines -> /ext/delfy/pmkid.22000
 static bool hop_on = false;
 // E: guided-audit context (written to /ext/delfy/audit.json when a grab finishes)
 static bool audit_mode = false;
@@ -327,8 +328,7 @@ static void hs_write_pcap(uint16_t* out_frames) {
 }
 
 // E: write a small audit summary next to the capture.
-static void audit_write_json(const char* kind, int frames) {
-    Storage* st = furi_record_open(RECORD_STORAGE);
+static void audit_write_json(const char* kind, int frames) {    Storage* st = furi_record_open(RECORD_STORAGE);
     storage_common_mkdir(st, "/ext/delfy");
     File* f = storage_file_alloc(st);
     if(storage_file_open(f, "/ext/delfy/audit.json", FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
@@ -351,6 +351,20 @@ static void audit_write_json(const char* kind, int frames) {
     storage_file_free(f);
     furi_record_close(RECORD_STORAGE);
     audit_mode = false;
+}
+
+// Evidence pack: dump collected PMKID WPA*01* lines to /ext/delfy/pmkid.22000.
+static void write_wpa_file(void) {
+    if(wpa_lines[0] == '\0') return;
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    storage_common_mkdir(st, "/ext/delfy");
+    File* f = storage_file_alloc(st);
+    if(storage_file_open(f, "/ext/delfy/pmkid.22000", FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        storage_file_write(f, wpa_lines, strlen(wpa_lines));
+        storage_file_close(f);
+    }
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
 }
 
 static void listed_wifis_item_callback(void* context, uint32_t index);
@@ -627,6 +641,11 @@ static void listed_beacon_items_callback(void* context, uint32_t index) {
         uart_helper_send(app->uart_helper, "RICKROLL\n", 9);
         scene_manager_next_scene(app->scene_manager, beaconInfoScene);
         break;
+    case 3:
+        //Ghost AP Beacon (BEACONSPAM GHOST)
+        uart_helper_send(app->uart_helper, "GHOSTSPAM\n", 10);
+        scene_manager_next_scene(app->scene_manager, beaconInfoScene);
+        break;
     }
     UNUSED(context);
 
@@ -641,6 +660,7 @@ void beacon_network_scene_on_enter(void* context) {
     submenu_add_item(app->submenu, "Custom AP Beacon", 0, listed_beacon_items_callback, app);
     submenu_add_item(app->submenu, "Random AP Beacon", 1, listed_beacon_items_callback, app);
     submenu_add_item(app->submenu, "RickRoll AP Beacon", 2, listed_beacon_items_callback, app);
+    submenu_add_item(app->submenu, "Ghost AP Beacon", 3, listed_beacon_items_callback, app);
 
     view_dispatcher_switch_to_view(app->view_dispatcher, beaconListView);
 }
@@ -955,6 +975,7 @@ static void delfy_start_pmkid(delfyRTL* app, bool grab) {
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
     snprintf(message, sizeof(message), "PMKID ch %d...", ch);
     snprintf(popupHeader, sizeof(popupHeader), "PMKID");
+    wpa_lines[0] = '\0';
     scene_manager_next_scene(app->scene_manager, popupScene);
 }
 
@@ -1284,6 +1305,10 @@ void beacon_info_scene_on_enter(void* context) {
         widget_add_icon_element(app->widget, 0, 0, rick[0]);
         furi_timer_start(app->timer, 300);
         break;
+    case 3:
+        widget_add_string_element(
+            app->widget, 80, 10, AlignCenter, AlignTop, FontPrimary, "Ghost AP");
+        break;
     }
     view_dispatcher_switch_to_view(app->view_dispatcher, beaconInfoView);
 }
@@ -1305,8 +1330,14 @@ void help_scene_on_enter(void* context) {
     delfyRTL* app = context;
     app->menuIndex = 3;
     widget_reset(app->widget);
-    widget_add_text_scroll_element(
-        app->widget, 0, 0, 128, 64, "https://github.com/gorebrau/delfyRTL");
+    char info[192];
+    snprintf(
+        info,
+        sizeof(info),
+        "delfyRTL\nfw: %s\ncaps: %s\n\nhttps://github.com/gorebrau/delfyRTL\n(fork tbelbek/delfyRTL)",
+        app->fw_version[0] ? app->fw_version : "(no IDENT)",
+        app->fw_caps[0] ? app->fw_caps : "-");
+    widget_add_text_scroll_element(app->widget, 0, 0, 128, 64, info);
     view_dispatcher_switch_to_view(app->view_dispatcher, helpView);
 }
 
@@ -1832,11 +1863,18 @@ void uart_process_line(FuriString* line, void* context) {
         recon_append(furi_string_get_cstr(line) + 4);
     } else if(strncmp(furi_string_get_cstr(line), "PMKIDDONE:", 10) == 0) {
         if(audit_mode) audit_write_json("pmkid", 0);
+        write_wpa_file();
         snprintf(recon_title, sizeof(recon_title), "PMKID");
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "PMKID:", 6) == 0 ||
               strncmp(furi_string_get_cstr(line), "WPA*01*", 7) == 0) {
-        recon_append(furi_string_get_cstr(line));
+        const char* s = furi_string_get_cstr(line);
+        recon_append(s);
+        if(strncmp(s, "WPA*01*", 7) == 0 &&
+           strlen(wpa_lines) + strlen(s) + 2 < sizeof(wpa_lines)) {
+            strcat(wpa_lines, s);
+            strcat(wpa_lines, "\n");
+        }
     } else if(strncmp(furi_string_get_cstr(line), "IDENT:", 6) == 0) {
         // A: board capability/version advertisement (HELLO response).
         const char* s = furi_string_get_cstr(line);
