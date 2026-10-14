@@ -231,6 +231,11 @@ typedef enum {
 #define TOOL_CAPSTOP 11
 #define TOOL_AUDIT   12
 
+// Deferred GUI events posted from the UART worker thread (GUI must run on the GUI thread).
+#define DELFY_EVT_RECON 0x2000
+#define DELFY_EVT_POPUP 0x2001
+#define DELFY_EVT_CREDS 0x2002
+
 typedef enum {
     SsidAPInputSceneSaveEvent,
 } CustoAPInputEvent;
@@ -338,6 +343,8 @@ static void audit_write_json(const char* kind, int frames) {
             audit_sec,
             kind,
             frames);
+        if(n < 0) n = 0;
+        if(n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
         storage_file_write(f, buf, n);
         storage_file_close(f);
     }
@@ -963,7 +970,9 @@ static void delfy_start_audit(delfyRTL* app) {
     audit_bssid[0] = '\0';
     if(app->selectedWifi >= 0 && app->selectedWifi < app->wifiCount) {
         strncpy(audit_ssid, app->wifiList[app->selectedWifi].APssid, sizeof(audit_ssid) - 1);
+        audit_ssid[sizeof(audit_ssid) - 1] = '\0';
         strncpy(audit_bssid, app->wifiList[app->selectedWifi].APbssid, sizeof(audit_bssid) - 1);
+        audit_bssid[sizeof(audit_bssid) - 1] = '\0';
         audit_sec = app->wifiList[app->selectedWifi].security;
     }
     recon_text[0] = '\0';
@@ -1684,6 +1693,19 @@ static bool delfyRTL_custom_callback(void* context, uint32_t custom_event) {
     FURI_LOG_D(TAG, __func__);
     furi_assert(context);
     delfyRTL* app = context;
+    // Deferred GUI transitions posted from the UART worker thread (runs on the GUI thread).
+    if(custom_event == DELFY_EVT_RECON) {
+        scene_manager_next_scene(app->scene_manager, pmfScene);
+        return true;
+    }
+    if(custom_event == DELFY_EVT_POPUP) {
+        scene_manager_next_scene(app->scene_manager, popupScene);
+        return true;
+    }
+    if(custom_event == DELFY_EVT_CREDS) {
+        scene_manager_next_scene(app->scene_manager, evilCredsScene);
+        return true;
+    }
     return scene_manager_handle_custom_event(app->scene_manager, custom_event);
 }
 
@@ -1757,7 +1779,7 @@ void uart_process_line(FuriString* line, void* context) {
         token = strtok(NULL, "|");
         strcat(credentials, token);
         strcat(credentials, "\n");
-        evil_creds_scene_on_enter(app);
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_CREDS);
     } else if(strncmp(furi_string_get_cstr(line), "ERROR:", 6) == 0) {
         char buffer[128]; // Pequeño buffer en la pila (Flipper Zero tiene RAM limitada)
         strncpy(buffer, furi_string_get_cstr(line), sizeof(buffer) - 1);
@@ -1767,7 +1789,7 @@ void uart_process_line(FuriString* line, void* context) {
 
         strcat(message, token);
         snprintf(popupHeader, sizeof(popupHeader), "ERROR");
-        scene_manager_next_scene(app->scene_manager, popupScene);
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
     } else if(strncmp(furi_string_get_cstr(line), "HSCAP:", 6) == 0) {
         // Board header before a HSFRAME dump: "HSCAP: ch=N count=N".
         hs_count = 0;
@@ -1797,21 +1819,21 @@ void uart_process_line(FuriString* line, void* context) {
             (unsigned)written,
             hs_channel);
         snprintf(popupHeader, sizeof(popupHeader), "Capture done");
-        scene_manager_next_scene(app->scene_manager, popupScene);
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
     } else if(strncmp(furi_string_get_cstr(line), "PMFDONE:", 8) == 0) {
         snprintf(recon_title, sizeof(recon_title), "PMF / WPA3");
-        scene_manager_next_scene(app->scene_manager, pmfScene);
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "PMF:", 4) == 0) {
         recon_append(furi_string_get_cstr(line) + 4);
     } else if(strncmp(furi_string_get_cstr(line), "STADONE:", 8) == 0) {
         snprintf(recon_title, sizeof(recon_title), "Stations");
-        scene_manager_next_scene(app->scene_manager, pmfScene);
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "STA:", 4) == 0) {
         recon_append(furi_string_get_cstr(line) + 4);
     } else if(strncmp(furi_string_get_cstr(line), "PMKIDDONE:", 10) == 0) {
         if(audit_mode) audit_write_json("pmkid", 0);
         snprintf(recon_title, sizeof(recon_title), "PMKID");
-        scene_manager_next_scene(app->scene_manager, pmfScene);
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "PMKID:", 6) == 0 ||
               strncmp(furi_string_get_cstr(line), "WPA*01*", 7) == 0) {
         recon_append(furi_string_get_cstr(line));
@@ -1837,7 +1859,7 @@ void uart_process_line(FuriString* line, void* context) {
         FURI_LOG_I(TAG, "IDENT fw=%s caps=%s", app->fw_version, app->fw_caps);
     } else if(strncmp(furi_string_get_cstr(line), "BLEDONE:", 8) == 0) {
         snprintf(recon_title, sizeof(recon_title), "BLE");
-        scene_manager_next_scene(app->scene_manager, pmfScene);
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "BLE:", 4) == 0) {
         recon_append(furi_string_get_cstr(line));
     }
@@ -1893,6 +1915,8 @@ static delfyRTL* app_alloc() {
     app->passwordAP = "password123";
     app->selectedWifi = 0;
     app->wifiCount = 0;
+    app->menuIndex = 0;
+    app->submenuIndex = 0;
     app->fw_version[0] = '\0';
     app->fw_caps[0] = '\0';
     app->scene_manager = scene_manager_alloc(&delfyRTL_scene_manager_handlers, app);

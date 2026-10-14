@@ -1190,10 +1190,12 @@ void loop() {
         char ab[18]; addr.toCharArray(ab, sizeof(ab));
         BLEConnect* conn = BLE.configConnection();
         Serial.println("GATT: connecting..."); Serial1.println("GATT: connecting...");
-        bool cok = conn->connect(
-          ab,
-          (T_GAP_REMOTE_ADDR_TYPE)(at ? GAP_REMOTE_ADDR_LE_RANDOM : GAP_REMOTE_ADDR_LE_PUBLIC),
-          8000);
+        T_GAP_REMOTE_ADDR_TYPE ta =
+          (T_GAP_REMOTE_ADDR_TYPE)(at ? GAP_REMOTE_ADDR_LE_RANDOM : GAP_REMOTE_ADDR_LE_PUBLIC);
+        T_GAP_REMOTE_ADDR_TYPE tb =
+          (T_GAP_REMOTE_ADDR_TYPE)(at ? GAP_REMOTE_ADDR_LE_PUBLIC : GAP_REMOTE_ADDR_LE_RANDOM);
+        bool cok = conn->connect(ab, ta, 6000);
+        if(!cok) cok = conn->connect(ab, tb, 6000);  // retry with the other addr type
         if(cok){
           BLEClient* cl = BLE.addClient(0);
           for(int i = 0; i < 30 && !cl->connected(); i++) delay(100);
