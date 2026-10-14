@@ -740,19 +740,44 @@ static volatile int cap_ch = 6;
 #define BLE_MAX 16
 static char ble_addr[BLE_MAX][20];
 static char ble_name[BLE_MAX][24];
+static char ble_tag[BLE_MAX][12];
 static int8_t ble_rssi[BLE_MAX];
 static volatile uint8_t ble_n = 0;
 static BLEAdvertData ble_adv;
 static BLEHIDKeyboard ble_kbd;
 static BLEAdvertData ble_hidadv;
 
+static void ble_classify(BLEAdvertData& a, char* tag, size_t cap) {
+  tag[0] = '\0';
+  String nm = a.getName();
+  if(nm.indexOf("Flipper") >= 0) { snprintf(tag, cap, "Flipper"); return; }
+  if(a.hasManufacturer()) {
+    uint16_t mf = a.getManufacturer();
+    if(mf == 0x004C || mf == 0x4C00) {          // Apple (FindMy trackers use type 0x12)
+      uint8_t* md = a.getManufacturerData();
+      uint8_t ml = a.getManufacturerDataLength();
+      if(ml >= 1 && md[0] == 0x12) snprintf(tag, cap, "FindMy");
+      else snprintf(tag, cap, "Apple");
+    } else if(mf == 0x0006 || mf == 0x0600) {
+      snprintf(tag, cap, "MS");
+    } else {
+      snprintf(tag, cap, "mf%04X", mf);
+    }
+    return;
+  }
+  if(nm.length() == 0) snprintf(tag, cap, "--");
+}
+
 static void ble_scan_cb(T_LE_CB_DATA* p_data) {
   ble_adv.parseScanInfo(p_data);
   BLEAddr a = ble_adv.getAddr();
   const char* as = a.str();
+  char tag[12];
+  ble_classify(ble_adv, tag, sizeof(tag));
   for (uint8_t i = 0; i < ble_n; i++) {
-    if (strcmp(ble_addr[i], as) == 0) {          // already seen -> refresh name/rssi
+    if (strcmp(ble_addr[i], as) == 0) {          // already seen -> refresh name/tag/rssi
       ble_rssi[i] = ble_adv.getRSSI();
+      if(ble_tag[i][0] == '\0' && tag[0]) { strncpy(ble_tag[i], tag, sizeof(ble_tag[0]) - 1); }
       if (ble_name[i][0] == '\0' && ble_adv.hasName()) {
         strncpy(ble_name[i], ble_adv.getName().c_str(), sizeof(ble_name[0]) - 1);
         ble_name[i][sizeof(ble_name[0]) - 1] = '\0';
@@ -767,6 +792,8 @@ static void ble_scan_cb(T_LE_CB_DATA* p_data) {
     strncpy(ble_name[ble_n], ble_adv.getName().c_str(), sizeof(ble_name[0]) - 1);
     ble_name[ble_n][sizeof(ble_name[0]) - 1] = '\0';
   }
+  strncpy(ble_tag[ble_n], tag, sizeof(ble_tag[0]) - 1);
+  ble_tag[ble_n][sizeof(ble_tag[0]) - 1] = '\0';
   ble_rssi[ble_n] = ble_adv.getRSSI();
   ble_n++;
 }
@@ -774,7 +801,7 @@ static void ble_scan_cb(T_LE_CB_DATA* p_data) {
 static void ble_stream() {
   for (uint8_t i = 0; i < ble_n; i++) {
     char line[80];
-    snprintf(line, sizeof(line), "BLE:%s|%d|%s", ble_addr[i], ble_rssi[i], ble_name[i]);
+    snprintf(line, sizeof(line), "BLE:%s|%d|%s|%s", ble_addr[i], ble_rssi[i], ble_name[i], ble_tag[i]);
     Serial.println(line); Serial1.println(line);
   }
   String fin = "BLEDONE: n=" + String((unsigned)ble_n);
