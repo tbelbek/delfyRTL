@@ -26,7 +26,12 @@ enum portals{
 //DNS
 
 #include "dns.h"
+#include "dhcp_captive.h"
 #include <lwip/lwip_v2.0.2/src/include/lwip/priv/tcp_priv.h>
+
+// Stop the SDK's built-in DHCP server (in lib_arduino.a) so our option-114 server
+// can own UDP:67. Declared here to avoid pulling the whole dhcps.h.
+extern "C" void dhcps_deinit(void);
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
@@ -152,6 +157,11 @@ void createAP(char* ssid, char* channel, char* password){
       }
       delay(1000);
   }
+  // Replace the SDK DHCP server with ours so we can advertise option 114 (RFC 8910),
+  // which is what actually triggers Android 11+ captive-portal auto-open.
+  dhcps_deinit();
+  start_DHCP_Server();
+
   unbind_dns();
   delay(1000);
 
@@ -652,6 +662,14 @@ void loop() {
             }
             String path = parseRequest(request);
             Serial.println(request);
+            // RFC 8908 Captive-Portal API endpoint that DHCP option 114 points at.
+            // Android's NetworkMonitor fetches this expecting application/captive+json.
+            if(path.startsWith("/cp.json")){
+              String j = "{\"captive\":true,\"user-portal-url\":\"http://192.168.1.1/\"}";
+              String resp = makeResponse(200, "application/captive+json", false, j.length());
+              resp += j;
+              client.write(resp.c_str());
+            }else
             // Portal page + form submissions get the HTML; every captive probe
             // (generate_204, ncsi.txt, success.html, …) and any unknown URL gets a
             // 302 to the portal root, which is what triggers the Android/iOS sign-in flow.
