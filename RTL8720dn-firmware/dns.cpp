@@ -1,7 +1,7 @@
 #include "dns.h"
 #define DNS_QR_RESPONSE        1
 
-uint8_t dhcpServer[4]={192,168,1,1};
+uint8_t dhcpServer[4]={192,168,4,1};
 
 bool requestIncludesOnlyOneQuestion(DNSHeader &dnsHeader) {
   return ntohs(dnsHeader.QDCount) == 1 && dnsHeader.ANCount == 0 && dnsHeader.NSCount == 0 && dnsHeader.ARCount == 0;

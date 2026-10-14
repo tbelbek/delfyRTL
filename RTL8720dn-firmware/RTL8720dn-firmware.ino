@@ -148,6 +148,9 @@ void createAP(char* ssid, char* channel, char* password){
   DEBUG_SER_PRINT("CREATING AP");
   DEBUG_SER_PRINT(ssid);
   DEBUG_SER_PRINT(channel);
+  // Dedicated captive-portal subnet (192.168.4.1/24) so we never collide with a
+  // typical home LAN at 192.168.1.x. Must be set before apbegin.
+  WiFi.config(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
   while (status != WL_CONNECTED) {
     DEBUG_SER_PRINT("CREATING AP 2");
       if(strcmp(password,"")==0){
@@ -237,7 +240,7 @@ String makeResponse(int code, String content_type, bool compresed, size_t conten
 // "Sign in to network" flow. Stock 5Ghost uses exactly this; DHCP option 114 is NOT needed.
 void handleRedirect(WiFiClient &client) {
   String response = "HTTP/1.1 302 Found\r\n";
-  response += "Location: http://192.168.1.1/\r\n";
+  response += "Location: http://192.168.4.1/\r\n";
   response += "Content-Length: 0\r\n";
   response += "Cache-Control: no-store\r\n";
   response += "Connection: close\r\n\r\n";
@@ -665,7 +668,7 @@ void loop() {
             // RFC 8908 Captive-Portal API endpoint that DHCP option 114 points at.
             // Android's NetworkMonitor fetches this expecting application/captive+json.
             if(path.startsWith("/cp.json")){
-              String j = "{\"captive\":true,\"user-portal-url\":\"http://192.168.1.1/\"}";
+              String j = "{\"captive\":true,\"user-portal-url\":\"http://192.168.4.1/\"}";
               String resp = makeResponse(200, "application/captive+json", false, j.length());
               resp += j;
               client.write(resp.c_str());

@@ -12,13 +12,15 @@
 #define DHCP_FIXED_LEN 236      /* BOOTP header before the magic cookie */
 #define DHCP_MIN_REPLY 300      /* pad short replies; some clients expect >= 300B */
 
-/* AP network — must match WiFiDrv's _arduinoApIpAddr / delfy's dhcpServer (192.168.1.1/24). */
-static const uint8_t DHCP_AP_IP[4]   = {192, 168, 1, 1};
+/* AP network — must match WiFi.config() in the sketch and delfy's dhcpServer.
+   Dedicated captive-portal subnet 192.168.4.0/24, NOT 192.168.1.x, so it never
+   collides with a typical home LAN (which breaks dual-homed clients and testing). */
+static const uint8_t DHCP_AP_IP[4]   = {192, 168, 4, 1};
 static const uint8_t DHCP_AP_MASK[4] = {255, 255, 255, 0};
 static const uint8_t DHCP_MAGIC[4]   = {99, 130, 83, 99};
 /* Option 114 points at the RFC 8908 captive-portal API endpoint (served by the sketch),
    not the HTML root — Android's NetworkMonitor expects application/captive+json there. */
-static const char DHCP_CP_URI[] = "http://192.168.1.1/cp.json";
+static const char DHCP_CP_URI[] = "http://192.168.4.1/cp.json";
 
 /* Find a DHCP option by code in the options area; returns value ptr or NULL. */
 static inline const uint8_t *dhcp_find_opt(const uint8_t *req, size_t len,
