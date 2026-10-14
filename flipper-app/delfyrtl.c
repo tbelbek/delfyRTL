@@ -206,6 +206,7 @@ typedef enum {
     ChannelMap = 6,
     BleScan = 7,
     BleBeacon = 8,
+    BadBle = 9,
 } MainMenuIndex;
 
 // Tools submenu item IDs — stable across capability-gating (dispatch keys off these,
@@ -352,6 +353,10 @@ void delfyRTL_menu_callback(void* context, uint32_t index) {
         FURI_LOG_I("delfyRTL", "BleBeacon");
         scene_manager_handle_custom_event(app->scene_manager, BleBeacon);
         break;
+    case BadBle:
+        FURI_LOG_I("delfyRTL", "BadBle");
+        scene_manager_handle_custom_event(app->scene_manager, BadBle);
+        break;
     case Exit:
         uart_helper_send(app->uart_helper, "STOP", 5);
         FURI_LOG_I("delfyRTL", "Exit");
@@ -378,6 +383,8 @@ void main_menu_scene_on_enter(void* context) {
         menu_add_item(app->menu, "BLE Scan", &I_Scan_Wifi, BleScan, delfyRTL_menu_callback, app);
     if(delfy_has_cap(app, 'I'))
         menu_add_item(app->menu, "BLE iBeacon", &I_Scan_Wifi, BleBeacon, delfyRTL_menu_callback, app);
+    if(delfy_has_cap(app, 'K'))
+        menu_add_item(app->menu, "BadBLE HID", &I_Scan_Wifi, BadBle, delfyRTL_menu_callback, app);
     menu_add_item(app->menu, "Help", &I_help, Help, delfyRTL_menu_callback, app);
     menu_add_item(app->menu, "Exit", &I_exit, Exit, delfyRTL_menu_callback, app);
     menu_set_selected_item(app->menu, app->menuIndex);
@@ -432,6 +439,13 @@ bool main_menu_scene_on_event(void* context, SceneManagerEvent event) {
             }
             snprintf(message, sizeof(message), "iBeacon 30s...");
             snprintf(popupHeader, sizeof(popupHeader), "BLE");
+            scene_manager_next_scene(app->scene_manager, popupScene);
+            break;
+        case BadBle:
+            // Advertise as a HID keyboard for 30s (types once a host connects).
+            uart_helper_send(app->uart_helper, "BADBLE 30\n", 10);
+            snprintf(message, sizeof(message), "BadBLE 30s...");
+            snprintf(popupHeader, sizeof(popupHeader), "BadBLE");
             scene_manager_next_scene(app->scene_manager, popupScene);
             break;
         default:

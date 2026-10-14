@@ -6,6 +6,8 @@
 #include "WiFi.h"
 #include <BLEDevice.h>
 #include <BLEAdvertData.h>
+#include <BLEHIDDevice.h>
+#include <BLEHIDKeyboard.h>
 
 //Captive portals
 #include "portals/compressed/facebook.h"
@@ -672,7 +674,7 @@ static void pmkid_stream(int ch) {
 // caps letters (5Ghost-compatible): D=deauth S=stascan E=evil/AP B=beacon H=handshake.
 // We advertise "DSEBH" (no BLE -> no L/I/C/K).
 #define DELFY_FW_VERSION "1.0.0"
-#define DELFY_FW_CAPS    "DSEBHLI"
+#define DELFY_FW_CAPS    "DSEBHLICK"
 
 // --- C: P3 multi-target deauth list (DEAUTHADD / DEAUTHRUN) -------------------
 #define DAUTH_MAX 8
@@ -730,6 +732,8 @@ static char ble_name[BLE_MAX][24];
 static int8_t ble_rssi[BLE_MAX];
 static volatile uint8_t ble_n = 0;
 static BLEAdvertData ble_adv;
+static BLEHIDKeyboard ble_kbd;
+static BLEAdvertData ble_hidadv;
 
 static void ble_scan_cb(T_LE_CB_DATA* p_data) {
   ble_adv.parseScanInfo(p_data);
@@ -1203,6 +1207,45 @@ void loop() {
         }
         BLE.end();
       }
+    }else if(readString.substring(0,6)=="BADBLE"){
+      // P11: BLE HID keyboard injection. Args: BADBLE [secs]
+      // Advertises as a HID keyboard; if a host connects, types a line. LOW success:
+      // modern hosts require pairing/confirmation and reject unauth HID peripherals.
+      int secs = readString.substring(7, readString.length()-1).toInt();
+      if(secs < 1 || secs > 120) secs = 30;
+      ble_hidadv.clear();
+      ble_hidadv.addFlags();
+      ble_hidadv.addCompleteName("DELFY-KB");
+      ble_hidadv.addAppearance(GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE);
+      ble_hidadv.addCompleteServices(BLEUUID(HID_SERVICE_UUID));
+      BLEHIDDev.init();
+      BLE.init();
+      BLE.configAdvert()->setAdvData(ble_hidadv);
+      BLE.setDeviceName("DELFY-KB");
+      BLE.setDeviceAppearance(GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE);
+      BLE.configSecurity()->setPairable(true);
+      BLE.configSecurity()->setAuthFlags(GAP_AUTHEN_BIT_BONDING_FLAG);
+      BLE.configServer(3);
+      BLE.addService(BLEHIDDev.hidService());
+      BLE.addService(BLEHIDDev.battService());
+      BLE.addService(BLEHIDDev.devInfoService());
+      BLE.beginPeripheral();
+      Serial.println("BADBLE:on"); Serial1.println("BADBLE:on");
+      uint32_t t0 = millis();
+      bool typed = false;
+      while (millis() - t0 < (uint32_t)secs * 1000u) {
+        if (BLE.connected() && !typed) {
+          ble_kbd.keyReleaseAll();
+          delay(300);
+          ble_kbd.keySequence("delfyRTL says hi\n", 20);
+          ble_kbd.keyReleaseAll();
+          typed = true;
+          Serial.println("BADBLE:typed"); Serial1.println("BADBLE:typed");
+        }
+        delay(200);
+      }
+      BLE.end();
+      Serial.println("BADBLE:off"); Serial1.println("BADBLE:off");
     }else if(readString.substring(0,3)=="HOP"){
       // P1: channel hop. Args: HOP <interval_ms>  (0 = stop). Cycles 1..13.
       int ms = readString.substring(4, readString.length()-1).toInt();
