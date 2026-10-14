@@ -68,7 +68,7 @@ static void dhcp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     ip_addr_t bcast;
     IP_ADDR4(&bcast, 255, 255, 255, 255);
     err_t e = udp_sendto_if(pcb, op, &bcast, DHCP_CLI_PORT, ap_netif ? ap_netif : find_ap_netif());
-    printf("DHCP: reply type=%d len=%u send=%d\n", repbuf[DHCP_FIXED_LEN + 6], (unsigned)n, (int)e);
+    printf("DHCP: reply type=%d len=%d send=%d\n", repbuf[DHCP_FIXED_LEN + 6], (int)n, (int)e);
     pbuf_free(op);
 }
 

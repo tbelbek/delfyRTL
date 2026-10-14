@@ -4,7 +4,10 @@
 uint8_t dhcpServer[4]={192,168,4,1};
 
 bool requestIncludesOnlyOneQuestion(DNSHeader &dnsHeader) {
-  return ntohs(dnsHeader.QDCount) == 1 && dnsHeader.ANCount == 0 && dnsHeader.NSCount == 0 && dnsHeader.ARCount == 0;
+  // Accept EDNS: modern resolvers attach an OPT record in the additional section
+  // (ARCount>=1). Requiring ARCount==0 made us REFUSE those queries, breaking the
+  // DNS hijack for most real clients. Only require a single question, no answers.
+  return ntohs(dnsHeader.QDCount) == 1 && dnsHeader.ANCount == 0 && dnsHeader.NSCount == 0;
 }
 
 
