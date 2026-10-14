@@ -4,6 +4,8 @@
 #include "wifi_drv.h"
 #include "debug.h"
 #include "WiFi.h"
+#include <BLEDevice.h>
+#include <BLEAdvertData.h>
 
 //Captive portals
 #include "portals/compressed/facebook.h"
@@ -670,7 +672,7 @@ static void pmkid_stream(int ch) {
 // caps letters (5Ghost-compatible): D=deauth S=stascan E=evil/AP B=beacon H=handshake.
 // We advertise "DSEBH" (no BLE -> no L/I/C/K).
 #define DELFY_FW_VERSION "1.0.0"
-#define DELFY_FW_CAPS    "DSEBH"
+#define DELFY_FW_CAPS    "DSEBHL"
 
 // --- C: P3 multi-target deauth list (DEAUTHADD / DEAUTHRUN) -------------------
 #define DAUTH_MAX 8
@@ -720,6 +722,49 @@ static volatile int hsg_ch = 6;
 static volatile bool cap_active = false;
 static volatile uint32_t cap_deadline = 0;
 static volatile int cap_ch = 6;
+
+// --- P8: BLE scan (AmebaBLE library) ---
+#define BLE_MAX 16
+static char ble_addr[BLE_MAX][20];
+static char ble_name[BLE_MAX][24];
+static int8_t ble_rssi[BLE_MAX];
+static volatile uint8_t ble_n = 0;
+static BLEAdvertData ble_adv;
+
+static void ble_scan_cb(T_LE_CB_DATA* p_data) {
+  ble_adv.parseScanInfo(p_data);
+  BLEAddr a = ble_adv.getAddr();
+  const char* as = a.str();
+  for (uint8_t i = 0; i < ble_n; i++) {
+    if (strcmp(ble_addr[i], as) == 0) {          // already seen -> refresh name/rssi
+      ble_rssi[i] = ble_adv.getRSSI();
+      if (ble_name[i][0] == '\0' && ble_adv.hasName()) {
+        strncpy(ble_name[i], ble_adv.getName().c_str(), sizeof(ble_name[0]) - 1);
+        ble_name[i][sizeof(ble_name[0]) - 1] = '\0';
+      }
+      return;
+    }
+  }
+  if (ble_n >= BLE_MAX) return;
+  snprintf(ble_addr[ble_n], sizeof(ble_addr[0]), "%s", as);
+  ble_name[ble_n][0] = '\0';
+  if (ble_adv.hasName()) {
+    strncpy(ble_name[ble_n], ble_adv.getName().c_str(), sizeof(ble_name[0]) - 1);
+    ble_name[ble_n][sizeof(ble_name[0]) - 1] = '\0';
+  }
+  ble_rssi[ble_n] = ble_adv.getRSSI();
+  ble_n++;
+}
+
+static void ble_stream() {
+  for (uint8_t i = 0; i < ble_n; i++) {
+    char line[80];
+    snprintf(line, sizeof(line), "BLE:%s|%d|%s", ble_addr[i], ble_rssi[i], ble_name[i]);
+    Serial.println(line); Serial1.println(line);
+  }
+  String fin = "BLEDONE: n=" + String((unsigned)ble_n);
+  Serial.println(fin); Serial1.println(fin);
+}
 
 void loop() {
   while (Serial1.available()) {
@@ -1055,6 +1100,21 @@ void loop() {
         hsg_phase = HSG_DISCOVER;  // discover STAs -> unicast deauth -> capture
         Serial.println("HSGRAB: armed"); Serial1.println("HSGRAB: armed");
       }
+    }else if(readString.substring(0,7)=="BLESCAN"){
+      // P8: BLE scan. Args: BLESCAN [secs]  (default 5s, max 30s).
+      int secs = readString.substring(8, readString.length()-1).toInt();
+      if(secs < 1 || secs > 30) secs = 5;
+      ble_n = 0;
+      BLE.init();
+      BLE.configScan()->setScanMode(GAP_SCAN_MODE_ACTIVE);
+      BLE.configScan()->setScanInterval(500);
+      BLE.configScan()->setScanWindow(250);
+      BLE.configScan()->updateScanParams();
+      BLE.setScanCallback(ble_scan_cb);
+      BLE.beginCentral(0);
+      BLE.configScan()->startScan((uint32_t)secs * 1000u);
+      ble_stream();
+      BLE.end();
     }else if(readString.substring(0,3)=="HOP"){
       // P1: channel hop. Args: HOP <interval_ms>  (0 = stop). Cycles 1..13.
       int ms = readString.substring(4, readString.length()-1).toInt();

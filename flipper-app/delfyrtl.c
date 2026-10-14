@@ -204,6 +204,7 @@ typedef enum {
     Help = 4,
     Exit = 5,
     ChannelMap = 6,
+    BleScan = 7,
 } MainMenuIndex;
 
 // Tools submenu item IDs — stable across capability-gating (dispatch keys off these,
@@ -312,6 +313,7 @@ static void hs_write_pcap(uint16_t* out_frames) {
 }
 
 static void listed_wifis_item_callback(void* context, uint32_t index);
+static bool delfy_has_cap(delfyRTL* app, char cap);
 void delfyRTL_menu_callback(void* context, uint32_t index) {
     FURI_LOG_D(TAG, __func__);
     delfyRTL* app = context;
@@ -341,6 +343,10 @@ void delfyRTL_menu_callback(void* context, uint32_t index) {
         FURI_LOG_I("delfyRTL", "ChannelMap");
         scene_manager_handle_custom_event(app->scene_manager, ChannelMap);
         break;
+    case BleScan:
+        FURI_LOG_I("delfyRTL", "BleScan");
+        scene_manager_handle_custom_event(app->scene_manager, BleScan);
+        break;
     case Exit:
         uart_helper_send(app->uart_helper, "STOP", 5);
         FURI_LOG_I("delfyRTL", "Exit");
@@ -363,6 +369,8 @@ void main_menu_scene_on_enter(void* context) {
         app->menu, "Send Beacon", &I_random_AP, CustomBeacon, delfyRTL_menu_callback, app);
     menu_add_item(app->menu, "Create AP", &I_Custom_AP, CreateAP, delfyRTL_menu_callback, app);
     menu_add_item(app->menu, "Channel Map", &I_Scan_Wifi, ChannelMap, delfyRTL_menu_callback, app);
+    if(delfy_has_cap(app, 'L'))
+        menu_add_item(app->menu, "BLE Scan", &I_Scan_Wifi, BleScan, delfyRTL_menu_callback, app);
     menu_add_item(app->menu, "Help", &I_help, Help, delfyRTL_menu_callback, app);
     menu_add_item(app->menu, "Exit", &I_exit, Exit, delfyRTL_menu_callback, app);
     menu_set_selected_item(app->menu, app->menuIndex);
@@ -400,6 +408,14 @@ bool main_menu_scene_on_event(void* context, SceneManagerEvent event) {
             break;
         case ChannelMap:
             scene_manager_next_scene(app->scene_manager, channelMapScene);
+            break;
+        case BleScan:
+            recon_text[0] = '\0';
+            snprintf(recon_title, sizeof(recon_title), "BLE");
+            uart_helper_send(app->uart_helper, "BLESCAN 8\n", 10);
+            snprintf(message, sizeof(message), "Scanning BLE...");
+            snprintf(popupHeader, sizeof(popupHeader), "BLE");
+            scene_manager_next_scene(app->scene_manager, popupScene);
             break;
         default:
             FURI_LOG_W("delfyRTL", "Evento desconocido: %ld", event.event);
@@ -1728,6 +1744,11 @@ void uart_process_line(FuriString* line, void* context) {
             app->fw_caps[n] = '\0';
         }
         FURI_LOG_I(TAG, "IDENT fw=%s caps=%s", app->fw_version, app->fw_caps);
+    } else if(strncmp(furi_string_get_cstr(line), "BLEDONE:", 8) == 0) {
+        snprintf(recon_title, sizeof(recon_title), "BLE");
+        scene_manager_next_scene(app->scene_manager, pmfScene);
+    } else if(strncmp(furi_string_get_cstr(line), "BLE:", 4) == 0) {
+        recon_append(furi_string_get_cstr(line));
     }
 }
 
