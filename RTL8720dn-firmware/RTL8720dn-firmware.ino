@@ -379,6 +379,28 @@ void setup() {
 String ssid="";
 uint32_t current_num = 0;
 
+// --- Promisc spike (GATE test): does the BW16 driver actually deliver data/EAPOL
+// frames to the promisc callback, or only mgmt? If data+EAPOL flow, handshake/PMKID/
+// station-enum ports are feasible; if not, they're off the table. RTW_PROMISC_ENABLE
+// + len_used=1 delivers Ethernet frames, so EAPOL shows up as ethertype 0x888e. ---
+static volatile uint32_t pm_total = 0, pm_mgmt = 0, pm_ctrl = 0, pm_data = 0, pm_eapol = 0;
+// RTW_PROMISC_ENABLE_2 (raw 802.11): buf[0] = frame control. type bits (buf[0]>>2)&3:
+// 0=mgmt 1=ctrl 2=data. EAPOL rides in a data frame after the 802.11 hdr + LLC/SNAP,
+// ethertype 0x888e at offset 30 (non-QoS) or 32 (QoS data).
+static void promisc_spike_cb(unsigned char *buf, unsigned int len, void *userdata) {
+  (void)userdata;
+  if (len < 1) return;
+  pm_total++;
+  uint8_t ftype = (buf[0] >> 2) & 0x3;
+  if (ftype == 0) pm_mgmt++;
+  else if (ftype == 1) pm_ctrl++;
+  else if (ftype == 2) {
+    pm_data++;
+    if ((len >= 32 && buf[30] == 0x88 && buf[31] == 0x8e) ||
+        (len >= 34 && buf[32] == 0x88 && buf[33] == 0x8e)) pm_eapol++;
+  }
+}
+
 void loop() {
   while (Serial1.available()) {
     delay(3);  //delay to allow buffer to fill
@@ -595,7 +617,20 @@ void loop() {
         Serial1.print(String(scan_results[i].security) + "|");
         Serial1.print(String(scan_results[i].rssi) + "\n");
       }
-      
+
+    }else if(readString.substring(0,11)=="PROMISCTEST"){
+      // GATE experiment: set channel, capture Ethernet frames for 10s, report counts.
+      int ch = readString.substring(12, readString.length()-1).toInt();
+      if(ch < 1 || ch > 165) ch = 6;
+      pm_total=0; pm_mgmt=0; pm_ctrl=0; pm_data=0; pm_eapol=0;
+      wext_set_channel(WLAN0_NAME, ch);
+      wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2: all 802.11 frames*/, promisc_spike_cb, 0);
+      for(int i=0;i<10;i++) delay(1000);
+      wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
+      String r = "PROMISC: ch="+String(ch)+" total="+String((unsigned)pm_total)+
+                 " mgmt="+String((unsigned)pm_mgmt)+" ctrl="+String((unsigned)pm_ctrl)+
+                 " data="+String((unsigned)pm_data)+" eapol="+String((unsigned)pm_eapol);
+      Serial.println(r); Serial1.println(r);
     }
     readString="";
 
