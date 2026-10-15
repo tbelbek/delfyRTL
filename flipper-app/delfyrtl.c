@@ -54,6 +54,7 @@ typedef enum {
     toolsMenuScene,
     channelMapScene,
     bleAdvInputScene,
+    ibeaconInputScene,
 
     DelfyRTLSceneCount
 } delfyRTLScene;
@@ -203,6 +204,7 @@ typedef struct delfyRTL {
     char fw_caps[16];    // capability letters, e.g. "DSEBH"
     View* chanMapView;   // G: channel-map canvas view
     char bleAdvHex[80];  // #5: BLE adv hex payload (typed / saved)
+    char ibeaconUuid[40];// #6: iBeacon UUID hex (typed)
 } delfyRTL;
 
 //Las opciones del menu
@@ -220,6 +222,8 @@ typedef enum {
     PortalFile = 10,
     BleAdvHex = 11,
     BleAdvReplay = 12,
+    IBeaconUuid = 13,
+    BadBleFile = 14,
 } MainMenuIndex;
 
 // Tools submenu item IDs — stable across capability-gating (dispatch keys off these,
@@ -410,6 +414,7 @@ static void listed_wifis_item_callback(void* context, uint32_t index);
 static bool delfy_has_cap(delfyRTL* app, char cap);
 static void delfy_load_portal(delfyRTL* app);
 static void delfy_adv_replay(delfyRTL* app);
+static void delfy_badble_file(delfyRTL* app);
 void delfyRTL_menu_callback(void* context, uint32_t index) {
     FURI_LOG_D(TAG, __func__);
     delfyRTL* app = context;
@@ -461,6 +466,12 @@ void delfyRTL_menu_callback(void* context, uint32_t index) {
     case BleAdvReplay:
         scene_manager_handle_custom_event(app->scene_manager, BleAdvReplay);
         break;
+    case IBeaconUuid:
+        scene_manager_handle_custom_event(app->scene_manager, IBeaconUuid);
+        break;
+    case BadBleFile:
+        scene_manager_handle_custom_event(app->scene_manager, BadBleFile);
+        break;
     case Exit:
         uart_helper_send(app->uart_helper, "STOP", 5);
         FURI_LOG_I("delfyRTL", "Exit");
@@ -487,10 +498,14 @@ void main_menu_scene_on_enter(void* context) {
         menu_add_item(app->menu, "Load Portal", &I_Custom_AP, PortalFile, delfyRTL_menu_callback, app);
     if(delfy_has_cap(app, 'L'))
         menu_add_item(app->menu, "BLE Scan", &I_Scan_Wifi, BleScan, delfyRTL_menu_callback, app);
-    if(delfy_has_cap(app, 'I'))
+    if(delfy_has_cap(app, 'I')) {
         menu_add_item(app->menu, "BLE iBeacon", &I_Scan_Wifi, BleBeacon, delfyRTL_menu_callback, app);
-    if(delfy_has_cap(app, 'K'))
+        menu_add_item(app->menu, "iBeacon UUID", &I_Scan_Wifi, IBeaconUuid, delfyRTL_menu_callback, app);
+    }
+    if(delfy_has_cap(app, 'K')) {
         menu_add_item(app->menu, "BadBLE HID", &I_Scan_Wifi, BadBle, delfyRTL_menu_callback, app);
+        menu_add_item(app->menu, "BadBLE file", &I_Scan_Wifi, BadBleFile, delfyRTL_menu_callback, app);
+    }
     if(delfy_has_cap(app, 'L')) {
         menu_add_item(app->menu, "BLE Adv (hex)", &I_Scan_Wifi, BleAdvHex, delfyRTL_menu_callback, app);
         menu_add_item(app->menu, "BLE Adv replay", &I_Scan_Wifi, BleAdvReplay, delfyRTL_menu_callback, app);
@@ -566,6 +581,12 @@ bool main_menu_scene_on_event(void* context, SceneManagerEvent event) {
             break;
         case BleAdvReplay:
             delfy_adv_replay(app);
+            break;
+        case IBeaconUuid:
+            scene_manager_next_scene(app->scene_manager, ibeaconInputScene);
+            break;
+        case BadBleFile:
+            delfy_badble_file(app);
             break;
         default:
             FURI_LOG_W("delfyRTL", "Evento desconocido: %ld", event.event);
@@ -1242,6 +1263,62 @@ void ble_adv_input_scene_on_exit(void* context) {
     UNUSED(context);
 }
 
+static void delfy_badble_file(delfyRTL* app) {
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    File* f = storage_file_alloc(st);
+    uint8_t buf[96]; size_t n = 0;
+    if(storage_file_open(f, "/ext/delfy/badble.txt", FSAM_READ, FSOM_OPEN_EXISTING)) {
+        n = storage_file_read(f, buf, sizeof(buf));
+        storage_file_close(f);
+    }
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+    if(n == 0) {
+        snprintf(message, sizeof(message), "Put text at\n/ext/delfy/badble.txt");
+        snprintf(popupHeader, sizeof(popupHeader), "BadBLE");
+        scene_manager_next_scene(app->scene_manager, popupScene);
+        return;
+    }
+    char hex[200] = "";
+    for(size_t i = 0; i < n; i++) snprintf(hex + i * 2, 3, "%02x", buf[i]);
+    char cmd[230];
+    snprintf(cmd, sizeof(cmd), "BADBLE 60 %s\n", hex);
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    snprintf(message, sizeof(message), "BadBLE %u B", (unsigned)n);
+    snprintf(popupHeader, sizeof(popupHeader), "BadBLE");
+    scene_manager_next_scene(app->scene_manager, popupScene);
+}
+
+static void delfy_ibeacon_input_cb(void* context) {
+    delfyRTL* app = context;
+    char cmd[80];
+    snprintf(cmd, sizeof(cmd), "BLEIBEACON %s 1 1 30\n", app->ibeaconUuid);
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    scene_manager_previous_scene(app->scene_manager);
+}
+
+void ibeacon_input_scene_on_enter(void* context) {
+    delfyRTL* app = context;
+    text_input_reset(app->text_input);
+    text_input_set_header_text(app->text_input, "iBeacon UUID (32 hex)");
+    text_input_set_result_callback(
+        app->text_input,
+        delfy_ibeacon_input_cb,
+        app,
+        app->ibeaconUuid,
+        sizeof(app->ibeaconUuid) - 1,
+        false);
+    view_dispatcher_switch_to_view(app->view_dispatcher, bssidTextInputView);
+}
+bool ibeacon_input_scene_on_event(void* context, SceneManagerEvent event) {
+    UNUSED(context);
+    UNUSED(event);
+    return false;
+}
+void ibeacon_input_scene_on_exit(void* context) {
+    UNUSED(context);
+}
+
 static void delfy_toggle_hop(delfyRTL* app) {
     hop_on = !hop_on;
     uart_helper_send(app->uart_helper, hop_on ? "HOP 500\n" : "HOP 0\n", hop_on ? 8 : 6);
@@ -1872,7 +1949,8 @@ void (*const delfyRTL_scene_on_enter_handlers[])(void*) = {
     pmf_scene_on_enter,
     tools_menu_scene_on_enter,
     channel_map_scene_on_enter,
-    ble_adv_input_scene_on_enter};
+    ble_adv_input_scene_on_enter,
+    ibeacon_input_scene_on_enter};
 
 bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     main_menu_scene_on_event,
@@ -1891,7 +1969,8 @@ bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     pmf_scene_on_event,
     tools_menu_scene_on_event,
     channel_map_scene_on_event,
-    ble_adv_input_scene_on_event};
+    ble_adv_input_scene_on_event,
+    ibeacon_input_scene_on_event};
 
 void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     main_menu_scene_on_exit,
@@ -1910,7 +1989,8 @@ void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     pmf_scene_on_exit,
     tools_menu_scene_on_exit,
     channel_map_scene_on_exit,
-    ble_adv_input_scene_on_exit};
+    ble_adv_input_scene_on_exit,
+    ibeacon_input_scene_on_exit};
 
 static const SceneManagerHandlers delfyRTL_scene_manager_handlers = {
     .on_enter_handlers = delfyRTL_scene_on_enter_handlers,
@@ -2160,6 +2240,7 @@ static delfyRTL* app_alloc() {
     app->fw_version[0] = '\0';
     app->fw_caps[0] = '\0';
     app->bleAdvHex[0] = '\0';
+    app->ibeaconUuid[0] = '\0';
     app->scene_manager = scene_manager_alloc(&delfyRTL_scene_manager_handlers, app);
     app->view_dispatcher = view_dispatcher_alloc();
     //strncpy(app->customMac, "00:E0:4C:01:02:03", 18);

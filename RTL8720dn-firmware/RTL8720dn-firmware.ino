@@ -1333,11 +1333,22 @@ void loop() {
         BLE.end();
       }
     }else if(readString.substring(0,6)=="BADBLE"){
-      // P11: BLE HID keyboard injection. Args: BADBLE [secs]
-      // Advertises as a HID keyboard; if a host connects, types a line. LOW success:
+      // P11: BLE HID keyboard injection. Args: BADBLE [secs] [hex-payload]
+      // Advertises as a HID keyboard; if a host connects, types the payload. LOW success:
       // modern hosts require pairing/confirmation and reject unauth HID peripherals.
-      int secs = readString.substring(7, readString.length()-1).toInt();
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int secs = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1).toInt() : 30;
       if(secs < 1 || secs > 120) secs = 30;
+      String phex = (s2 > 0) ? readString.substring(s2+1, readString.length()-1) : String("");
+      char txt[96]; int tn = 0;
+      for(int i = 0; phex[i] && phex[i+1] && tn < 95; i += 2) {
+        int hi = hexnib(phex[i]), lo = hexnib(phex[i+1]);
+        if(hi < 0 || lo < 0) break;
+        txt[tn++] = (char)((hi << 4) | lo);
+      }
+      txt[tn] = 0;
+      if(tn == 0) strcpy(txt, "delfyRTL says hi\n");
       ble_hidadv.clear();
       ble_hidadv.addFlags();
       ble_hidadv.addCompleteName("DELFY-KB");
@@ -1362,7 +1373,7 @@ void loop() {
         if (BLE.connected() && !typed) {
           ble_kbd.keyReleaseAll();
           delay(300);
-          ble_kbd.keySequence("delfyRTL says hi\n", 20);
+          ble_kbd.keySequence(txt, 20);
           ble_kbd.keyReleaseAll();
           typed = true;
           Serial.println("BADBLE:typed"); Serial1.println("BADBLE:typed");
