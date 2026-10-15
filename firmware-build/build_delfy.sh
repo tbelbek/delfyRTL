@@ -40,6 +40,9 @@ docker run --rm --platform linux/amd64 \
     # patch core WiFiClient to expose remoteIP() (per-client captive 204 needs peer IP)
     CORE_WIFI="/root/.arduino15/packages/realtek/hardware/AmebaD/$CORE_VER/libraries/WiFi/src"
     python3 /patch/patch_wificlient.py "$CORE_WIFI"
+    # patch core BLEClient to expose the discovered service/characteristic UUIDs (host UI)
+    CORE_BLE="/root/.arduino15/packages/realtek/hardware/AmebaD/$CORE_VER/libraries/BLE/src"
+    python3 /patch/patch_bleclient.py "$CORE_BLE"
     # sketch folder name must match the .ino basename; /sketch is mounted ro so copy it
     INO=$(basename /sketch/*.ino .ino)
     cp -r /sketch "/tmp/$INO"

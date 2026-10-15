@@ -64,6 +64,7 @@ typedef enum {
     portalListScene,
     settingsScene,
     sessionScene,
+    gattScene,
 
     DelfyRTLSceneCount
 } delfyRTLScene;
@@ -211,6 +212,12 @@ static int sess_probes = 0;
 static int sess_stas = 0;
 static int sess_pmf = 0;
 static int sess_wifis = 0;
+
+// --- D1: BLE devices seen in the last scan (so "GATT enumerate" can pick one) -----
+#define BLE_LIST_MAX 16
+static char ble_list_mac[BLE_LIST_MAX][18];
+static char ble_list_name[BLE_LIST_MAX][24];
+static int ble_list_n = 0;
 // E: guided-audit context (written to /ext/delfy/audit.json when a grab finishes)
 static bool audit_mode = false;
 static char audit_ssid[33];
@@ -1629,6 +1636,7 @@ void ibeacon_input_scene_on_exit(void* context) {
 
 static void delfy_ble_scan(delfyRTL* app) {
     recon_text[0] = '\0';
+    ble_list_n = 0;   // D1: fresh device list for GATT enumerate
     snprintf(recon_title, sizeof(recon_title), "BLE");
     uart_helper_send(app->uart_helper, "BLESCAN 8\n", 10);
     delfy_busy(app, "BLE", "Scanning BLE...");
@@ -1706,6 +1714,7 @@ static void ble_hub_cb(void* context, uint32_t index) {
     case 5: scene_manager_next_scene(app->scene_manager, bleAdvInputScene); break;
     case 6: delfy_adv_replay(app); break;
     case 7: scene_manager_next_scene(app->scene_manager, bleAdvLibScene); break;
+    case 8: scene_manager_next_scene(app->scene_manager, gattScene); break;
     }
 }
 void ble_hub_scene_on_enter(void* context) {
@@ -1721,6 +1730,7 @@ void ble_hub_scene_on_enter(void* context) {
     submenu_add_item(app->submenu, "BLE Adv (hex)", 5, ble_hub_cb, app);
     submenu_add_item(app->submenu, "BLE Adv replay", 6, ble_hub_cb, app);
     submenu_add_item(app->submenu, "Saved adverts", 7, ble_hub_cb, app);
+    submenu_add_item(app->submenu, "GATT enumerate", 8, ble_hub_cb, app);
     view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
 }
 bool ble_hub_scene_on_event(void* context, SceneManagerEvent event) {
@@ -1972,6 +1982,42 @@ bool session_scene_on_event(void* context, SceneManagerEvent event) {
     return false;
 }
 void session_scene_on_exit(void* context) {
+    UNUSED(context);
+}
+
+// D1: pick a scanned BLE device and enumerate its GATT services/characteristics.
+static void gatt_item_cb(void* context, uint32_t index) {
+    delfyRTL* app = context;
+    if((int)index >= ble_list_n) return;
+    recon_text[0] = '\0';
+    snprintf(recon_title, sizeof(recon_title), "GATT");
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "BLEGATTPROBE %s 1\n", ble_list_mac[index]);
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    delfy_busy_ex(app, "GATT", "Connecting...", 15);
+}
+void gatt_scene_on_enter(void* context) {
+    delfyRTL* app = context;
+    app->submenuIndex = 0;
+    submenu_reset(app->submenu);
+    submenu_set_header(app->submenu, "GATT enumerate");
+    if(ble_list_n == 0) {
+        submenu_add_item(app->submenu, "Run BLE Scan first", 0, NULL, app);
+    } else {
+        for(int i = 0; i < ble_list_n; i++) {
+            char label[44];
+            snprintf(label, sizeof(label), "..%s %.12s", ble_list_mac[i] + 9, ble_list_name[i]);
+            submenu_add_item(app->submenu, label, i, gatt_item_cb, app);
+        }
+    }
+    view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
+}
+bool gatt_scene_on_event(void* context, SceneManagerEvent event) {
+    UNUSED(context);
+    UNUSED(event);
+    return false;
+}
+void gatt_scene_on_exit(void* context) {
     UNUSED(context);
 }
 
@@ -2843,7 +2889,7 @@ void (*const delfyRTL_scene_on_enter_handlers[])(void*) = {
     wifi_hub_scene_on_enter,
     ble_hub_scene_on_enter,
     ble_adv_lib_scene_on_enter,
-    portal_list_scene_on_enter, settings_scene_on_enter, session_scene_on_enter};
+    portal_list_scene_on_enter, settings_scene_on_enter, session_scene_on_enter, gatt_scene_on_enter};
 
 bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     main_menu_scene_on_event,
@@ -2868,7 +2914,7 @@ bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     wifi_hub_scene_on_event,
     ble_hub_scene_on_event,
     ble_adv_lib_scene_on_event,
-    portal_list_scene_on_event, settings_scene_on_event, session_scene_on_event};
+    portal_list_scene_on_event, settings_scene_on_event, session_scene_on_event, gatt_scene_on_event};
 
 void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     main_menu_scene_on_exit,
@@ -2893,7 +2939,7 @@ void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     wifi_hub_scene_on_exit,
     ble_hub_scene_on_exit,
     ble_adv_lib_scene_on_exit,
-    portal_list_scene_on_exit, settings_scene_on_exit, session_scene_on_exit};
+    portal_list_scene_on_exit, settings_scene_on_exit, session_scene_on_exit, gatt_scene_on_exit};
 
 static const SceneManagerHandlers delfyRTL_scene_manager_handlers = {
     .on_enter_handlers = delfyRTL_scene_on_enter_handlers,
@@ -3136,8 +3182,52 @@ void uart_process_line(FuriString* line, void* context) {
         snprintf(recon_title, sizeof(recon_title), "BLE");
         delfy_save_scan("ble", recon_text);
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
+    } else if(strncmp(furi_string_get_cstr(line), "GATT:done", 9) == 0) {
+        snprintf(recon_title, sizeof(recon_title), "GATT");
+        delfy_save_scan("gatt", recon_text);
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
+    } else if(strncmp(furi_string_get_cstr(line), "GATT:connect-failed", 19) == 0) {
+        snprintf(message, sizeof(message), "Connect failed");
+        snprintf(popupHeader, sizeof(popupHeader), "GATT");
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+    } else if(strncmp(furi_string_get_cstr(line), "GATT:", 5) == 0) {
+        recon_append(furi_string_get_cstr(line) + 5);
     } else if(strncmp(furi_string_get_cstr(line), "BLE:", 4) == 0) {
-        recon_append(furi_string_get_cstr(line));
+        // BLE:<mac>|<rssi>|<name>|<vendor>|<data> -> remember the device for GATT enumerate
+        const char* s = furi_string_get_cstr(line) + 4;
+        char mac[18] = "";
+        const char* p1 = strchr(s, '|');
+        if(p1 && (size_t)(p1 - s) < sizeof(mac)) {
+            size_t n = (size_t)(p1 - s);
+            memcpy(mac, s, n);
+            mac[n] = '\0';
+        }
+        if(mac[0]) {
+            char name[24] = "";
+            const char* p2 = p1 ? strchr(p1 + 1, '|') : NULL; // rssi
+            const char* p3 = p2 ? strchr(p2 + 1, '|') : NULL; // name
+            const char* p4 = p3 ? strchr(p3 + 1, '|') : NULL; // vendor
+            if(p3 && p4) {
+                size_t n = (size_t)(p4 - p3 - 1);
+                if(n > 23) n = 23;
+                memcpy(name, p3 + 1, n);
+                name[n] = '\0';
+            }
+            if(!name[0]) strncpy(name, "(no name)", sizeof(name) - 1);
+            bool have = false;
+            for(int i = 0; i < ble_list_n; i++)
+                if(!strcmp(ble_list_mac[i], mac)) {
+                    have = true;
+                    break;
+                }
+            if(!have && ble_list_n < BLE_LIST_MAX) {
+                strncpy(ble_list_mac[ble_list_n], mac, sizeof(ble_list_mac[0]) - 1);
+                ble_list_name[ble_list_n][0] = '\0';
+                strncpy(ble_list_name[ble_list_n], name, sizeof(ble_list_name[0]) - 1);
+                ble_list_n++;
+            }
+        }
+        recon_append(s);
     }
 }
 

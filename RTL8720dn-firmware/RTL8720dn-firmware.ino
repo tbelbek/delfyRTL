@@ -1472,6 +1472,18 @@ void loop() {
           cl->discoverServices();
           for(int i = 0; i < 50 && !cl->discoveryDone(); i++) delay(100);
           cl->printServices();  // service + characteristic UUIDs -> USB serial
+          // Also stream the discovered tree to the Flipper so the host can show it
+          // (printServices only writes to the SDK/USB log).
+          for(uint8_t si = 0; si < cl->getServiceCount(); si++) {
+            char line[96];
+            snprintf(line, sizeof(line), "GATT:S|%s", cl->getServiceUuid(si));
+            Serial.println(line); Serial1.println(line);
+            for(uint8_t ci = 0; ci < cl->getCharacteristicCount(si); ci++) {
+              char l2[96];
+              snprintf(l2, sizeof(l2), "GATT:C|%s", cl->getCharacteristicUuid(si, ci));
+              Serial.println(l2); Serial1.println(l2);
+            }
+          }
           conn->disconnect();
           Serial.println("GATT:done"); Serial1.println("GATT:done");
         }else{
