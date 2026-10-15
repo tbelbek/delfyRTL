@@ -45,6 +45,6 @@ docker run --rm --platform linux/amd64 \
     cp -r /sketch "/tmp/$INO"
     echo "=== compiling $INO ==="
     arduino-cli compile --fqbn "$FQBN" --output-dir /out --build-path /out/build -v "/tmp/$INO" 2>&1 \
-      | grep -iE "postbuild|img2|image2|km0_km4|error|\.bin|Sketch uses" | tail -30
+      | grep -iE "postbuild|img2|image2|km0_km4|error|undefined|reference to|overflow|region|ld:|warning:|Sketch uses|\.bin" | tail -30
     echo "=== images in /out (save_file target) ==="; find /out -maxdepth 2 -iname "*.bin" -exec ls -la {} \;
   '
