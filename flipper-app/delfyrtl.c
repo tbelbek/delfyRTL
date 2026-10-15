@@ -152,9 +152,10 @@ const char* const channelList[59] = {"1",   "2",   "3",   "4",   "5",   "6",   "
                                      "134", "136", "138", "140", "142", "144", "149", "151", "153",
                                      "155", "157", "159", "161", "165"};
 
+#define WIFI_MAX 48
 typedef struct {
     int idAP;
-    char* APssid;
+    char APssid[33]; // fixed buffer: the AP list lives in BSS, no heap churn / no worker-vs-GUI realloc race
     char APbssid[18];
     int chanel;
     int rssi;
@@ -192,9 +193,13 @@ typedef struct delfyRTL {
     char* ssidAP;
     uint8_t ssidAPLength;
     UartHelper* uart_helper;
-    APDetails* wifiList;
+    APDetails wifiList[WIFI_MAX];
     int selectedWifi;
     int wifiCount;
+    int ap_idx_name; // Create-AP screen row indices (tracked, since rows are conditional)
+    int ap_idx_pass;
+    int ap_idx_load;
+    int ap_idx_start;
     int captivePortal;
     int deauthReason;
     int mac_type;
@@ -609,13 +614,7 @@ void scan_networks_scene_on_enter(void* context) {
     delfyRTL* app = context;
     app->menuIndex = 0;
     view_dispatcher_switch_to_view(app->view_dispatcher, loadingView);
-    for(int i = 0; i < app->wifiCount; i++) {
-        free(app->wifiList[i].APssid);
-    }
-    free(app->wifiList);
-
-    app->wifiList = NULL;
-    app->wifiCount = 0;
+    app->wifiCount = 0; // fixed-size list in BSS: just reset the count (no heap)
 
     uart_helper_send(app->uart_helper, "SCAN\n", 5);
     scanFinish = false;
@@ -1213,11 +1212,12 @@ static void delfy_load_portal_file(delfyRTL* app, const char* name) {
         off += cl;
     }
     furi_delay_ms(120);
-    app->captivePortal = 6; // keep Custom(file) selected for the next AP start
+    app->captivePortal = 6; // Custom(file): selected + used on the next AP start
     uart_helper_send(app->uart_helper, "PORTAL 6\n", 9);
     snprintf(message, sizeof(message), "Loaded: %s\n%u B", name, (unsigned)n);
     snprintf(popupHeader, sizeof(popupHeader), "Portal");
-    scene_manager_next_scene(app->scene_manager, popupScene);
+    // Return to the Create-AP screen (re-entered -> Portal Type now shows "Custom (file)")
+    scene_manager_previous_scene(app->scene_manager);
 }
 
 static void portal_item_cb(void* context, uint32_t index) {
@@ -2013,100 +2013,43 @@ void config_ap_change_call_back(void* context, uint32_t index) {
     FURI_LOG_D(TAG, "%p %ld", context, index);
     delfyRTL* app = context;
     char cadena[100] = "";
-    switch(index) {
-    case 0:
+    if((int)index == app->ap_idx_name) {
         text_input_reset(app->text_input);
         text_input_set_header_text(app->text_input, "Acces Point Name");
         text_input_set_result_callback(
             app->text_input, config_ap_scene_on_enter, app, app->ssidAP, app->ssidAPLength, true);
         view_dispatcher_switch_to_view(app->view_dispatcher, apNameTextInputView);
-        break;
-    case 2:
-        if(app->securityAP == 1) {
-            text_input_reset(app->text_input);
-            text_input_set_header_text(app->text_input, "Acces Point Password");
-            text_input_set_result_callback(
-                app->text_input,
-                config_ap_scene_on_enter,
-                app,
-                app->passwordAP,
-                app->passwordAPLength,
-                true);
-            view_dispatcher_switch_to_view(app->view_dispatcher, apPasswordTextInputView);
-        }
-        break;
-    case 5:
-        if(app->securityAP == 0 && app->mac_type == 2) {
-            scene_manager_next_scene(app->scene_manager, aPmacAddresScene);
-        } else {
-            if(app->securityAP == 1) {
-                snprintf(cadena, 74, "PASSWORD %s\n", app->passwordAP);
-                uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-                furi_delay_ms(200);
-            }
-            snprintf(cadena, 25, "APMAC %s\n", app->customMac);
-            uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-            furi_delay_ms(200);
-            snprintf(cadena, 25, "CHANNEL %s\n", channelList[app->channelAP]);
-            uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-            furi_delay_ms(200);
-            snprintf(cadena, 13, "PORTAL %d\n", app->captivePortal);
-            uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-            furi_delay_ms(200);
-            snprintf(cadena, 48, "APSTART %s\n", app->ssidAP);
-            FURI_LOG_D(TAG, "%s", app->ssidAP);
-            uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-            scene_manager_next_scene(app->scene_manager, evilCredsScene);
-        }
-        break;
-
-    case 6:
-        if(app->securityAP == 1 && app->mac_type == 2) {
-            scene_manager_next_scene(app->scene_manager, aPmacAddresScene);
-        } else {
-            if(app->securityAP == 1) {
-                snprintf(cadena, 74, "PASSWORD %s\n", app->passwordAP);
-                uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-                furi_delay_ms(200);
-            }
-            snprintf(cadena, 25, "APMAC %s\n", app->customMac);
-            uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-            furi_delay_ms(200);
-            snprintf(cadena, 25, "CHANNEL %s\n", channelList[app->channelAP]);
-            uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-            furi_delay_ms(200);
-            snprintf(cadena, 13, "PORTAL %d\n", app->captivePortal);
-            uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-            furi_delay_ms(200);
-            snprintf(cadena, 48, "APSTART %s\n", app->ssidAP);
-            FURI_LOG_D(TAG, "%s", app->ssidAP);
-            uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-            scene_manager_next_scene(app->scene_manager, evilCredsScene);
-        }
-        break;
-    case 7:
+    } else if((int)index == app->ap_idx_pass) {
+        text_input_reset(app->text_input);
+        text_input_set_header_text(app->text_input, "Acces Point Password");
+        text_input_set_result_callback(
+            app->text_input,
+            config_ap_scene_on_enter,
+            app,
+            app->passwordAP,
+            app->passwordAPLength,
+            true);
+        view_dispatcher_switch_to_view(app->view_dispatcher, apPasswordTextInputView);
+    } else if((int)index == app->ap_idx_load) {
+        scene_manager_next_scene(app->scene_manager, portalListScene); // pick .html from /ext/delfy/portals
+    } else if((int)index == app->ap_idx_start) {
         if(app->securityAP == 1) {
             snprintf(cadena, 74, "PASSWORD %s\n", app->passwordAP);
             uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-            furi_delay_ms(200);
+            furi_delay_ms(150);
         }
         snprintf(cadena, 25, "APMAC %s\n", app->customMac);
         uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-        furi_delay_ms(200);
+        furi_delay_ms(150);
         snprintf(cadena, 25, "CHANNEL %s\n", channelList[app->channelAP]);
         uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-        furi_delay_ms(200);
+        furi_delay_ms(150);
         snprintf(cadena, 13, "PORTAL %d\n", app->captivePortal);
         uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-        furi_delay_ms(200);
+        furi_delay_ms(150);
         snprintf(cadena, 48, "APSTART %s\n", app->ssidAP);
-        FURI_LOG_D(TAG, "%s", app->ssidAP);
         uart_helper_send(app->uart_helper, cadena, strlen(cadena));
         scene_manager_next_scene(app->scene_manager, evilCredsScene);
-
-        break;
-    default:
-        break;
     }
 }
 
@@ -2117,40 +2060,52 @@ void config_ap_scene_on_enter(void* context) {
     app->menuIndex = CreateAP;
     credentials[0] = '\0';
     variable_item_list_reset(app->variableList);
+    int idx = 0;
+    app->ap_idx_name = idx++;
     item = variable_item_list_add(app->variableList, "AP NAME", 1, NULL, NULL);
     variable_item_set_current_value_text(item, app->ssidAP);
     variable_item_set_current_value_index(item, 0);
 
+    idx++; // SECURITY
     item = variable_item_list_add(app->variableList, "SECURITY", 2, security_change_callback, app);
     variable_item_set_current_value_text(item, securityType[app->securityAP]);
     variable_item_set_current_value_index(item, app->securityAP);
 
+    app->ap_idx_pass = -1;
     if(app->securityAP != 0) {
+        app->ap_idx_pass = idx++;
         item = variable_item_list_add(app->variableList, "Password", 1, NULL, NULL);
         variable_item_set_current_value_text(item, app->passwordAP);
         variable_item_set_current_value_index(item, 0);
     }
 
+    idx++; // Channel
     item = variable_item_list_add(app->variableList, "Channel", 59, channel_change_callback, app);
     variable_item_set_current_value_text(item, channelList[app->channelAP]);
     variable_item_set_current_value_index(item, app->channelAP);
 
+    idx++; // Portal Type
     item = variable_item_list_add(
         app->variableList, "Portal Type", CAPTIVE_PORTAL_SIZE, portal_type_change_call_back, app);
     variable_item_set_current_value_index(item, app->captivePortal);
     variable_item_set_current_value_text(item, captive_portals[app->captivePortal]);
 
+    // Load Portal file -> opens the /ext/delfy/portals browser (right below Portal Type)
+    app->ap_idx_load = idx++;
+    variable_item_list_add(app->variableList, "Load Portal file", 0, NULL, NULL);
+
+    idx++; // Mac Type
     item =
         variable_item_list_add(app->variableList, "Mac Type", 3, mac_type_change_call_back, app);
     variable_item_set_current_value_index(item, app->mac_type);
     variable_item_set_current_value_text(item, mac_type[app->mac_type]);
 
     if(app->mac_type == 2) {
+        idx++;
         item = variable_item_list_add(app->variableList, app->customMac, 0, NULL, NULL);
     }
-    variable_item_list_set_enter_callback(app->variableList, ap_config_enter_call_back, app);
-
-    item = variable_item_list_add(app->variableList, "Start", 1, NULL, app);
+    app->ap_idx_start = idx++;
+    item = variable_item_list_add(app->variableList, "Start", 1, NULL, NULL);
     variable_item_list_set_enter_callback(app->variableList, config_ap_change_call_back, app);
 
     view_dispatcher_switch_to_view(app->view_dispatcher, configAPView);
@@ -2296,32 +2251,23 @@ void uart_process_line(FuriString* line, void* context) {
     FURI_LOG_D(TAG, "%s", furi_string_get_cstr(line));
     delfyRTL* app = context;
     if(strncmp(furi_string_get_cstr(line), "AP:", 3) == 0) {
-        char buffer[128]; // Pequeño buffer en la pila (Flipper Zero tiene RAM limitada)
+        if(app->wifiCount >= WIFI_MAX) return; // fixed-size list full
+        char buffer[128];
         strncpy(buffer, furi_string_get_cstr(line), sizeof(buffer) - 1);
-        buffer[sizeof(buffer) - 1] = '\0'; // Asegurar terminación nula
+        buffer[sizeof(buffer) - 1] = '\0';
 
         char* token = strtok(buffer, ":|"); // Omitir "AP:"
         if(!token) return;
+        APDetails* newAP = &app->wifiList[app->wifiCount]; // BSS slot, no heap
 
-        // Crear un nuevo espacio en la lista
-        APDetails* temp = realloc(app->wifiList, (app->wifiCount + 1) * sizeof(APDetails));
-        if(!temp) {
-            printf("Error de memoria\n");
-            return;
-        }
-        app->wifiList = temp;
-        APDetails* newAP = &app->wifiList[app->wifiCount];
-
-        // Extraer los valores
         token = strtok(NULL, "|"); // ID del AP
         if(!token) return;
         newAP->idAP = atoi(token);
 
         token = strtok(NULL, "|"); // SSID
         if(!token) return;
-        newAP->APssid = malloc(strlen(token) + 1);
-        if(!newAP->APssid) return;
-        strcpy(newAP->APssid, token);
+        strncpy(newAP->APssid, token, sizeof(newAP->APssid) - 1);
+        newAP->APssid[sizeof(newAP->APssid) - 1] = '\0';
 
         token = strtok(NULL, "|"); // BSSID
         if(!token) return;
@@ -2332,7 +2278,7 @@ void uart_process_line(FuriString* line, void* context) {
         if(!token) return;
         newAP->chanel = atoi(token);
 
-        token = strtok(NULL, "|"); // RSSI
+        token = strtok(NULL, "|"); // security
         if(!token) return;
         newAP->security = atoi(token);
 
@@ -2494,8 +2440,6 @@ static delfyRTL* app_alloc() {
     FURI_LOG_D(TAG, __func__);
     delfyRTL* app = malloc(sizeof(delfyRTL));
     app->ssidAPLength = 32;
-    app->ssidAP = malloc(app->ssidAPLength);
-    app->wifiList = NULL;
     //app->ssidAPLength = 0;
     app->captivePortal = 0;
     app->deauthReason = 2;
@@ -2646,13 +2590,7 @@ static void app_free(delfyRTL* app) {
 
     text_input_free(app->text_input);
     loading_free(app->loading);
-    for(int i = 0; i < app->wifiCount; i++) {
-        free(app->wifiList[i].APssid); // Liberar memoria del SSID
-    }
-
-    free(app->wifiList); // Liberar el array dinámico
-    app->wifiList = NULL; // Evitar punteros colgantes
-    app->wifiCount = 0; // Resetear el contador
+    app->wifiCount = 0;
     app->rickIndex = 0;
 
     free(app->ssidAP);
