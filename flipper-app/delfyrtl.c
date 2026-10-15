@@ -1878,77 +1878,208 @@ void pmf_scene_on_exit(void* context) {
 }
 
 // G: channel map — per-2.4 GHz-channel AP counts (widget text map; no custom View).
-static int aps_on_channel(delfyRTL* app, int ch) {
-    int n = 0;
-    for(int i = 0; i < app->wifiCount; i++)
-        if(app->wifiList[i].chanel == ch) n++;
-    return n;
-}
+// Channel map — 5Ghost-style: one horizontal spectrum (present 2.4G channels then present 5G
+// channels), bar = AP count, filled = recommended, Left/Right pans, footer = best channels.
+typedef struct {
+    uint8_t count24[14]; // APs per 2.4GHz channel [1..13]
+    uint8_t max24;
+    int best24; // recommended 1/6/11
+    int total24;
+    uint8_t ch5[32]; // 5GHz channels present
+    uint8_t cnt5[32];
+    int n5;
+    uint8_t max5;
+    int best5; // least-busy present 5GHz channel
+    int total5;
+} ChanStats;
 
-static int aps_on_band(delfyRTL* app, int lo, int hi) {
-    int n = 0;
+typedef struct {
+    ChanStats s;
+    int scroll; // first visible channel column
+    int nu; // present channels on the unified axis
+} ChanModel;
+
+#define CHAN_SLOT 16 // px per channel column
+#define CHAN_VIS  7  // columns visible at once
+
+static void channel_compute_stats(ChanStats* s, delfyRTL* app) {
+    memset(s, 0, sizeof(*s));
+    s->best24 = -1;
+    s->best5 = -1;
     for(int i = 0; i < app->wifiCount; i++) {
         int ch = app->wifiList[i].chanel;
-        if(ch >= lo && ch <= hi) n++;
+        if(ch >= 1 && ch <= 13) {
+            s->count24[ch]++;
+            s->total24++;
+            if(s->count24[ch] > s->max24) s->max24 = s->count24[ch];
+        } else if(ch > 14) {
+            s->total5++;
+            int j = 0;
+            for(; j < s->n5; j++)
+                if(s->ch5[j] == ch) break;
+            if(j == s->n5 && s->n5 < (int)sizeof(s->ch5)) {
+                s->ch5[s->n5] = ch;
+                s->n5++;
+            }
+            if(j < (int)sizeof(s->ch5)) {
+                s->cnt5[j]++;
+                if(s->cnt5[j] > s->max5) s->max5 = s->cnt5[j];
+            }
+        }
     }
-    return n;
+    if(s->total24 > 0) {
+        const int cand[3] = {1, 6, 11};
+        int best_cost = 100000;
+        for(int k = 0; k < 3; k++) {
+            int c = cand[k], cost = 0;
+            for(int ch = c - 2; ch <= c + 2; ch++)
+                if(ch >= 1 && ch <= 13) cost += s->count24[ch];
+            if(cost < best_cost) {
+                best_cost = cost;
+                s->best24 = c;
+            }
+        }
+    }
+    for(int a = 1; a < s->n5; a++) { // sort present 5G channels ascending
+        uint8_t kc = s->ch5[a], kn = s->cnt5[a];
+        int b = a - 1;
+        while(b >= 0 && s->ch5[b] > kc) {
+            s->ch5[b + 1] = s->ch5[b];
+            s->cnt5[b + 1] = s->cnt5[b];
+            b--;
+        }
+        s->ch5[b + 1] = kc;
+        s->cnt5[b + 1] = kn;
+    }
+    if(s->n5 > 0) {
+        int best_cost = 100000;
+        for(int j = 0; j < s->n5; j++) {
+            if(s->cnt5[j] < best_cost ||
+               (s->cnt5[j] == best_cost && s->best5 > 0 && s->ch5[j] < s->best5)) {
+                best_cost = s->cnt5[j];
+                s->best5 = s->ch5[j];
+            }
+        }
+    }
 }
 
-static delfyRTL* g_chmap = NULL;
+static void channel_map_draw(Canvas* canvas, void* model) {
+    ChanModel* m = model;
+    ChanStats* s = &m->s;
+    canvas_clear(canvas);
+    canvas_set_color(canvas, ColorBlack);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 2, 10, "Channel Map");
+    canvas_set_font(canvas, FontSecondary);
 
-static void channel_map_draw(Canvas* c, void* model) {
-    UNUSED(model);
-    delfyRTL* app = g_chmap;
-    canvas_clear(c);
-    canvas_set_font(c, FontSecondary);
-    canvas_draw_str(c, 2, 9, "Channel Map");
-    if(!app || app->wifiCount == 0) {
-        canvas_draw_str(c, 2, 30, "Scan Wi-Fi first");
+    int total = s->total24 + s->total5;
+    if(total == 0) {
+        canvas_draw_str_aligned(canvas, 64, 34, AlignCenter, AlignCenter, "No scan data");
+        canvas_draw_str_aligned(canvas, 64, 46, AlignCenter, AlignCenter, "Run Scan first");
         return;
     }
-    // 2.4 GHz: channels 1..13
-    int maxc = 1;
-    for(int ch = 1; ch <= 13; ch++) {
-        int n = aps_on_channel(app, ch);
-        if(n > maxc) maxc = n;
-    }
-    for(int ch = 1; ch <= 13; ch++) {
-        int n = aps_on_channel(app, ch);
-        if(n <= 0) continue;
-        int h = (n * 14) / maxc;
-        int x = 2 + (ch - 1) * 9;
-        canvas_draw_box(c, x, 28 - h, 7, h);
-        char num[12];
-        snprintf(num, sizeof(num), "%d", n);
-        canvas_draw_str(c, x + 1, 28 - h - 1, num);
-    }
-    canvas_draw_str(c, 2, 38, "2.4G 1-13");
+    char hstat[20];
+    snprintf(hstat, sizeof(hstat), "%d APs", total);
+    canvas_draw_str_aligned(canvas, 126, 11, AlignRight, AlignBottom, hstat);
 
-    // 5 GHz: U-NII bands (36-48, 52-64, 100-144, 149-165)
-    static const int blo[4] = {36, 52, 100, 149};
-    static const int bhi[4] = {48, 64, 144, 165};
-    static const char* blb[4] = {"U1", "U2a", "U2c", "U3"};
-    int maxb = 1;
-    for(int b = 0; b < 4; b++) {
-        int n = aps_on_band(app, blo[b], bhi[b]);
-        if(n > maxb) maxb = n;
+    // Unified axis: present 2.4G channels, then present 5G channels (sorted).
+    uint8_t uch[40], ucnt[40];
+    bool ubest[40];
+    int nu = 0;
+    for(int ch = 1; ch <= 13 && nu < 40; ch++) {
+        if(s->count24[ch] > 0) {
+            uch[nu] = ch;
+            ucnt[nu] = s->count24[ch];
+            ubest[nu] = (ch == s->best24);
+            nu++;
+        }
     }
-    for(int b = 0; b < 4; b++) {
-        int n = aps_on_band(app, blo[b], bhi[b]);
-        int h = (n * 13) / maxb;
-        int x = 6 + b * 30;
-        if(n > 0) canvas_draw_box(c, x, 60 - h, 7, h);
-        char num[12];
-        snprintf(num, sizeof(num), "%d", n);
-        canvas_draw_str(c, x + 2, 46, num); // count above the 5G bar
-        canvas_draw_str(c, x + 1, 63, blb[b]); // U-NII band label
+    int first5 = nu;
+    for(int j = 0; j < s->n5 && nu < 40; j++) {
+        uch[nu] = s->ch5[j];
+        ucnt[nu] = s->cnt5[j];
+        ubest[nu] = (s->ch5[j] == s->best5);
+        nu++;
     }
-    canvas_draw_str(c, 102, 38, "5G");
+    int maxc = s->max24 > s->max5 ? s->max24 : s->max5;
+    if(maxc < 1) maxc = 1;
+
+    const int base_y = 47, top_y = 16;
+    int start = m->scroll;
+    if(start < 0) start = 0;
+    if(start > nu - 1) start = nu - 1;
+    int end = start + CHAN_VIS;
+    if(end > nu) end = nu;
+    for(int i = start; i < end; i++) {
+        int x = 6 + (i - start) * CHAN_SLOT;
+        int h = 1 + (ucnt[i] * (base_y - top_y)) / maxc;
+        int bw = CHAN_SLOT - 5;
+        if(ubest[i])
+            canvas_draw_box(canvas, x, base_y - h, bw, h); // filled = recommended
+        else
+            canvas_draw_frame(canvas, x, base_y - h, bw, h); // outline = busy
+        char cl[6];
+        snprintf(cl, sizeof(cl), "%d", uch[i]);
+        int clw = canvas_string_width(canvas, cl);
+        canvas_draw_str(canvas, x + (bw - clw) / 2, base_y + 9, cl);
+        if(i == first5 && i > start)
+            canvas_draw_line(canvas, x - 3, top_y, x - 3, base_y); // 2.4G | 5G divider
+    }
+    canvas_draw_line(canvas, 0, base_y, 127, base_y);
+    if(start > 0) canvas_draw_str(canvas, 0, 33, "<");
+    if(end < nu) canvas_draw_str(canvas, 123, 33, ">");
+
+    if(s->total24 > 0 && s->total5 > 0) {
+        char f24[20], f5[16];
+        snprintf(f24, sizeof(f24), "Best 2.4G: %d", s->best24);
+        snprintf(f5, sizeof(f5), "5G: %d", s->best5);
+        canvas_draw_str(canvas, 2, 63, f24);
+        canvas_draw_str(canvas, 126 - canvas_string_width(canvas, f5), 63, f5);
+    } else {
+        char foot[28];
+        if(s->total24 > 0) snprintf(foot, sizeof(foot), "Best 2.4G channel %d", s->best24);
+        else snprintf(foot, sizeof(foot), "Best 5G channel %d", s->best5);
+        canvas_draw_str(canvas, 2, 63, foot);
+    }
+}
+
+static bool channel_map_input(InputEvent* event, void* context) {
+    delfyRTL* app = context;
+    if(event->type != InputTypeShort && event->type != InputTypeRepeat) return false;
+    bool handled = false;
+    with_view_model(
+        app->chanMapView,
+        ChanModel * m,
+        {
+            int maxs = m->nu - CHAN_VIS;
+            if(maxs < 0) maxs = 0;
+            if(event->key == InputKeyLeft || event->key == InputKeyUp) {
+                if(m->scroll > 0) m->scroll--;
+                handled = true;
+            } else if(event->key == InputKeyRight || event->key == InputKeyDown) {
+                if(m->scroll < maxs) m->scroll++;
+                handled = true;
+            }
+        },
+        true);
+    return handled;
 }
 
 void channel_map_scene_on_enter(void* context) {
     delfyRTL* app = context;
-    g_chmap = app;
+    with_view_model(
+        app->chanMapView,
+        ChanModel * m,
+        {
+            channel_compute_stats(&m->s, app);
+            int nu = 0;
+            for(int ch = 1; ch <= 13; ch++)
+                if(m->s.count24[ch] > 0) nu++;
+            nu += m->s.n5;
+            m->nu = nu;
+            m->scroll = 0;
+        },
+        true);
     view_dispatcher_switch_to_view(app->view_dispatcher, channelMapView);
 }
 
@@ -2559,7 +2690,10 @@ static delfyRTL* app_alloc() {
     view_dispatcher_add_view(app->view_dispatcher, cardMenuView, app->cardView);
 
     app->chanMapView = view_alloc();
+    view_allocate_model(app->chanMapView, ViewModelTypeLocking, sizeof(ChanModel));
+    view_set_context(app->chanMapView, app);
     view_set_draw_callback(app->chanMapView, channel_map_draw);
+    view_set_input_callback(app->chanMapView, channel_map_input);
     view_dispatcher_add_view(app->view_dispatcher, channelMapView, app->chanMapView);
 
     app->uart_helper = uart_helper_alloc();
