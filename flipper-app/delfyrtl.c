@@ -58,6 +58,7 @@ typedef enum {
     ibeaconInputScene,
     wifiHubScene,
     bleHubScene,
+    bleAdvLibScene,
 
     DelfyRTLSceneCount
 } delfyRTLScene;
@@ -1186,14 +1187,42 @@ static void delfy_load_portal(delfyRTL* app) {
     scene_manager_next_scene(app->scene_manager, popupScene);
 }
 
-// #5: BLE adv library — save the typed hex to /ext/delfy/adv.txt, replay it, or broadcast.
+// #5: BLE adv library — save/replay multiple adverts in /ext/delfy/adv.txt (one hex/line).
+static int delfy_adv_load(char lines[8][80]) {
+    int n = 0;
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    File* f = storage_file_alloc(st);
+    if(storage_file_open(f, "/ext/delfy/adv.txt", FSAM_READ, FSOM_OPEN_EXISTING)) {
+        char buf[640];
+        size_t rd = storage_file_read(f, buf, sizeof(buf) - 1);
+        buf[rd] = '\0';
+        storage_file_close(f);
+        size_t i = 0;
+        while(n < 8) {
+            while(i < rd && (buf[i] == '\r' || buf[i] == '\n')) i++;
+            if(i >= rd) break;
+            size_t s = i;
+            while(i < rd && buf[i] != '\r' && buf[i] != '\n') i++;
+            size_t len = i - s;
+            if(len > 79) len = 79;
+            memcpy(lines[n], buf + s, len);
+            lines[n][len] = '\0';
+            n++;
+        }
+    }
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+    return n;
+}
+
 static void delfy_adv_save(delfyRTL* app) {
     if(app->bleAdvHex[0] == '\0') return;
     Storage* st = furi_record_open(RECORD_STORAGE);
     storage_common_mkdir(st, "/ext/delfy");
     File* f = storage_file_alloc(st);
-    if(storage_file_open(f, "/ext/delfy/adv.txt", FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+    if(storage_file_open(f, "/ext/delfy/adv.txt", FSAM_WRITE, FSOM_OPEN_APPEND)) {
         storage_file_write(f, app->bleAdvHex, strlen(app->bleAdvHex));
+        storage_file_write(f, "\n", 1);
         storage_file_close(f);
     }
     storage_file_free(f);
@@ -1201,27 +1230,58 @@ static void delfy_adv_save(delfyRTL* app) {
 }
 
 static void delfy_adv_replay(delfyRTL* app) {
-    Storage* st = furi_record_open(RECORD_STORAGE);
-    File* f = storage_file_alloc(st);
-    char hex[80] = "";
-    if(storage_file_open(f, "/ext/delfy/adv.txt", FSAM_READ, FSOM_OPEN_EXISTING)) {
-        size_t n = storage_file_read(f, hex, sizeof(hex) - 1);
-        hex[n] = '\0';
-        for(size_t i = 0; i < n; i++) if(hex[i] == '\r' || hex[i] == '\n') { hex[i] = '\0'; break; }
-        storage_file_close(f);
-    }
-    storage_file_free(f);
-    furi_record_close(RECORD_STORAGE);
-    if(hex[0] == '\0') {
+    char lines[8][80];
+    int n = delfy_adv_load(lines);
+    if(n == 0) {
         snprintf(message, sizeof(message), "No saved advert");
     } else {
         char cmd[100];
-        snprintf(cmd, sizeof(cmd), "BLEADV %s 30\n", hex);
+        snprintf(cmd, sizeof(cmd), "BLEADV %s 30\n", lines[n - 1]);
         uart_helper_send(app->uart_helper, cmd, strlen(cmd));
         snprintf(message, sizeof(message), "Adv replay sent");
     }
     snprintf(popupHeader, sizeof(popupHeader), "BLE Adv");
     scene_manager_next_scene(app->scene_manager, popupScene);
+}
+
+static char adv_lines[8][80];
+static int adv_n = 0;
+static void ble_adv_lib_cb(void* context, uint32_t index) {
+    delfyRTL* app = context;
+    if((int)index < adv_n) {
+        char cmd[100];
+        snprintf(cmd, sizeof(cmd), "BLEADV %s 30\n", adv_lines[index]);
+        uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+        snprintf(message, sizeof(message), "Adv replay");
+        snprintf(popupHeader, sizeof(popupHeader), "BLE Adv");
+        scene_manager_next_scene(app->scene_manager, popupScene);
+    } else {
+        Storage* st = furi_record_open(RECORD_STORAGE);
+        File* f = storage_file_alloc(st);
+        if(storage_file_open(f, "/ext/delfy/adv.txt", FSAM_WRITE, FSOM_CREATE_ALWAYS))
+            storage_file_close(f);
+        storage_file_free(f);
+        furi_record_close(RECORD_STORAGE);
+        scene_manager_previous_scene(app->scene_manager);
+    }
+}
+void ble_adv_lib_scene_on_enter(void* context) {
+    delfyRTL* app = context;
+    adv_n = delfy_adv_load(adv_lines);
+    submenu_reset(app->submenu);
+    submenu_set_header(app->submenu, "Saved adverts");
+    for(int i = 0; i < adv_n; i++)
+        submenu_add_item(app->submenu, adv_lines[i], (uint32_t)i, ble_adv_lib_cb, app);
+    submenu_add_item(app->submenu, "Clear saved", (uint32_t)adv_n, ble_adv_lib_cb, app);
+    view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
+}
+bool ble_adv_lib_scene_on_event(void* context, SceneManagerEvent event) {
+    UNUSED(context);
+    UNUSED(event);
+    return false;
+}
+void ble_adv_lib_scene_on_exit(void* context) {
+    UNUSED(context);
 }
 
 static void delfy_adv_input_cb(void* context) {
@@ -1377,6 +1437,7 @@ static void ble_hub_cb(void* context, uint32_t index) {
     case 4: delfy_badble_file(app); break;
     case 5: scene_manager_next_scene(app->scene_manager, bleAdvInputScene); break;
     case 6: delfy_adv_replay(app); break;
+    case 7: scene_manager_next_scene(app->scene_manager, bleAdvLibScene); break;
     }
 }
 void ble_hub_scene_on_enter(void* context) {
@@ -1390,6 +1451,7 @@ void ble_hub_scene_on_enter(void* context) {
     submenu_add_item(app->submenu, "BadBLE file", 4, ble_hub_cb, app);
     submenu_add_item(app->submenu, "BLE Adv (hex)", 5, ble_hub_cb, app);
     submenu_add_item(app->submenu, "BLE Adv replay", 6, ble_hub_cb, app);
+    submenu_add_item(app->submenu, "Saved adverts", 7, ble_hub_cb, app);
     view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
 }
 bool ble_hub_scene_on_event(void* context, SceneManagerEvent event) {
@@ -1763,33 +1825,46 @@ static int aps_on_channel(delfyRTL* app, int ch) {
     return n;
 }
 
-void channel_map_scene_on_enter(void* context) {
-    delfyRTL* app = context;
-    widget_reset(app->widget);
-    widget_add_string_element(
-        app->widget, 64, 2, AlignCenter, AlignTop, FontPrimary, "Channel Map");
-    if(app->wifiCount == 0) {
-        widget_add_string_element(
-            app->widget, 64, 30, AlignCenter, AlignTop, FontSecondary, "Scan Wi-Fi first");
-        view_dispatcher_switch_to_view(app->view_dispatcher, pmfView);
+static delfyRTL* g_chmap = NULL;
+
+static void channel_map_draw(Canvas* c, void* model) {
+    UNUSED(model);
+    delfyRTL* app = g_chmap;
+    canvas_clear(c);
+    canvas_set_font(c, FontSecondary);
+    canvas_draw_str(c, 2, 9, "Channel Map");
+    if(!app || app->wifiCount == 0) {
+        canvas_draw_str(c, 2, 30, "Scan Wi-Fi first");
         return;
     }
-    char map[384];
-    size_t p = 0;
-    int n5 = 0;
+    int maxc = 1, n5 = 0;
+    for(int ch = 1; ch <= 13; ch++) {
+        int n = aps_on_channel(app, ch);
+        if(n > maxc) maxc = n;
+    }
     for(int i = 0; i < app->wifiCount; i++)
         if(app->wifiList[i].chanel > 14) n5++;
+    char b5[16];
+    snprintf(b5, sizeof(b5), "5G:%d", n5);
+    canvas_draw_str(c, 96, 9, b5);
     for(int ch = 1; ch <= 13; ch++) {
-        int c = aps_on_channel(app, ch);
-        char bar[16];
-        int b = 0;
-        for(int k = 0; k < c && k < 12; k++) bar[b++] = '#';
-        bar[b] = '\0';
-        if(p < sizeof(map)) p += snprintf(map + p, sizeof(map) - p, "%2d %-12s %d\n", ch, bar, c);
+        int n = aps_on_channel(app, ch);
+        if(n <= 0) continue;
+        int h = (n * 34) / maxc;
+        int x = 3 + (ch - 1) * 9;
+        canvas_draw_box(c, x, 56 - h, 7, h);
+        char num[12];
+        snprintf(num, sizeof(num), "%d", n);
+        canvas_draw_str(c, x + 1, 56 - h - 1, num);
     }
-    if(p < sizeof(map)) p += snprintf(map + p, sizeof(map) - p, "5GHz APs: %d\n", n5);
-    widget_add_text_scroll_element(app->widget, 0, 14, 128, 50, map);
-    view_dispatcher_switch_to_view(app->view_dispatcher, pmfView);
+    canvas_draw_str(c, 3, 63, "1");
+    canvas_draw_str(c, 108, 63, "13");
+}
+
+void channel_map_scene_on_enter(void* context) {
+    delfyRTL* app = context;
+    g_chmap = app;
+    view_dispatcher_switch_to_view(app->view_dispatcher, channelMapView);
 }
 
 bool channel_map_scene_on_event(void* context, SceneManagerEvent event) {
@@ -2070,7 +2145,8 @@ void (*const delfyRTL_scene_on_enter_handlers[])(void*) = {
     ble_adv_input_scene_on_enter,
     ibeacon_input_scene_on_enter,
     wifi_hub_scene_on_enter,
-    ble_hub_scene_on_enter};
+    ble_hub_scene_on_enter,
+    ble_adv_lib_scene_on_enter};
 
 bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     main_menu_scene_on_event,
@@ -2092,7 +2168,8 @@ bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     ble_adv_input_scene_on_event,
     ibeacon_input_scene_on_event,
     wifi_hub_scene_on_event,
-    ble_hub_scene_on_event};
+    ble_hub_scene_on_event,
+    ble_adv_lib_scene_on_event};
 
 void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     main_menu_scene_on_exit,
@@ -2114,7 +2191,8 @@ void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     ble_adv_input_scene_on_exit,
     ibeacon_input_scene_on_exit,
     wifi_hub_scene_on_exit,
-    ble_hub_scene_on_exit};
+    ble_hub_scene_on_exit,
+    ble_adv_lib_scene_on_exit};
 
 static const SceneManagerHandlers delfyRTL_scene_manager_handlers = {
     .on_enter_handlers = delfyRTL_scene_on_enter_handlers,
@@ -2206,22 +2284,28 @@ void uart_process_line(FuriString* line, void* context) {
         scanFinish = true;
         FURI_LOG_D(TAG, "SCAN FINISH");
     } else if(strncmp(furi_string_get_cstr(line), "EV:", 3) == 0) {
-        char buffer[128]; // Pequeño buffer en la pila (Flipper Zero tiene RAM limitada)
+        char buffer[128];
         strncpy(buffer, furi_string_get_cstr(line), sizeof(buffer) - 1);
-        char* token = strtok(buffer, ":|"); // Omitir "AP:"
+        buffer[sizeof(buffer) - 1] = '\0';
+        char* token = strtok(buffer, ":|"); // Omitir "EV:"
         if(!token) return;
         token = strtok(NULL, "|");
-        strcat(credentials, token);
-        strcat(credentials, "\n");
+        if(!token) return;
+        if(strlen(credentials) + strlen(token) + 2 < sizeof(credentials)) {
+            strcat(credentials, token);
+            strcat(credentials, "\n");
+        }
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_CREDS);
     } else if(strncmp(furi_string_get_cstr(line), "ERROR:", 6) == 0) {
-        char buffer[128]; // Pequeño buffer en la pila (Flipper Zero tiene RAM limitada)
+        char buffer[128];
         strncpy(buffer, furi_string_get_cstr(line), sizeof(buffer) - 1);
+        buffer[sizeof(buffer) - 1] = '\0';
         char* token = strtok(buffer, ":");
         if(!token) return;
         token = strtok(NULL, "|");
+        if(!token) return;
 
-        strcat(message, token);
+        snprintf(message, sizeof(message), "%s", token);
         snprintf(popupHeader, sizeof(popupHeader), "ERROR");
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
     } else if(strncmp(furi_string_get_cstr(line), "HSCAP:", 6) == 0) {
@@ -2440,6 +2524,10 @@ static delfyRTL* app_alloc() {
     view_set_input_callback(app->cardView, card_menu_input);
     view_dispatcher_add_view(app->view_dispatcher, cardMenuView, app->cardView);
 
+    app->chanMapView = view_alloc();
+    view_set_draw_callback(app->chanMapView, channel_map_draw);
+    view_dispatcher_add_view(app->view_dispatcher, channelMapView, app->chanMapView);
+
     app->uart_helper = uart_helper_alloc();
     uart_helper_set_baud_rate(app->uart_helper, DEVICE_BAUDRATE);
     uart_helper_set_delimiter(app->uart_helper, LINE_DELIMITER, INCLUDE_LINE_DELIMITER);
@@ -2480,6 +2568,7 @@ static void app_free(delfyRTL* app) {
     view_dispatcher_remove_view(app->view_dispatcher, cardMenuView);
     view_dispatcher_remove_view(app->view_dispatcher, pmfView);
     view_dispatcher_remove_view(app->view_dispatcher, toolsListView);
+    view_dispatcher_remove_view(app->view_dispatcher, channelMapView);
 
     scene_manager_free(app->scene_manager);
 
@@ -2490,6 +2579,7 @@ static void app_free(delfyRTL* app) {
     menu_free(app->menu);
     submenu_free(app->submenu);
     view_free(app->cardView);
+    view_free(app->chanMapView);
 
     text_input_free(app->text_input);
     loading_free(app->loading);
