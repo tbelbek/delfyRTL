@@ -5,7 +5,9 @@ App(
     name="DelfiRTL",  # Displayed in menus
     apptype=FlipperAppType.EXTERNAL,
     entry_point="delfyRTL_app",
-    stack_size=2 * 1024,
+    stack_size=6 * 1024,   # was 2K: deep scene/widget call chains overflowed it and
+                           # corrupted the heap, surfacing as loader 'Out of Memory'
+                           # (note: an unrelated 'BusFault' on Exit is still open)
     fap_category="GPIO",
     # Optional values
     # fap_version="0.1",

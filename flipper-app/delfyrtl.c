@@ -130,6 +130,14 @@ const char* const deauth_reasons[25] = {
     "IEEE 802.1X authentication failed.",
     "Cipher suite rejected because of the security policy.",
 };
+// Short labels for the "Deauth Reason" row: the full IEEE text above is wider than the
+// variable-item value column, so the on-screen value was clipped ("<nger vali>").
+const char* const deauth_reason_short[25] = {
+    "resvd", "unsp",  "prev",  "leave", "inact", "busy",  "cls2",
+    "cls3",  "leav2", "nauth", "pwrcp", "supch", "bsstr", "elem",
+    "mic",   "4way",  "grptmo", "4wayd", "gciph", "pciph", "akmp",
+    "ver",   "caps",  "8021x", "ciph",
+};
 static const Icon* rick[] = {&I_rick0,  &I_rick1,  &I_rick2,  &I_rick3,  &I_rick4,  &I_rick5,
                              &I_rick6,  &I_rick7,  &I_rick8,  &I_rick9,  &I_rick10, &I_rick11,
                              &I_rick12, &I_rick13, &I_rick14, &I_rick15, &I_rick16, &I_rick17,
@@ -172,6 +180,7 @@ static char recon_text[1024];
 static char recon_title[24];
 static char wpa_lines[512]; // PMKID WPA*01* lines -> /ext/delfy/pmkid.22000
 static bool hop_on = false;
+static bool busy_active = false; // true while the animated busy scene owns the stack
 // E: guided-audit context (written to /ext/delfy/audit.json when a grab finishes)
 static bool audit_mode = false;
 static char audit_ssid[33];
@@ -271,6 +280,8 @@ typedef enum {
 #define DELFY_EVT_RECON 0x2000
 #define DELFY_EVT_POPUP 0x2001
 #define DELFY_EVT_BUSY_TICK 0x2003
+#define DELFY_EVT_BUSY_TIMEOUT 0x2004
+#define DELFY_EVT_EXIT 0x2005
 #define DELFY_EVT_CREDS 0x2002
 
 typedef enum {
@@ -460,6 +471,74 @@ static void creds_append_sd(const char* line) {
 
 static void listed_wifis_item_callback(void* context, uint32_t index);
 static void delfy_busy(delfyRTL* app, const char* header, const char* text);
+
+// Tughan: persist the SCAN RESULTS to the SD (not an action log). One timestamped file per
+// scan under /ext/delfy/scans/ (e.g. 2026-10-15_13-40-12_wifis.txt) with a small header, so
+// every Wi-Fi/PMF/STA/BLE result survives a reboot and can be reviewed later.
+static void delfy_save_scan(const char* kind, const char* body) {
+    if(!kind) return;
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    storage_common_mkdir(st, "/ext/delfy");
+    storage_common_mkdir(st, "/ext/delfy/scans");
+    DateTime dt;
+    furi_hal_rtc_get_datetime(&dt);
+    char path[112];
+    snprintf(
+        path,
+        sizeof(path),
+        "/ext/delfy/scans/%04d-%02d-%02d_%02d-%02d-%02d_%s.txt",
+        dt.year,
+        dt.month,
+        dt.day,
+        dt.hour,
+        dt.minute,
+        dt.second,
+        kind);
+    File* f = storage_file_alloc(st);
+    if(storage_file_open(f, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        char hdr[96];
+        int n = snprintf(
+            hdr,
+            sizeof(hdr),
+            "# %04d-%02d-%02d %02d:%02d:%02d  %s\n",
+            dt.year,
+            dt.month,
+            dt.day,
+            dt.hour,
+            dt.minute,
+            dt.second,
+            kind);
+        storage_file_write(f, hdr, (size_t)n);
+        if(body && body[0]) storage_file_write(f, body, strlen(body));
+        storage_file_close(f);
+    }
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+}
+
+// Build "BSSID|SSID|ch|rssi|security" lines for the whole scanned AP list and save it.
+static void delfy_save_wifi_list(delfyRTL* app) {
+    if(app->wifiCount <= 0) return;
+    size_t cap = (size_t)app->wifiCount * 96u + 1u;
+    char* buf = malloc(cap);
+    if(!buf) return;
+    buf[0] = '\0';
+    for(int i = 0; i < app->wifiCount; i++) {
+        char line[112];
+        snprintf(
+            line,
+            sizeof(line),
+            "%s|%s|ch%d|%ddBm|0x%X\n",
+            app->wifiList[i].APbssid,
+            app->wifiList[i].APssid,
+            app->wifiList[i].chanel,
+            app->wifiList[i].rssi,
+            app->wifiList[i].security);
+        if(strlen(buf) + strlen(line) < cap) strcat(buf, line);
+    }
+    delfy_save_scan("wifis", buf);
+    free(buf);
+}
 static void busy_show(delfyRTL* app);
 static bool delfy_has_cap(delfyRTL* app, char cap);
 static void delfy_adv_replay(delfyRTL* app);
@@ -680,6 +759,7 @@ void scan_networks_scene_on_exit(void* context) {
 void list_networks_scene_on_enter(void* context) {
     FURI_LOG_D(TAG, __func__);
     delfyRTL* app = context;
+    delfy_save_wifi_list(app);   // persist the scanned AP list to /ext/delfy/scans/
     app->menuIndex = 1;
     char* channelSt;
     app->submenuIndex = 0;
@@ -900,23 +980,19 @@ void info_wifi_scene_on_enter(void* context) {
             app->wifiList[app->selectedWifi].rssi,
             app->wifiList[app->selectedWifi].APbssid);
 
-        FuriString* tmp_ssid = furi_string_alloc_set(app->wifiList[app->selectedWifi].APssid);
-        bool not_empty = (furi_string_cmp(tmp_ssid, "<empty>") != 0);
-        furi_string_free(tmp_ssid);
-        if(not_empty) {
-            if(app->wifiList[app->selectedWifi].deauth) {
-                widget_add_button_element(
-                    app->widget, GuiButtonTypeCenter, "Stop", info_wifi_button_press, app);
-            } else {
-                widget_add_button_element(
-                    app->widget, GuiButtonTypeCenter, "Deauth", info_wifi_button_press, app);
-            }
-
+        // Always show the action buttons. They used to be gated on a non-"<empty>" SSID,
+        // which left a hidden AP's info screen with no <Edit button -> you could not reach
+        // the attack config / Tools at all. A hidden AP still has a BSSID, so Deauth/Evil
+        // work fine; the SSID shown in the title is "<empty>" but nothing else needs it.
+        if(app->wifiList[app->selectedWifi].deauth) {
             widget_add_button_element(
-                app->widget, GuiButtonTypeRight, "Evil", info_wifi_button_press, app);
+                app->widget, GuiButtonTypeCenter, "Stop", info_wifi_button_press, app);
+        } else {
             widget_add_button_element(
-                app->widget, GuiButtonTypeLeft, "Edit", info_wifi_button_press, app);
+                app->widget, GuiButtonTypeCenter, "Deauth", info_wifi_button_press, app);
         }
+        widget_add_button_element(app->widget, GuiButtonTypeRight, "Evil", info_wifi_button_press, app);
+        widget_add_button_element(app->widget, GuiButtonTypeLeft, "Edit", info_wifi_button_press, app);
     }
     widget_add_string_multiline_element(
         app->widget, 64, 45, AlignCenter, AlignBottom, FontSecondary, infoWifi);
@@ -960,7 +1036,7 @@ void deauth_reason_change_call_back(VariableItem* item) {
     FURI_LOG_D(TAG, __func__);
     int index = variable_item_get_current_value_index(item);
     delfyRTL* app = variable_item_get_context(item);
-    variable_item_set_current_value_text(item, deauth_reasons[index]);
+    variable_item_set_current_value_text(item, deauth_reason_short[index]);
     app->deauthReason = index;
 
     UNUSED(item);
@@ -1574,7 +1650,12 @@ static void tools_item_callback(void* context, uint32_t index) {
     case TOOL_DARUN: delfy_deauth_run(app); break;
     case TOOL_DASTOP: delfy_deauth_stop(app); break;
     case TOOL_CAPSTOP: delfy_capture_stop(app); break;
-    case TOOL_STOP: uart_helper_send(app->uart_helper, "STOP\n", 5); break;
+    case TOOL_STOP:
+        uart_helper_send(app->uart_helper, "STOP\n", 5);
+        snprintf(message, sizeof(message), "Stopped / cleared");
+        snprintf(popupHeader, sizeof(popupHeader), "Stop");
+        scene_manager_next_scene(app->scene_manager, popupScene);
+        break;
     }
 }
 
@@ -1636,9 +1717,9 @@ void config_attack_scene_on_enter(void* context) {
     VariableItem* item;
     variable_item_list_reset(app->variableList);
     item = variable_item_list_add(
-        app->variableList, "Deauth Reason", 25, deauth_reason_change_call_back, app);
+        app->variableList, "Reason", 25, deauth_reason_change_call_back, app);
     variable_item_set_current_value_index(item, app->deauthReason);
-    variable_item_set_current_value_text(item, deauth_reasons[app->deauthReason]);
+    variable_item_set_current_value_text(item, deauth_reason_short[app->deauthReason]);
     item = variable_item_list_add(
         app->variableList, "Portal Type", CAPTIVE_PORTAL_SIZE, portal_type_change_call_back, app);
     variable_item_set_current_value_index(item, app->captivePortal);
@@ -1879,15 +1960,24 @@ static void busy_view_draw(Canvas* canvas, void* model) {
     }
 }
 
+static volatile uint32_t busy_ticks = 0;
+
 static void busy_timer_cb(void* context) {
     // Commit the model straight from the timer thread -- the same pattern the (working)
     // RickRoll widget animation uses. Going through view_dispatcher_send_custom_event
     // left the phase stuck, so the spinner never rotated.
     delfyRTL* app = context;
     with_view_model(app->busyView, BusyModel* m, { m->phase++; }, true);
+    // Watchdog: the board may never answer (wedged AP/capture). Without this the spinner
+    // spun forever with no way out besides BACK. ~36 s at 120 ms/tick -> "Timeout" popup.
+    if(++busy_ticks >= 300) {
+        busy_ticks = 0;
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_BUSY_TIMEOUT);
+    }
 }
 
 static void busy_show(delfyRTL* app) {
+    busy_ticks = 0;
     with_view_model(app->busyView, BusyModel* m, { m->phase = 0; }, true);
     furi_timer_start(app->busyTimer, 120);
     view_dispatcher_switch_to_view(app->view_dispatcher, busyView);
@@ -1903,26 +1993,43 @@ bool busy_scene_on_event(void* context, SceneManagerEvent event) {
         with_view_model(app->busyView, BusyModel* m, { m->phase++; }, true);
         return true;
     }
+    if(event.type == SceneManagerEventTypeCustom && event.event == DELFY_EVT_BUSY_TIMEOUT) {
+        // No board reply within the watchdog window: drop the spinner and say so instead of
+        // spinning forever.
+        furi_timer_stop(app->busyTimer);
+        busy_active = false;
+        snprintf(message, sizeof(message), "Timed out - no board reply");
+        snprintf(popupHeader, sizeof(popupHeader), "Timeout");
+        scene_manager_previous_scene(app->scene_manager);
+        scene_manager_next_scene(app->scene_manager, popupScene);
+        return true;
+    }
     return false;
 }
 void busy_scene_on_exit(void* context) {
     delfyRTL* app = context;
     furi_timer_stop(app->busyTimer);
+    busy_active = false;
 }
 
 // Set the operation name + detail and switch to the animated busy screen.
 static void delfy_busy(delfyRTL* app, const char* header, const char* text) {
     snprintf(popupHeader, sizeof(popupHeader), "%s", header);
     snprintf(message, sizeof(message), "%s", text);
+    busy_active = true;
     scene_manager_next_scene(app->scene_manager, busyScene);
 }
 
 void popup_scene_on_enter(void* context) {
     delfyRTL* app = context;
     popup_reset(app->popup);
-    popup_set_header(app->popup, popupHeader, 5, 7, AlignRight, AlignTop);
+    // The 45x42 dolphin sits at the left; the header + message must live in the remaining
+    // right-hand column. The old (0,0,AlignCenter) anchored the text off-screen / under
+    // the icon, so every popup (audit, BadBLE file, Channel hop, ...) showed the dolphin
+    // with no visible text.
+    popup_set_header(app->popup, popupHeader, 87, 5, AlignCenter, AlignTop);
     popup_set_icon(app->popup, 0, 0, &I_WarningDolphin_45x42);
-    popup_set_text(app->popup, message, 0, 0, AlignCenter, AlignTop);
+    popup_set_text(app->popup, message, 87, 24, AlignCenter, AlignTop);
     view_dispatcher_switch_to_view(app->view_dispatcher, popupView);
     UNUSED(context);
 }
@@ -1945,14 +2052,49 @@ static void recon_append(const char* s) {
     }
 }
 
+// Format the raw recon records for the on-screen widget. The widget wraps at the pixel width
+// IGNORING spaces, so it cut records mid-token ("...|ak" / "m=2|..."). We therefore pre-split
+// each record into short physical lines ourselves (MAC + first field joined, then one field
+// per line) so the widget never has to wrap. The SD copy keeps the raw pipe-separated form.
+static void recon_format_display(char* out, size_t cap) {
+    size_t u = 0;
+    const char* p = recon_text;
+    while(p && *p && u + 30 < cap) {
+        const char* e = strchr(p, '\n');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        size_t start = 0;
+        int field = 0;
+        for(size_t i = 0; i <= len; i++) {
+            if(i == len || p[i] == '|') {
+                size_t flen = i - start;
+                if(field == 1 && u > 0 && flen <= 12) {
+                    out[u++] = ' '; // keep "MAC SSID" on one line when the SSID is short
+                } else if(field > 0) {
+                    out[u++] = '\n';
+                }
+                if(flen > 26) flen = 26;
+                for(size_t k = 0; k < flen && u + 2 < cap; k++) out[u++] = p[start + k];
+                start = i + 1;
+                field++;
+                if(u + 2 >= cap) break;
+            }
+        }
+        if(u + 1 < cap) out[u++] = '\n';
+        p = e ? e + 1 : p + len;
+    }
+    out[u] = '\0';
+}
+
 void pmf_scene_on_enter(void* context) {
     FURI_LOG_D(TAG, __func__);
     delfyRTL* app = context;
     widget_reset(app->widget);
     widget_add_string_element(
         app->widget, 64, 2, AlignCenter, AlignTop, FontPrimary, recon_title[0] ? recon_title : "Recon");
+    static char recon_disp[1024];
+    recon_format_display(recon_disp, sizeof(recon_disp));
     widget_add_text_scroll_element(
-        app->widget, 0, 16, 128, 48, recon_text[0] ? recon_text : "(empty)");
+        app->widget, 0, 16, 128, 48, recon_disp[0] ? recon_disp : "(empty)");
     view_dispatcher_switch_to_view(app->view_dispatcher, pmfView);
 }
 
@@ -2473,11 +2615,17 @@ static bool delfyRTL_custom_callback(void* context, uint32_t custom_event) {
     furi_assert(context);
     delfyRTL* app = context;
     // Deferred GUI transitions posted from the UART worker thread (runs on the GUI thread).
+    // A completion (result popup / recon view) arrives while the animated busy scene is the
+    // current scene. Pop it first, else the result lands ON TOP of the spinner and BACK
+    // falls back into the spinner ("busy <-> result" loop). The ERROR: path can arrive
+    // with no busy scene, hence the busy_active guard.
     if(custom_event == DELFY_EVT_RECON) {
+        if(busy_active) scene_manager_previous_scene(app->scene_manager);
         scene_manager_next_scene(app->scene_manager, pmfScene);
         return true;
     }
     if(custom_event == DELFY_EVT_POPUP) {
+        if(busy_active) scene_manager_previous_scene(app->scene_manager);
         scene_manager_next_scene(app->scene_manager, popupScene);
         return true;
     }
@@ -2611,11 +2759,13 @@ void uart_process_line(FuriString* line, void* context) {
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
     } else if(strncmp(furi_string_get_cstr(line), "PMFDONE:", 8) == 0) {
         snprintf(recon_title, sizeof(recon_title), "PMF / WPA3");
+        delfy_save_scan("pmf", recon_text);
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "PMF:", 4) == 0) {
         recon_append(furi_string_get_cstr(line) + 4);
     } else if(strncmp(furi_string_get_cstr(line), "STADONE:", 8) == 0) {
         snprintf(recon_title, sizeof(recon_title), "Stations");
+        delfy_save_scan("stations", recon_text);
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "STA:", 4) == 0) {
         recon_append(furi_string_get_cstr(line) + 4);
@@ -2655,6 +2805,7 @@ void uart_process_line(FuriString* line, void* context) {
         FURI_LOG_I(TAG, "IDENT fw=%s caps=%s", app->fw_version, app->fw_caps);
     } else if(strncmp(furi_string_get_cstr(line), "BLEDONE:", 8) == 0) {
         snprintf(recon_title, sizeof(recon_title), "BLE");
+        delfy_save_scan("ble", recon_text);
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "BLE:", 4) == 0) {
         recon_append(furi_string_get_cstr(line));
@@ -2826,6 +2977,10 @@ static void app_free(delfyRTL* app) {
     FURI_LOG_D(TAG, __func__);
     furi_assert(app);
 
+    furi_timer_stop(app->timer);
+    furi_timer_stop(app->busyTimer);
+    furi_timer_free(app->timer);
+    furi_timer_free(app->busyTimer);
     uart_helper_free(app->uart_helper);
 
     view_dispatcher_remove_view(app->view_dispatcher, mainMenuView);
@@ -2853,15 +3008,15 @@ static void app_free(delfyRTL* app) {
 
     view_dispatcher_free(app->view_dispatcher); //Some events whre not processed
 
-    furi_timer_free(app->timer);
-    furi_timer_free(app->busyTimer);
-
     menu_free(app->menu);
     submenu_free(app->submenu);
+    variable_item_list_free(app->variableList);
+    byte_input_free(app->byteInput);
+    popup_free(app->popup);
+    widget_free(app->widget);
     view_free(app->cardView);
     view_free(app->chanMapView);
     view_free(app->busyView);
-
     text_input_free(app->text_input);
     loading_free(app->loading);
     app->wifiCount = 0;
@@ -2889,7 +3044,6 @@ int32_t delfyRTL_app(void* p) {
 
     app_free(app);
     expansion_enable(expansion);
-
     furi_record_close(RECORD_EXPANSION);
 
     return 0;

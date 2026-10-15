@@ -1230,6 +1230,8 @@ void loop() {
       int secs = (s2 > 0) ? readString.substring(s2+1, readString.length()-1).toInt() : 10;
       if(ch < 1 || ch > 165) ch = 6;
       if(secs < 1 || secs > 60) secs = 10;
+      if(apActive) destroyAP();   // tear the softAP down first: its HTTP accept loop starves
+                                  // the monitor capture (CAPTURE/HSGRAB otherwise never finish)
       hs_count = 0;
       cap_ch = ch;
       hs_cap = true;
@@ -1268,6 +1270,7 @@ void loop() {
         Serial.println("ERROR: HSGRAB needs <chan> <bssid-12hex> [secs]");
         Serial1.println("ERROR: HSGRAB needs <chan> <bssid-12hex> [secs]");
       }else{
+        if(apActive) destroyAP();   // as above: no monitor capture while the softAP runs
         hs_count = 0;
         memcpy(hsg_bssid, bssid, 6);
         hsg_ch = ch;
@@ -1455,6 +1458,7 @@ void loop() {
       int secs = (s2 > 0) ? readString.substring(s2+1, readString.length()-1).toInt() : 5;
       if(ch < 1 || ch > 165) ch = 6;
       if(secs < 1 || secs > 60) secs = 5;
+      if(apActive) destroyAP();   // monitor scan needs the softAP torn down
       pmf_n = 0;
       wext_set_channel(WLAN0_NAME, ch);
       wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2: all 802.11 frames*/, promisc_pmf_cb, 0);
@@ -1480,6 +1484,7 @@ void loop() {
       }
       if(ch < 1 || ch > 165) ch = 6;
       if(secs < 1 || secs > 60) secs = 5;
+      if(apActive) destroyAP();   // monitor scan needs the softAP torn down
       sta_n = 0;
       sta_filter_on = (bssid_hex.length() == 12);
       for(int i=0; sta_filter_on && i<6; i++)
@@ -1505,6 +1510,7 @@ void loop() {
       if(!ok || ssid.length() == 0){
         Serial.println("ERR:PMKIDCLIENT:args"); Serial1.println("ERR:PMKIDCLIENT:args");
       }else{
+        if(apActive) destroyAP();   // monitor capture needs the softAP torn down
         pmkid_n = 0;
         cl_eapol = 0;
         char macstr[20] = {0};
@@ -1531,6 +1537,7 @@ void loop() {
       int secs = (s2 > 0) ? readString.substring(s2+1, readString.length()-1).toInt() : 10;
       if(ch < 1 || ch > 165) ch = 6;
       if(secs < 1 || secs > 60) secs = 10;
+      if(apActive) destroyAP();   // monitor capture needs the softAP torn down
       pmkid_n = 0;
       wext_set_channel(WLAN0_NAME, ch);
       wifi_set_promisc(3, promisc_pmkid_cb, 0);
@@ -1555,6 +1562,7 @@ void loop() {
         Serial.println("ERROR: PKGRAB needs <chan> <bssid-12hex> [secs]");
         Serial1.println("ERROR: PKGRAB needs <chan> <bssid-12hex> [secs]");
       }else{
+        if(apActive) destroyAP();   // monitor capture needs the softAP torn down
         pmkid_n = 0;
         memcpy(hsg_bssid, bssid, 6);
         hsg_ch = ch;

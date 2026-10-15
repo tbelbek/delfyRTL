@@ -15,6 +15,7 @@ How it works
   * Main: 1 command_id, 20 start_screen_stream, 22 screen_frame, 23 send_input_event
   * ScreenFrame.data = 1024 B, SSD1306 PAGE layout: byte = (y//8)*128 + x, bit = y%8
 """
+import signal
 import struct
 import sys
 import time
@@ -196,6 +197,14 @@ def main():
     if not args:
         print(__doc__)
         return 1
+    # ponytail: global watchdog. A busy FAP (e.g. channel-hop looping) can stop
+    # draining USB CDC and block serial open/write; without this the call hangs
+    # forever and leaves the RPC session orphaned, bricking the CLI until reboot.
+    if hasattr(signal, "SIGALRM"):
+        def _bail(_sig, _frm):
+            print("timeout"); sys.stdout.flush(); import os; os._exit(2)
+        signal.signal(signal.SIGALRM, _bail)
+        signal.alarm(20)
     settle = 0.25
     if "--settle" in args:
         settle = float(args[args.index("--settle") + 1])
