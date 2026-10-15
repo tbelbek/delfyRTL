@@ -76,6 +76,7 @@ static const char* ghost_ssids[8] = {
 
 
 std::vector<WiFiScanResult> scan_results;
+volatile bool scan_done = false;  // set by scanResultHandler when the driver reports completion
 std::vector<int> deauth_wifis, wifis_temp;
 //WiFiServer server(80);
 uint8_t deauth_bssid[6];
@@ -160,7 +161,11 @@ int status = WL_IDLE_STATUS;
 
 rtw_result_t scanResultHandler(rtw_scan_handler_result_t *scan_result) {
   rtw_scan_result_t *record;
-  if (scan_result->scan_complete == 0) {
+  if (scan_result->scan_complete != 0) {
+    scan_done = true;   // driver signalled completion -> all results are in
+    return RTW_SUCCESS;
+  }
+  {
     record = &scan_result->ap_details;
     record->SSID.val[record->SSID.len] = 0;
     WiFiScanResult result;
@@ -170,9 +175,8 @@ rtw_result_t scanResultHandler(rtw_scan_handler_result_t *scan_result) {
     result.rssi = record->signal_strength;
     
     memcpy(&result.bssid, &record->BSSID, 6);
-    char bssid_str[] = "XX:XX:XX:XX:XX:XX";
-    snprintf(bssid_str, sizeof(bssid_str), "%02X:%02X:%02X:%02X:%02X:%02X", result.bssid[0], result.bssid[1], result.bssid[2], result.bssid[3], result.bssid[4], result.bssid[5]);
-    result.bssid_str = bssid_str;
+    // (no bssid_str here: it pointed at a local -> dangling. The LIST output formats the
+    //  MAC itself with %02X, so the pointer was never needed.)
     result.security = record->security;
     scan_results.push_back(result);
   }
@@ -402,18 +406,23 @@ void handleRequest(WiFiClient &client,enum portals portalType,String ssid){
 int scanNetworks(int miliseconds) {
   DEBUG_SER_PRINT("Scanning WiFi networks ("+(String)miliseconds+" ms)...\n");
   scan_results.clear();
+  scan_done = false;
   DEBUG_SER_PRINT("wifi get band type:"+(String)wifi_get_band_type()+"\n");
   DEBUG_SER_PRINT("scan results cleared...");
   
   if (wifi_scan_networks(scanResultHandler, NULL) == RTW_SUCCESS) {
     digitalWrite(LED_B,false);
-    for (int i =0;i<miliseconds/100;i++){
+    // Wait for the DRIVER's completion signal (scan_done), not a fixed delay: the scan
+    // routinely takes longer than `miliseconds`, and a premature SCAN:OK made the host's
+    // immediately-following LIST race the results -> empty/partial list.
+    uint32_t t0 = millis();
+    uint32_t maxwait = (uint32_t)miliseconds + 5000u;
+    while (!scan_done && (millis() - t0) < maxwait) {
       digitalWrite(LED_G, !digitalRead(LED_G));
       delay(100);
-
     }
     digitalWrite(LED_B,true);
-    DEBUG_SER_PRINT(" done!\n");
+    DEBUG_SER_PRINT(" done! n="+(String)scan_results.size()+"\n");
     return 0;
   } else {
     DEBUG_SER_PRINT(" failed!\n");
@@ -1174,14 +1183,17 @@ void loop() {
         Serial.print(scan_results[i].ssid + "|");
         Serial1.print("AP:"+String(i)+"|");
         Serial1.print(scan_results[i].ssid + "|");
-        for (int j = 0; j < 6; j++) {
-          if (j > 0){
-             Serial.print(":");
-             Serial1.print(":");
-          }
-          Serial.print(scan_results[i].bssid[j], HEX);
-          Serial1.print(scan_results[i].bssid[j], HEX);
-          
+        {
+          // %02X: bytes <0x10 must keep their leading zero, else the host's colon-stripped
+          // 12-hex BSSID (used by HSGRAB/PKGRAB/DEAUTHADD) comes up short and is rejected,
+          // and the info screen's MAC is wrong. (Arduino's print(x, HEX) does NOT pad.)
+          char mac[18];
+          snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                   scan_results[i].bssid[0], scan_results[i].bssid[1],
+                   scan_results[i].bssid[2], scan_results[i].bssid[3],
+                   scan_results[i].bssid[4], scan_results[i].bssid[5]);
+          Serial.print(mac);
+          Serial1.print(mac);
         }
         Serial.print("|" + String(scan_results[i].channel) + "|");
         Serial.print(String(scan_results[i].security) + "|");

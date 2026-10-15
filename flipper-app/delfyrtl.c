@@ -52,6 +52,7 @@ typedef enum {
     configAPScene,
     helpScene,
     popupScene,
+    busyScene,
     pmfScene,
     toolsMenuScene,
     channelMapScene,
@@ -82,6 +83,7 @@ typedef enum {
     apPasswordTextInputView,
     helpView,
     popupView,
+    busyView,
     pmfView,
     toolsListView,
     channelMapView,
@@ -216,9 +218,16 @@ typedef struct delfyRTL {
     char fw_caps[16];    // capability letters, e.g. "DSEBH"
     View* chanMapView;   // G: channel-map canvas view
     View* cardView;      // card-grid main menu
+    View* busyView;      // animated "working" screen (name + spinner, no dolphin)
+    FuriTimer* busyTimer;
     char bleAdvHex[80];  // #5: BLE adv hex payload (typed / saved)
     char ibeaconUuid[40];// #6: iBeacon UUID hex (typed)
 } delfyRTL;
+
+// Model for the animated "working" screen (busyView): just a phase counter.
+typedef struct {
+    uint8_t phase;
+} BusyModel;
 
 //Las opciones del menu
 typedef enum {
@@ -261,6 +270,7 @@ typedef enum {
 // Deferred GUI events posted from the UART worker thread (GUI must run on the GUI thread).
 #define DELFY_EVT_RECON 0x2000
 #define DELFY_EVT_POPUP 0x2001
+#define DELFY_EVT_BUSY_TICK 0x2003
 #define DELFY_EVT_CREDS 0x2002
 
 typedef enum {
@@ -449,6 +459,8 @@ static void creds_append_sd(const char* line) {
 }
 
 static void listed_wifis_item_callback(void* context, uint32_t index);
+static void delfy_busy(delfyRTL* app, const char* header, const char* text);
+static void busy_show(delfyRTL* app);
 static bool delfy_has_cap(delfyRTL* app, char cap);
 static void delfy_adv_replay(delfyRTL* app);
 static void delfy_badble_file(delfyRTL* app);
@@ -569,9 +581,7 @@ bool main_menu_scene_on_event(void* context, SceneManagerEvent event) {
             recon_text[0] = '\0';
             snprintf(recon_title, sizeof(recon_title), "BLE");
             uart_helper_send(app->uart_helper, "BLESCAN 8\n", 10);
-            snprintf(message, sizeof(message), "Scanning BLE...");
-            snprintf(popupHeader, sizeof(popupHeader), "BLE");
-            scene_manager_next_scene(app->scene_manager, popupScene);
+            delfy_busy(app, "BLE", "Scanning BLE...");
             break;
         case BleBeacon:
             // Broadcast a demo iBeacon (fixed UUID/major/minor) for 30s.
@@ -579,16 +589,12 @@ bool main_menu_scene_on_event(void* context, SceneManagerEvent event) {
                 const char* c = "BLEIBEACON 0102030405060708090A0B0C0D0E0F10 1 1 30\n";
                 uart_helper_send(app->uart_helper, c, strlen(c));
             }
-            snprintf(message, sizeof(message), "iBeacon 30s...");
-            snprintf(popupHeader, sizeof(popupHeader), "BLE");
-            scene_manager_next_scene(app->scene_manager, popupScene);
+            delfy_busy(app, "BLE", "iBeacon 30s...");
             break;
         case BadBle:
             // Advertise as a HID keyboard for 30s (types once a host connects).
             uart_helper_send(app->uart_helper, "BADBLE 30\n", 10);
-            snprintf(message, sizeof(message), "BadBLE 30s...");
-            snprintf(popupHeader, sizeof(popupHeader), "BadBLE");
-            scene_manager_next_scene(app->scene_manager, popupScene);
+            delfy_busy(app, "BadBLE", "BadBLE 30s...");
             break;
         case PortalFile:
             scene_manager_next_scene(app->scene_manager, portalListScene);
@@ -637,7 +643,9 @@ void scan_networks_scene_on_enter(void* context) {
 
     delfyRTL* app = context;
     app->menuIndex = 0;
-    view_dispatcher_switch_to_view(app->view_dispatcher, loadingView);
+    snprintf(popupHeader, sizeof(popupHeader), "%s", "Wi-Fi");
+    snprintf(message, sizeof(message), "%s", "Scanning networks...");
+    busy_show(app);
     app->wifiCount = 0; // fixed-size list in BSS: just reset the count (no heap)
 
     uart_helper_send(app->uart_helper, "SCAN\n", 5);
@@ -666,7 +674,8 @@ bool scan_networks_scene_on_event(void* context, SceneManagerEvent event) {
 }
 void scan_networks_scene_on_exit(void* context) {
     FURI_LOG_D(TAG, __func__);
-    UNUSED(context);
+    delfyRTL* app = context;
+    furi_timer_stop(app->busyTimer);
 }
 void list_networks_scene_on_enter(void* context) {
     FURI_LOG_D(TAG, __func__);
@@ -1015,14 +1024,19 @@ static void delfy_start_capture(delfyRTL* app, bool grab) {
             if(b[i] != ':') hex[j++] = b[i];
         }
         hex[j] = '\0';
+        if(j != 12) {   // unpadded/malformed MAC -> refuse instead of sending garbage
+            snprintf(message, sizeof(message), "Bad BSSID - rescan");
+            snprintf(popupHeader, sizeof(popupHeader), "ERROR");
+            scene_manager_next_scene(app->scene_manager, popupScene);
+            return;
+        }
         snprintf(cmd, sizeof(cmd), "HSGRAB %d %s 20\n", ch, hex);
     } else {
         snprintf(cmd, sizeof(cmd), "CAPTURE %d 20\n", ch);
     }
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
-    snprintf(message, sizeof(message), "Capturing on ch %d...", ch);
-    snprintf(popupHeader, sizeof(popupHeader), "Handshake");
     // Result is shown when HSDONE arrives (uart_process_line -> popupScene).
+    { char b[48]; snprintf(b, sizeof(b), "Capturing on ch %d...", ch); delfy_busy(app, "Handshake", b); }
 }
 
 static void delfy_start_pmf(delfyRTL* app) {
@@ -1035,9 +1049,7 @@ static void delfy_start_pmf(delfyRTL* app) {
     char cmd[32];
     snprintf(cmd, sizeof(cmd), "PMFSCAN %d 5\n", ch);
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
-    snprintf(message, sizeof(message), "Scanning ch %d...", ch);
-    snprintf(popupHeader, sizeof(popupHeader), "PMF/WPA3");
-    scene_manager_next_scene(app->scene_manager, popupScene);
+    { char b[48]; snprintf(b, sizeof(b), "Scanning ch %d...", ch); delfy_busy(app, "PMF/WPA3", b); }
 }
 
 // Extract the selected AP's channel and (optionally) colon-stripped BSSID.
@@ -1051,6 +1063,7 @@ static void delfy_sel_ap(delfyRTL* app, int* ch, char* hex /*>=13*/) {
         for(int i = 0; b[i] && j < 12; i++)
             if(b[i] != ':') hex[j++] = b[i];
         hex[j] = '\0';
+        if(j != 12) hex[0] = '\0';   // malformed/unpadded MAC -> treat as "no BSSID"
     }
 }
 
@@ -1061,12 +1074,13 @@ static void delfy_start_sta(delfyRTL* app) {
     recon_text[0] = '\0';
     snprintf(recon_title, sizeof(recon_title), "Stations");
     char cmd[48];
-    if(hex[0]) snprintf(cmd, sizeof(cmd), "STASCAN %d 8 %s\n", ch, hex);
+    // Firmware parses STASCAN <chan> [bssid-12hex | secs] [secs] -- the BSSID must be the
+    // 2nd token (a 12-char 2nd token is treated as the filter); we used to put it 3rd,
+    // so the filter was silently ignored.
+    if(strlen(hex) == 12) snprintf(cmd, sizeof(cmd), "STASCAN %d %s 8\n", ch, hex);
     else snprintf(cmd, sizeof(cmd), "STASCAN %d 8\n", ch);
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
-    snprintf(message, sizeof(message), "STA scan ch %d...", ch);
-    snprintf(popupHeader, sizeof(popupHeader), "STASCAN");
-    scene_manager_next_scene(app->scene_manager, popupScene);
+    { char b[48]; snprintf(b, sizeof(b), "STA scan ch %d...", ch); delfy_busy(app, "STASCAN", b); }
 }
 
 static void delfy_start_pmkid(delfyRTL* app, bool grab) {
@@ -1079,10 +1093,8 @@ static void delfy_start_pmkid(delfyRTL* app, bool grab) {
     if(grab && hex[0]) snprintf(cmd, sizeof(cmd), "PKGRAB %d %s 10\n", ch, hex);
     else snprintf(cmd, sizeof(cmd), "PMKID %d 10\n", ch);
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
-    snprintf(message, sizeof(message), "PMKID ch %d...", ch);
-    snprintf(popupHeader, sizeof(popupHeader), "PMKID");
     wpa_lines[0] = '\0';
-    scene_manager_next_scene(app->scene_manager, popupScene);
+    { char b[48]; snprintf(b, sizeof(b), "PMKID ch %d...", ch); delfy_busy(app, "PMKID", b); }
 }
 
 // E: guided audit for the selected AP — grab + write /ext/delfy/audit.json.
@@ -1107,9 +1119,7 @@ static void delfy_start_audit(delfyRTL* app) {
     char cmd[48];
     snprintf(cmd, sizeof(cmd), "HSGRAB %d %s 20\n", ch, hex[0] ? hex : "FFFFFFFFFFFF");
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
-    snprintf(message, sizeof(message), "Audit ch %d...", ch);
-    snprintf(popupHeader, sizeof(popupHeader), "Audit");
-    scene_manager_next_scene(app->scene_manager, popupScene);
+    { char b[48]; snprintf(b, sizeof(b), "Audit ch %d...", ch); delfy_busy(app, "Audit", b); }
 }
 
 // A: capability check from the board's IDENT. Unknown/old fw -> permissive.
@@ -1125,17 +1135,13 @@ static void delfy_deauth_add(delfyRTL* app) {
     char cmd[48];
     snprintf(cmd, sizeof(cmd), "DEAUTHADD %s FFFFFFFFFFFF %d\n", hex[0] ? hex : "FFFFFFFFFFFF", ch);
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
-    snprintf(message, sizeof(message), "Deauth list + ch %d", ch);
-    snprintf(popupHeader, sizeof(popupHeader), "Deauth list");
-    scene_manager_next_scene(app->scene_manager, popupScene);
+    { char b[48]; snprintf(b, sizeof(b), "Deauth list + ch %d", ch); delfy_busy(app, "Deauth list", b); }
 }
 
 // C: arm the list (runs round-robin on the board).
 static void delfy_deauth_run(delfyRTL* app) {
     uart_helper_send(app->uart_helper, "DEAUTHRUN\n", 10);
-    snprintf(message, sizeof(message), "Deauth list running");
-    snprintf(popupHeader, sizeof(popupHeader), "Deauth list");
-    scene_manager_next_scene(app->scene_manager, popupScene);
+    delfy_busy(app, "Deauth list", "Deauth list running");
 }
 
 // C: clear/disarm the list without the WiFi teardown that STOP causes.
@@ -1168,9 +1174,7 @@ static void delfy_start_pmkid_clientless(delfyRTL* app) {
     char cmd[80];
     snprintf(cmd, sizeof(cmd), "PMKIDCLIENT %d %s %s\n", ch, hex[0] ? hex : "FFFFFFFFFFFF", ssid);
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
-    snprintf(message, sizeof(message), "PMKID(clientless) ch %d...", ch);
-    snprintf(popupHeader, sizeof(popupHeader), "PMKID");
-    scene_manager_next_scene(app->scene_manager, popupScene);
+    { char b[48]; snprintf(b, sizeof(b), "PMKID(clientless) ch %d...", ch); delfy_busy(app, "PMKID", b); }
 }
 
 // gap: send a custom portal HTML from /ext/delfy/portal.html to the board (chunked hex).
@@ -1460,22 +1464,16 @@ static void delfy_ble_scan(delfyRTL* app) {
     recon_text[0] = '\0';
     snprintf(recon_title, sizeof(recon_title), "BLE");
     uart_helper_send(app->uart_helper, "BLESCAN 8\n", 10);
-    snprintf(message, sizeof(message), "Scanning BLE...");
-    snprintf(popupHeader, sizeof(popupHeader), "BLE");
-    scene_manager_next_scene(app->scene_manager, popupScene);
+    delfy_busy(app, "BLE", "Scanning BLE...");
 }
 static void delfy_ibeacon_default(delfyRTL* app) {
     const char* c = "BLEIBEACON 0102030405060708090A0B0C0D0E0F10 1 1 30\n";
     uart_helper_send(app->uart_helper, c, strlen(c));
-    snprintf(message, sizeof(message), "iBeacon 30s...");
-    snprintf(popupHeader, sizeof(popupHeader), "BLE");
-    scene_manager_next_scene(app->scene_manager, popupScene);
+    delfy_busy(app, "BLE", "iBeacon 30s...");
 }
 static void delfy_badble_run(delfyRTL* app) {
     uart_helper_send(app->uart_helper, "BADBLE 30\n", 10);
-    snprintf(message, sizeof(message), "BadBLE 30s...");
-    snprintf(popupHeader, sizeof(popupHeader), "BadBLE");
-    scene_manager_next_scene(app->scene_manager, popupScene);
+    delfy_busy(app, "BadBLE", "BadBLE 30s...");
 }
 
 static void wifi_hub_cb(void* context, uint32_t index) {
@@ -1856,6 +1854,61 @@ bool help_scene_on_event(void* context, SceneManagerEvent event) {
 
 void help_scene_on_exit(void* context) {
     UNUSED(context);
+}
+
+// --- Animated "working" screen -------------------------------------------------
+// Shows the operation name + a spinner so a blocking board op is visibly alive,
+// instead of the static popup with the idle dolphin icon. Driven by a periodic timer
+// that posts a GUI-thread custom event (view model updates must run on the GUI thread).
+static void busy_view_draw(Canvas* canvas, void* model) {
+    BusyModel* m = model;
+    canvas_clear(canvas);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str_aligned(canvas, 64, 10, AlignCenter, AlignTop, popupHeader);
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(canvas, 64, 26, AlignCenter, AlignTop, message);
+    static const int8_t dx[8] = {0, 8, 12, 8, 0, -8, -12, -8};
+    static const int8_t dy[8] = {-12, -8, 0, 8, 12, 8, 0, -8};
+    for(int i = 0; i < 8; i++) {
+        int x = 64 + dx[i], y = 50 + dy[i];
+        if(i == (int)(m->phase & 7)) canvas_draw_disc(canvas, x, y, 2);
+        else canvas_draw_dot(canvas, x, y);
+    }
+}
+
+static void busy_timer_cb(void* context) {
+    delfyRTL* app = context;
+    view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_BUSY_TICK);
+}
+
+static void busy_show(delfyRTL* app) {
+    with_view_model(app->busyView, BusyModel* m, { m->phase = 0; }, true);
+    furi_timer_start(app->busyTimer, 120);
+    view_dispatcher_switch_to_view(app->view_dispatcher, busyView);
+}
+
+void busy_scene_on_enter(void* context) {
+    delfyRTL* app = context;
+    busy_show(app);
+}
+bool busy_scene_on_event(void* context, SceneManagerEvent event) {
+    delfyRTL* app = context;
+    if(event.type == SceneManagerEventTypeCustom && event.event == DELFY_EVT_BUSY_TICK) {
+        with_view_model(app->busyView, BusyModel* m, { m->phase++; }, true);
+        return true;
+    }
+    return false;
+}
+void busy_scene_on_exit(void* context) {
+    delfyRTL* app = context;
+    furi_timer_stop(app->busyTimer);
+}
+
+// Set the operation name + detail and switch to the animated busy screen.
+static void delfy_busy(delfyRTL* app, const char* header, const char* text) {
+    snprintf(popupHeader, sizeof(popupHeader), "%s", header);
+    snprintf(message, sizeof(message), "%s", text);
+    scene_manager_next_scene(app->scene_manager, busyScene);
 }
 
 void popup_scene_on_enter(void* context) {
@@ -2341,6 +2394,7 @@ void (*const delfyRTL_scene_on_enter_handlers[])(void*) = {
     config_ap_scene_on_enter,
     help_scene_on_enter,
     popup_scene_on_enter,
+    busy_scene_on_enter,
     pmf_scene_on_enter,
     tools_menu_scene_on_enter,
     channel_map_scene_on_enter,
@@ -2365,6 +2419,7 @@ bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     config_ap_scene_on_event,
     help_scene_on_event,
     popup_scene_on_event,
+    busy_scene_on_event,
     pmf_scene_on_event,
     tools_menu_scene_on_event,
     channel_map_scene_on_event,
@@ -2389,6 +2444,7 @@ void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     config_ap_scene_on_exit,
     help_scene_on_exit,
     popup_scene_on_exit,
+    busy_scene_on_exit,
     pmf_scene_on_exit,
     tools_menu_scene_on_exit,
     channel_map_scene_on_exit,
@@ -2736,6 +2792,14 @@ static delfyRTL* app_alloc() {
     view_set_input_callback(app->chanMapView, channel_map_input);
     view_dispatcher_add_view(app->view_dispatcher, channelMapView, app->chanMapView);
 
+    // Animated "working" screen (operation name + spinner)
+    app->busyView = view_alloc();
+    view_allocate_model(app->busyView, ViewModelTypeLockFree, sizeof(BusyModel));
+    view_set_context(app->busyView, app);
+    view_set_draw_callback(app->busyView, busy_view_draw);
+    view_dispatcher_add_view(app->view_dispatcher, busyView, app->busyView);
+    app->busyTimer = furi_timer_alloc(busy_timer_cb, FuriTimerTypePeriodic, app);
+
     app->uart_helper = uart_helper_alloc();
     uart_helper_set_baud_rate(app->uart_helper, DEVICE_BAUDRATE);
     uart_helper_set_delimiter(app->uart_helper, LINE_DELIMITER, INCLUDE_LINE_DELIMITER);
@@ -2777,17 +2841,20 @@ static void app_free(delfyRTL* app) {
     view_dispatcher_remove_view(app->view_dispatcher, pmfView);
     view_dispatcher_remove_view(app->view_dispatcher, toolsListView);
     view_dispatcher_remove_view(app->view_dispatcher, channelMapView);
+    view_dispatcher_remove_view(app->view_dispatcher, busyView);
 
     scene_manager_free(app->scene_manager);
 
     view_dispatcher_free(app->view_dispatcher); //Some events whre not processed
 
     furi_timer_free(app->timer);
+    furi_timer_free(app->busyTimer);
 
     menu_free(app->menu);
     submenu_free(app->submenu);
     view_free(app->cardView);
     view_free(app->chanMapView);
+    view_free(app->busyView);
 
     text_input_free(app->text_input);
     loading_free(app->loading);
