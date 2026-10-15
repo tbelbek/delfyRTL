@@ -164,7 +164,9 @@ UartHelper* uart_helper_alloc() {
     const size_t rx_buffer_size = 2048;
 
     // worker_stack_size should be large enough stack for the worker thread (including functions it calls).
-    const size_t worker_stack_size = 1024;
+    // NOTE: raised from 1024 — the delfy line handler now does storage I/O (pcap/json/.22000),
+    // hex decode and JSON building; 1KB overflowed and crashed the device.
+    const size_t worker_stack_size = 4096;
 
     // uart_baud is the default baud rate for the UART.
     const uint32_t uart_baud = 115200;

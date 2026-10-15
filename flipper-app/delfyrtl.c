@@ -1807,21 +1807,6 @@ static int card_sel = 0;
 #define CARD_COUNT 4
 static const char* card_labels[CARD_COUNT] = {"Wi-Fi", "BLE", "Help", "Exit"};
 
-static void card_glyph_wifi(Canvas* c, int x, int y) {
-    canvas_draw_dot(c, x + 6, y + 8);
-    canvas_draw_line(c, x + 3, y + 6, x + 6, y + 3);
-    canvas_draw_line(c, x + 6, y + 3, x + 9, y + 6);
-    canvas_draw_line(c, x + 1, y + 8, x + 6, y + 1);
-    canvas_draw_line(c, x + 6, y + 1, x + 11, y + 8);
-}
-static void card_glyph_bt(Canvas* c, int x, int y) {
-    int cx = x + 6, y0 = y, y1 = y + 10, ym = y + 5, w = 4;
-    canvas_draw_line(c, cx, y0, cx, y1);
-    canvas_draw_line(c, cx, y0, cx + w, ym);
-    canvas_draw_line(c, cx + w, ym, cx, y1);
-    canvas_draw_line(c, cx, y0, cx - w, ym);
-    canvas_draw_line(c, cx - w, ym, cx, y1);
-}
 static void card_menu_draw(Canvas* canvas, void* model) {
     UNUSED(model);
     canvas_clear(canvas);
@@ -1834,8 +1819,8 @@ static void card_menu_draw(Canvas* canvas, void* model) {
         if(sel) canvas_draw_box(canvas, x, y, 60, 23);
         else canvas_draw_frame(canvas, x, y, 60, 23);
         if(sel) canvas_set_color(canvas, ColorWhite);
-        if(i == 0) card_glyph_wifi(canvas, x + 2, y + 6);
-        else if(i == 1) card_glyph_bt(canvas, x + 2, y + 6);
+        if(i == 0) canvas_draw_icon(canvas, x + 3, y + 3, &I_wifi);
+        else if(i == 1) canvas_draw_icon(canvas, x + 3, y + 3, &I_bluetooth);
         else canvas_draw_str(canvas, x + 8, y + 16, (i == 2) ? "?" : ">");
         canvas_draw_str(canvas, x + 20, y + 16, card_labels[i]);
         if(sel) canvas_set_color(canvas, ColorBlack);
