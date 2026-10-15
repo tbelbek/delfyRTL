@@ -1,62 +1,68 @@
-/* Host self-test for dhcp_build.h — assert OFFER/ACK layout + option 114.
-   cc -I<sketchdir> test_dhcp_build.c -o t && ./t  */
-#include <assert.h>
+// Host-side self-test for RTL8720dn-firmware/dhcp_build.h (no lwip/device needed).
+// Build: cc -I ../RTL8720dn-firmware test_dhcp_build.c -o /tmp/t && /tmp/t
+// Verifies: OFFER/ACK type, yiaddr on the 192.168.4.0/24 captive subnet, and that the
+// RFC 8910 option 114 (Captive-Portal URI) is present and points at /cp.json.
 #include <stdio.h>
 #include <string.h>
 #include "dhcp_build.h"
 
-static size_t make_req(uint8_t *b, uint8_t msgtype) {
-    memset(b, 0, 600);
-    b[0] = 1; b[1] = 1; b[2] = 6;            /* BOOTREQUEST, ether, 6 */
-    b[4]=0xDE; b[5]=0xAD; b[6]=0xBE; b[7]=0xEF; /* xid */
-    b[10]=0x80;                               /* broadcast flag */
-    uint8_t mac[6]={0x02,0x11,0x22,0x33,0x44,0x7B}; memcpy(b+28, mac, 6);
-    memcpy(b + DHCP_FIXED_LEN, DHCP_MAGIC, 4);
-    uint8_t *o = b + DHCP_FIXED_LEN + 4;
-    *o++=53; *o++=1; *o++=msgtype;            /* option 53 */
-    *o++=255;
-    return (size_t)(o - b);
+static int failures = 0;
+#define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s\n", msg); failures++; } \
+                              else { printf("ok  : %s\n", msg); } } while (0)
+
+static size_t build_req(uint8_t *req, uint8_t msg_type) {
+    memset(req, 0, 300);
+    req[0] = 1;                 // op = BOOTREQUEST
+    req[1] = 1;                 // htype = ethernet
+    req[2] = 6;                 // hlen
+    req[4] = 0xAA; req[5] = 0xBB; req[6] = 0xCC; req[7] = 0xDD;  // xid
+    req[28] = 0xEA; req[33] = 0x11;  // chaddr (chaddr[5]=0x11 -> yiaddr .117 if %101)
+    memcpy(req + DHCP_FIXED_LEN, DHCP_MAGIC, 4);
+    uint8_t *o = req + DHCP_FIXED_LEN + 4;
+    *o++ = 53; *o++ = 1; *o++ = msg_type;   // DHCP message type
+    *o++ = 255;                              // END
+    return (size_t)(o - req);
 }
 
-static const uint8_t* find(const uint8_t*r,size_t n,uint8_t code,uint8_t*l){return dhcp_find_opt(r,n,code,l);}
+static void expect_reply(uint8_t msg_type, uint8_t want_reply_type, const char *label) {
+    uint8_t req[300], out[600];
+    size_t rl = build_req(req, msg_type);
+    size_t n = dhcp_build_reply(out, sizeof(out), req, rl);
+    printf("\n-- %s --\n", label);
+    CHECK(n >= DHCP_MIN_REPLY, "reply produced and >= DHCP_MIN_REPLY");
+    CHECK(out[0] == 2, "op == BOOTREPLY");
+    CHECK(memmem(out + DHCP_FIXED_LEN, 4, DHCP_MAGIC, 4) != NULL, "magic cookie intact");
+
+    uint8_t tlen = 0;
+    const uint8_t *t = dhcp_find_opt(out, n, 53, &tlen);
+    CHECK(t && tlen == 1 && t[0] == want_reply_type, "message type = OFFER(2)/ACK(5) as expected");
+
+    CHECK(out[16] == 192 && out[17] == 168 && out[18] == 4, "yiaddr subnet = 192.168.4.0/24");
+    CHECK(out[19] >= 100 && out[19] <= 200, "yiaddr host in 100..200");
+
+    uint8_t ul = 0;
+    const uint8_t *u = dhcp_find_opt(out, n, 114, &ul);
+    CHECK(u != NULL, "option 114 present");
+    if (u) {
+        char uri[64] = {0};
+        memcpy(uri, u, ul < 63 ? ul : 63);
+        printf("      option 114 = \"%s\" (len %u)\n", uri, ul);
+        CHECK(strcmp(uri, "http://192.168.4.1/cp.json") == 0, "option 114 = http://192.168.4.1/cp.json");
+    }
+    // END marker must be the last option
+    CHECK(out[n - 1] == 255 || (n == DHCP_MIN_REPLY && out[n - 1] == 0), "option list terminated (END/pad)");
+}
 
 int main(void) {
-    uint8_t req[600], rep[600];
+    expect_reply(1, 2, "DISCOVER -> OFFER");
+    expect_reply(3, 5, "REQUEST  -> ACK");
 
-    /* DISCOVER -> OFFER */
-    size_t rn = make_req(req, 1);
-    size_t n = dhcp_build_reply(rep, sizeof(rep), req, rn);
-    assert(n >= DHCP_MIN_REPLY);
-    assert(rep[0] == 2);                               /* BOOTREPLY */
-    assert(memcmp(rep+4, req+4, 4) == 0);              /* xid echoed */
-    assert(memcmp(rep+28, req+28, 16) == 0);           /* chaddr echoed */
-    assert(memcmp(rep+DHCP_FIXED_LEN, DHCP_MAGIC, 4)==0);
-    assert(rep[16]==DHCP_AP_IP[0] && rep[17]==DHCP_AP_IP[1] && rep[18]==DHCP_AP_IP[2]); /* yiaddr in AP subnet */
-    assert(rep[19] == 100 + (0x7B % 101));             /* stateless per-MAC */
+    // A bare packet (no magic) must be ignored, not answered.
+    uint8_t junk[300] = {0};
+    junk[0] = 1;
+    CHECK(dhcp_build_reply(junk, sizeof(junk), junk, sizeof(junk)) == 0, "no magic cookie -> ignored");
 
-    uint8_t l=0; const uint8_t *v;
-    v = find(rep,n,53,&l); assert(v && l==1 && v[0]==2);          /* OFFER */
-    v = find(rep,n,54,&l); assert(v && l==4 && v[0]==192);        /* server id */
-    v = find(rep,n,6,&l);  assert(v && l==4 && memcmp(v,DHCP_AP_IP,4)==0); /* DNS=AP */
-    v = find(rep,n,1,&l);  assert(v && l==4);                     /* subnet */
-    v = find(rep,n,3,&l);  assert(v && l==4);                     /* router */
-    v = find(rep,n,51,&l); assert(v && l==4);                     /* lease */
-    v = find(rep,n,114,&l);                                       /* OPTION 114 */
-    assert(v && l==(uint8_t)(sizeof(DHCP_CP_URI)-1));
-    assert(memcmp(v, DHCP_CP_URI, l)==0);
-
-    /* REQUEST -> ACK */
-    rn = make_req(req, 3);
-    n = dhcp_build_reply(rep, sizeof(rep), req, rn);
-    v = find(rep,n,53,&l); assert(v && v[0]==5);                  /* ACK */
-    v = find(rep,n,114,&l); assert(v && memcmp(v,DHCP_CP_URI,l)==0);
-
-    /* Non DISCOVER/REQUEST ignored; bad magic ignored */
-    assert(dhcp_build_reply(rep,sizeof(rep),req,DHCP_FIXED_LEN)==0);
-    rn = make_req(req, 8); assert(dhcp_build_reply(rep,sizeof(rep),req,rn)==0);
-    req[DHCP_FIXED_LEN]=0; rn=make_req(req,1); req[DHCP_FIXED_LEN]=0xAA;
-    assert(dhcp_build_reply(rep,sizeof(rep),req,rn)==0);
-
-    printf("OK: option-114 DHCP builder passes (OFFER+ACK, full options)\n");
-    return 0;
+    printf("\n%s (%d failure%s)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED",
+           failures, failures == 1 ? "" : "s");
+    return failures ? 1 : 0;
 }

@@ -1,5 +1,10 @@
 const char *default_web(String ssid){
-  String html = R"(
+  // `html` MUST be static: we return html.c_str(), and handleRequest keeps that
+  // pointer while writing the response. A local String would be freed on return ->
+  // dangling pointer -> the portal page renders freed memory (works only by luck).
+  // Assignment (not +=) reuses the buffer, so it does not grow across calls.
+  static String html;
+  html = R"(
   <html>
   <head>
     <title>Koneksi Terputus</title>

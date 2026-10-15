@@ -215,9 +215,17 @@ void createAP(char* ssid, char* channel){
   createAP(ssid, channel, "");
 }
 void destroyAP(){
-  //udp_remove(dns_server_pcb);
-  
-  void unbind_all_udp();
+  // Tear our own servers down BEFORE the wifi_off/wifi_on below, while lwip is still
+  // alive (calling udp_remove on a pcb freed by the re-init would be a use-after-free).
+  // Without this the 2nd+ AP start of a session is broken:
+  //  - the HTTP listen socket dies with the WiFi re-init, but serveBegined stays true,
+  //    so server.begin() is never called again -> every accept() fails -> no portal.
+  //  - start_DHCP_Server() early-returns on dhcp_pcb != NULL, so retarget_ap_netif()
+  //    is skipped -> AP sits on the driver default subnet while DHCP advertises
+  //    192.168.4.1 -> client has no reachable gateway (and option 114's /cp.json
+  //    is unreachable, so Android never auto-opens the portal).
+  stop_DHCP_Server();     // dhcp_pcb = NULL -> next start_DHCP_Server() retargets + rebinds
+  serveBegined = false;   // -> next createAP() re-opens the HTTP listen socket
   delay(500);
   WiFiClient client = server.available();
   while(client.connected()){
