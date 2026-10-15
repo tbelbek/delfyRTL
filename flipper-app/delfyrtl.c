@@ -255,9 +255,10 @@ typedef struct delfyRTL {
     char ibeaconUuid[40];// #6: iBeacon UUID hex (typed)
 } delfyRTL;
 
-// Model for the animated "working" screen (busyView): just a phase counter.
+// Model for the animated "working" screen (busyView): spinner phase + a countdown.
 typedef struct {
     uint8_t phase;
+    int8_t remain_s; // remaining seconds (0 = no countdown)
 } BusyModel;
 
 //Las opciones del menu
@@ -494,6 +495,7 @@ static void creds_append_sd(const char* line) {
 
 static void listed_wifis_item_callback(void* context, uint32_t index);
 static void delfy_busy(delfyRTL* app, const char* header, const char* text);
+static void delfy_busy_ex(delfyRTL* app, const char* header, const char* text, int secs);
 static void delfy_ident(delfyRTL* app);
 
 // Tughan: persist the SCAN RESULTS to the SD (not an action log). One timestamped file per
@@ -1145,7 +1147,7 @@ static void delfy_start_capture(delfyRTL* app, bool grab) {
     }
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
     // Result is shown when HSDONE arrives (uart_process_line -> popupScene).
-    { char b[48]; snprintf(b, sizeof(b), "Capturing on ch %d...", ch); delfy_busy(app, "Handshake", b); }
+    { char b[48]; snprintf(b, sizeof(b), "Capturing on ch %d...", ch); delfy_busy_ex(app, "Handshake", b, 20); }
 }
 
 static void delfy_start_pmf(delfyRTL* app) {
@@ -1158,7 +1160,7 @@ static void delfy_start_pmf(delfyRTL* app) {
     char cmd[32];
     snprintf(cmd, sizeof(cmd), "PMFSCAN %d 5\n", ch);
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
-    { char b[48]; snprintf(b, sizeof(b), "Scanning ch %d...", ch); delfy_busy(app, "PMF/WPA3", b); }
+    { char b[48]; snprintf(b, sizeof(b), "Scanning ch %d...", ch); delfy_busy_ex(app, "PMF/WPA3", b, 5); }
 }
 
 // Extract the selected AP's channel and (optionally) colon-stripped BSSID.
@@ -1189,7 +1191,7 @@ static void delfy_start_sta(delfyRTL* app) {
     if(strlen(hex) == 12) snprintf(cmd, sizeof(cmd), "STASCAN %d %s 8\n", ch, hex);
     else snprintf(cmd, sizeof(cmd), "STASCAN %d 8\n", ch);
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
-    { char b[48]; snprintf(b, sizeof(b), "STA scan ch %d...", ch); delfy_busy(app, "STASCAN", b); }
+    { char b[48]; snprintf(b, sizeof(b), "STA scan ch %d...", ch); delfy_busy_ex(app, "STASCAN", b, 5); }
 }
 
 static void delfy_start_pmkid(delfyRTL* app, bool grab) {
@@ -1203,7 +1205,7 @@ static void delfy_start_pmkid(delfyRTL* app, bool grab) {
     else snprintf(cmd, sizeof(cmd), "PMKID %d 10\n", ch);
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
     wpa_lines[0] = '\0';
-    { char b[48]; snprintf(b, sizeof(b), "PMKID ch %d...", ch); delfy_busy(app, "PMKID", b); }
+    { char b[48]; snprintf(b, sizeof(b), "PMKID ch %d...", ch); delfy_busy_ex(app, "PMKID", b, 10); }
 }
 
 // E: guided audit for the selected AP — grab + write /ext/delfy/audit.json.
@@ -1228,7 +1230,7 @@ static void delfy_start_audit(delfyRTL* app) {
     char cmd[48];
     snprintf(cmd, sizeof(cmd), "HSGRAB %d %s 20\n", ch, hex[0] ? hex : "FFFFFFFFFFFF");
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
-    { char b[48]; snprintf(b, sizeof(b), "Audit ch %d...", ch); delfy_busy(app, "Audit", b); }
+    { char b[48]; snprintf(b, sizeof(b), "Audit ch %d...", ch); delfy_busy_ex(app, "Audit", b, 20); }
 }
 
 // A: capability check from the board's IDENT. Unknown/old fw -> permissive.
@@ -1283,7 +1285,7 @@ static void delfy_start_pmkid_clientless(delfyRTL* app) {
     char cmd[80];
     snprintf(cmd, sizeof(cmd), "PMKIDCLIENT %d %s %s\n", ch, hex[0] ? hex : "FFFFFFFFFFFF", ssid);
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
-    { char b[48]; snprintf(b, sizeof(b), "PMKID(clientless) ch %d...", ch); delfy_busy(app, "PMKID", b); }
+    { char b[48]; snprintf(b, sizeof(b), "PMKID(clientless) ch %d...", ch); delfy_busy_ex(app, "PMKID", b, 6); }
 }
 
 // A1: probe-request sniffer — harvest nearby devices' remembered SSIDs (their PNL).
@@ -1296,7 +1298,7 @@ static void delfy_start_probe(delfyRTL* app) {
     char cmd[32];
     snprintf(cmd, sizeof(cmd), "PROBESNIFF %d 12\n", ch);
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
-    { char b[48]; snprintf(b, sizeof(b), "Probes on ch %d...", ch); delfy_busy(app, "Probe / PNL", b); }
+    { char b[48]; snprintf(b, sizeof(b), "Probes on ch %d...", ch); delfy_busy_ex(app, "Probe / PNL", b, 12); }
 }
 
 // B6: clone the selected AP's SSID across many random BSSIDs (AP clone spam).
@@ -2160,6 +2162,11 @@ static void busy_view_draw(Canvas* canvas, void* model) {
     canvas_draw_str_aligned(canvas, 64, 10, AlignCenter, AlignTop, popupHeader);
     canvas_set_font(canvas, FontSecondary);
     canvas_draw_str_aligned(canvas, 64, 26, AlignCenter, AlignTop, message);
+    if(m->remain_s > 0) {
+        char t[8];
+        snprintf(t, sizeof(t), "%ds", m->remain_s);
+        canvas_draw_str_aligned(canvas, 126, 2, AlignRight, AlignTop, t);
+    }
     static const int8_t dx[8] = {0, 8, 12, 8, 0, -8, -12, -8};
     static const int8_t dy[8] = {-12, -8, 0, 8, 12, 8, 0, -8};
     for(int i = 0; i < 8; i++) {
@@ -2170,13 +2177,24 @@ static void busy_view_draw(Canvas* canvas, void* model) {
 }
 
 static volatile uint32_t busy_ticks = 0;
+static int busy_total_s = 0;
 
 static void busy_timer_cb(void* context) {
     // Commit the model straight from the timer thread -- the same pattern the (working)
     // RickRoll widget animation uses. Going through view_dispatcher_send_custom_event
     // left the phase stuck, so the spinner never rotated.
     delfyRTL* app = context;
-    with_view_model(app->busyView, BusyModel* m, { m->phase++; }, true);
+    with_view_model(
+        app->busyView,
+        BusyModel* m,
+        {
+            m->phase++;
+            if(busy_total_s > 0) {   // E2: live countdown for timed operations
+                int rem = busy_total_s - (int)(busy_ticks * 120 / 1000);
+                m->remain_s = (rem > 0) ? (int8_t)rem : 0;
+            }
+        },
+        true);
     // Watchdog: the board may never answer (wedged AP/capture). Without this the spinner
     // spun forever with no way out besides BACK. ~36 s at 120 ms/tick -> "Timeout" popup.
     if(++busy_ticks >= 300) {
@@ -2187,7 +2205,14 @@ static void busy_timer_cb(void* context) {
 
 static void busy_show(delfyRTL* app) {
     busy_ticks = 0;
-    with_view_model(app->busyView, BusyModel* m, { m->phase = 0; }, true);
+    with_view_model(
+        app->busyView,
+        BusyModel* m,
+        {
+            m->phase = 0;
+            m->remain_s = (int8_t)busy_total_s;
+        },
+        true);
     furi_timer_start(app->busyTimer, 120);
     view_dispatcher_switch_to_view(app->view_dispatcher, busyView);
 }
@@ -2222,11 +2247,15 @@ void busy_scene_on_exit(void* context) {
 }
 
 // Set the operation name + detail and switch to the animated busy screen.
-static void delfy_busy(delfyRTL* app, const char* header, const char* text) {
+static void delfy_busy_ex(delfyRTL* app, const char* header, const char* text, int secs) {
     snprintf(popupHeader, sizeof(popupHeader), "%s", header);
     snprintf(message, sizeof(message), "%s", text);
+    busy_total_s = secs;   // >0 -> the busy screen shows a live countdown
     busy_active = true;
     scene_manager_next_scene(app->scene_manager, busyScene);
+}
+static void delfy_busy(delfyRTL* app, const char* header, const char* text) {
+    delfy_busy_ex(app, header, text, 0);
 }
 
 void popup_scene_on_enter(void* context) {
