@@ -328,6 +328,38 @@ static void hs_write_pcap(uint16_t* out_frames) {
     if(out_frames) *out_frames = written;
 }
 
+// Quality engine: classify the buffered EAPOL-Key frames as M1..M4 (EAPOL-Key Key Info is
+// big-endian: Install=bit6, ACK=bit7, MIC=bit8, Secure=bit9) and say if it's crackable.
+static void hs_quality(char* out, size_t cap) {
+    bool m[5] = {false};
+    for(uint16_t i = 0; i < hs_count && i < HS_MAX_FRAMES; i++) {
+        const uint8_t* b = hs_frames[i];
+        uint16_t len = hs_lens[i];
+        unsigned e;
+        if(len >= 32 && b[30] == 0x88 && b[31] == 0x8e) e = 32;
+        else if(len >= 34 && b[32] == 0x88 && b[33] == 0x8e) e = 34;
+        else continue;
+        if(e + 99 > len) continue;
+        if(b[e + 1] != 3 || b[e + 4] != 2) continue; // EAPOL-Key, RSN
+        uint16_t ki = ((uint16_t)b[e + 5] << 8) | b[e + 6];
+        bool ack = ki & 0x0080, mic = ki & 0x0100, sec = ki & 0x0200;
+        if(ack && !mic) m[1] = true;
+        else if(!ack && mic && !sec) m[2] = true;
+        else if(ack && mic && sec) m[3] = true;
+        else if(!ack && mic && sec) m[4] = true;
+    }
+    bool crackable = (m[1] && m[2]) || (m[2] && m[3]);
+    snprintf(
+        out,
+        cap,
+        "%s%s%s%s%s",
+        m[1] ? "M1 " : "",
+        m[2] ? "M2 " : "",
+        m[3] ? "M3 " : "",
+        m[4] ? "M4 " : "",
+        crackable ? "OK" : (m[1] ? "M1 only" : "incomplete"));
+}
+
 // E: write a small audit summary next to the capture.
 static void audit_write_json(const char* kind, int frames) {    Storage* st = furi_record_open(RECORD_STORAGE);
     storage_common_mkdir(st, "/ext/delfy");
@@ -1865,11 +1897,14 @@ void uart_process_line(FuriString* line, void* context) {
         uint16_t written = 0;
         hs_write_pcap(&written);
         if(audit_mode) audit_write_json("handshake", (int)written);
+        char qual[48];
+        hs_quality(qual, sizeof(qual));
         snprintf(
             message,
             sizeof(message),
-            "%u frames on ch %d\nsaved to\n/ext/delfy/hs.pcap",
+            "%u EAPOL: %s\nch %d -> /ext/delfy/hs.pcap",
             (unsigned)written,
+            qual,
             hs_channel);
         snprintf(popupHeader, sizeof(popupHeader), "Capture done");
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
