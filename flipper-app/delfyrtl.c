@@ -59,6 +59,7 @@ typedef enum {
     wifiHubScene,
     bleHubScene,
     bleAdvLibScene,
+    portalListScene,
 
     DelfyRTLSceneCount
 } delfyRTLScene;
@@ -420,7 +421,6 @@ static void write_wpa_file(void) {
 
 static void listed_wifis_item_callback(void* context, uint32_t index);
 static bool delfy_has_cap(delfyRTL* app, char cap);
-static void delfy_load_portal(delfyRTL* app);
 static void delfy_adv_replay(delfyRTL* app);
 static void delfy_badble_file(delfyRTL* app);
 void delfyRTL_menu_callback(void* context, uint32_t index) {
@@ -562,7 +562,7 @@ bool main_menu_scene_on_event(void* context, SceneManagerEvent event) {
             scene_manager_next_scene(app->scene_manager, popupScene);
             break;
         case PortalFile:
-            delfy_load_portal(app);
+            scene_manager_next_scene(app->scene_manager, portalListScene);
             break;
         case BleAdvHex:
             scene_manager_next_scene(app->scene_manager, bleAdvInputScene);
@@ -1151,44 +1151,101 @@ static void delfy_start_pmkid_clientless(delfyRTL* app) {
 }
 
 // gap: send a custom portal HTML from /ext/delfy/portal.html to the board (chunked hex).
-static void delfy_load_portal(delfyRTL* app) {
+// Portal file browser: list *.html in /ext/delfy/portals/, pick one, stream it to the board.
+#define PORTAL_FILES_MAX 16
+static char portal_names[PORTAL_FILES_MAX][48];
+static int portal_file_count = 0;
+
+static void portal_list_load(void) {
+    portal_file_count = 0;
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    storage_common_mkdir(st, "/ext/delfy/portals");
+    File* dir = storage_file_alloc(st);
+    if(storage_dir_open(dir, "/ext/delfy/portals")) {
+        FileInfo fi;
+        char name[64];
+        while(storage_dir_read(dir, &fi, name, sizeof(name)) && portal_file_count < PORTAL_FILES_MAX) {
+            if(file_info_is_dir(&fi)) continue;
+            size_t l = strlen(name);
+            if(l > 5 && strcmp(name + l - 5, ".html") == 0) {
+                strncpy(portal_names[portal_file_count], name, 47);
+                portal_names[portal_file_count][47] = '\0';
+                portal_file_count++;
+            }
+        }
+        storage_dir_close(dir);
+    }
+    storage_file_free(dir);
+    furi_record_close(RECORD_STORAGE);
+}
+
+static void delfy_load_portal_file(delfyRTL* app, const char* name) {
+    char path[96];
+    snprintf(path, sizeof(path), "/ext/delfy/portals/%s", name);
     Storage* st = furi_record_open(RECORD_STORAGE);
     File* f = storage_file_alloc(st);
     static uint8_t buf[8192];
     size_t n = 0;
-    if(storage_file_open(f, "/ext/delfy/portal.html", FSAM_READ, FSOM_OPEN_EXISTING)) {
+    if(storage_file_open(f, path, FSAM_READ, FSOM_OPEN_EXISTING)) {
         n = storage_file_read(f, buf, sizeof(buf));
         storage_file_close(f);
     }
     storage_file_free(f);
     furi_record_close(RECORD_STORAGE);
     if(n == 0) {
-        snprintf(message, sizeof(message), "Put HTML at\n/ext/delfy/portal.html");
+        snprintf(message, sizeof(message), "Failed to read");
         snprintf(popupHeader, sizeof(popupHeader), "Portal");
         scene_manager_next_scene(app->scene_manager, popupScene);
         return;
     }
     uart_helper_send(app->uart_helper, "PORTALCLEAR\n", 12);
-    furi_delay_ms(150);
+    furi_delay_ms(120);
+    // Back-to-back chunks (uart_helper_send paces at 115200; no per-chunk delay -> no hang).
     static char chunk[16 + 2 * 256 + 4];
     size_t off = 0;
     while(off < n) {
         size_t cl = n - off;
-        if(cl > 256) cl = 256;   // board reads 256B bursts reliably (64B stalls)
+        if(cl > 256) cl = 256;
         int p = snprintf(chunk, sizeof(chunk), "PORTALHTML ");
         for(size_t i = 0; i < cl; i++) p += snprintf(chunk + p, sizeof(chunk) - p, "%02x", buf[off + i]);
         chunk[p++] = '\n';
         uart_helper_send(app->uart_helper, chunk, p);
         off += cl;
-        furi_delay_ms(40);
     }
-    furi_delay_ms(150);
+    furi_delay_ms(120);
     app->captivePortal = 6; // keep Custom(file) selected for the next AP start
-    uart_helper_send(app->uart_helper, "PORTAL 6\n", 9); // select Custom (file)
-    snprintf(message, sizeof(message), "Portal %u B loaded", (unsigned)n);
+    uart_helper_send(app->uart_helper, "PORTAL 6\n", 9);
+    snprintf(message, sizeof(message), "Loaded: %s\n%u B", name, (unsigned)n);
     snprintf(popupHeader, sizeof(popupHeader), "Portal");
     scene_manager_next_scene(app->scene_manager, popupScene);
 }
+
+static void portal_item_cb(void* context, uint32_t index) {
+    delfyRTL* app = context;
+    if((int)index < portal_file_count) delfy_load_portal_file(app, portal_names[index]);
+}
+void portal_list_scene_on_enter(void* context) {
+    delfyRTL* app = context;
+    portal_list_load();
+    submenu_reset(app->submenu);
+    submenu_set_header(app->submenu, "Portals");
+    if(portal_file_count == 0) {
+        submenu_add_item(app->submenu, "No .html in /ext/delfy/portals", 0, portal_item_cb, app);
+    } else {
+        for(int i = 0; i < portal_file_count; i++)
+            submenu_add_item(app->submenu, portal_names[i], (uint32_t)i, portal_item_cb, app);
+    }
+    view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
+}
+bool portal_list_scene_on_event(void* context, SceneManagerEvent event) {
+    UNUSED(context);
+    UNUSED(event);
+    return false;
+}
+void portal_list_scene_on_exit(void* context) {
+    UNUSED(context);
+}
+
 
 // #5: BLE adv library — save/replay multiple adverts in /ext/delfy/adv.txt (one hex/line).
 static int delfy_adv_load(char lines[8][80]) {
@@ -1405,7 +1462,7 @@ static void wifi_hub_cb(void* context, uint32_t index) {
     case 2: scene_manager_next_scene(app->scene_manager, channelMapScene); break;
     case 3: scene_manager_next_scene(app->scene_manager, configAPScene); break;
     case 4: scene_manager_next_scene(app->scene_manager, beaconNetworkScene); break;
-    case 5: delfy_load_portal(app); break;
+    case 5: scene_manager_next_scene(app->scene_manager, portalListScene); break;
     }
 }
 void wifi_hub_scene_on_enter(void* context) {
@@ -2149,7 +2206,8 @@ void (*const delfyRTL_scene_on_enter_handlers[])(void*) = {
     ibeacon_input_scene_on_enter,
     wifi_hub_scene_on_enter,
     ble_hub_scene_on_enter,
-    ble_adv_lib_scene_on_enter};
+    ble_adv_lib_scene_on_enter,
+    portal_list_scene_on_enter};
 
 bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     main_menu_scene_on_event,
@@ -2172,7 +2230,8 @@ bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     ibeacon_input_scene_on_event,
     wifi_hub_scene_on_event,
     ble_hub_scene_on_event,
-    ble_adv_lib_scene_on_event};
+    ble_adv_lib_scene_on_event,
+    portal_list_scene_on_event};
 
 void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     main_menu_scene_on_exit,
@@ -2195,7 +2254,8 @@ void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     ibeacon_input_scene_on_exit,
     wifi_hub_scene_on_exit,
     ble_hub_scene_on_exit,
-    ble_adv_lib_scene_on_exit};
+    ble_adv_lib_scene_on_exit,
+    portal_list_scene_on_exit};
 
 static const SceneManagerHandlers delfyRTL_scene_manager_handlers = {
     .on_enter_handlers = delfyRTL_scene_on_enter_handlers,
