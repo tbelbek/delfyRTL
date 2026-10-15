@@ -788,7 +788,7 @@ void info_wifi_button_press(GuiButtonType result, InputType type, void* context)
         snprintf(cadena, 13, "EVIL %d\n", app->selectedWifi);
 
         info_wifi_scene_on_enter(app);
-        FURI_LOG_D(TAG, cadena);
+        FURI_LOG_D(TAG, "%s", cadena);
         uart_helper_send(app->uart_helper, cadena, strlen(cadena));
         scene_manager_next_scene(app->scene_manager, evilCredsScene);
     }
@@ -865,8 +865,10 @@ void info_wifi_scene_on_enter(void* context) {
             app->wifiList[app->selectedWifi].rssi,
             app->wifiList[app->selectedWifi].APbssid);
 
-        if(furi_string_cmp(
-               furi_string_alloc_set(app->wifiList[app->selectedWifi].APssid), "<empty>")) {
+        FuriString* tmp_ssid = furi_string_alloc_set(app->wifiList[app->selectedWifi].APssid);
+        bool not_empty = (furi_string_cmp(tmp_ssid, "<empty>") != 0);
+        furi_string_free(tmp_ssid);
+        if(not_empty) {
             if(app->wifiList[app->selectedWifi].deauth) {
                 widget_add_button_element(
                     app->widget, GuiButtonTypeCenter, "Stop", info_wifi_button_press, app);
@@ -1624,7 +1626,7 @@ void mac_key_input_byte_input_callback(void* context) {
         app->byte_input_store[3],
         app->byte_input_store[4],
         app->byte_input_store[5]);
-    FURI_LOG_D(TAG, app->customMac);
+    FURI_LOG_D(TAG, "%s", app->customMac);
 
     scene_manager_previous_scene(app->scene_manager);
     UNUSED(context);
@@ -1687,8 +1689,8 @@ bool custom_beacon_scene_on_event(void* context, SceneManagerEvent event) {
             FURI_LOG_D(TAG, "ssidAPLenght %d", strlen(app->ssidAP));
 
             snprintf(cadena, 6 + strlen(app->ssidAP) + 2, "BSSID %s\n", app->ssidAP);
-            uart_helper_send(app->uart_helper, cadena, sizeof(cadena));
-            FURI_LOG_D(TAG, cadena);
+            uart_helper_send(app->uart_helper, cadena, strlen(cadena));
+            FURI_LOG_D(TAG, "%s", cadena);
             scene_manager_next_scene(app->scene_manager, beaconInfoScene);
             break;
         }
@@ -2110,7 +2112,7 @@ bool config_ap_scene_on_event(void* context, SceneManagerEvent event) {
             FURI_LOG_D(TAG, "ssidAPLenght %d", strlen(app->ssidAP));
 
             snprintf(cadena, 6 + strlen(app->ssidAP) + 2, "BSSID %s\n", app->ssidAP);
-            FURI_LOG_D(TAG, cadena);
+            FURI_LOG_D(TAG, "%s", cadena);
             break;
         }
         return true;
@@ -2230,7 +2232,7 @@ bool delfyRTL_back_event_callback(void* context) {
 
 void uart_process_line(FuriString* line, void* context) {
     FURI_LOG_D(TAG, __func__);
-    FURI_LOG_D(TAG, furi_string_get_cstr(line));
+    FURI_LOG_D(TAG, "%s", furi_string_get_cstr(line));
     delfyRTL* app = context;
     if(strncmp(furi_string_get_cstr(line), "AP:", 3) == 0) {
         char buffer[128]; // Pequeño buffer en la pila (Flipper Zero tiene RAM limitada)
