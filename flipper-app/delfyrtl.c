@@ -80,7 +80,7 @@ typedef enum {
 
 } delfyRTLView;
 
-#define CAPTIVE_PORTAL_SIZE 6
+#define CAPTIVE_PORTAL_SIZE 7
 const char* const captive_portals[CAPTIVE_PORTAL_SIZE] = {
     "Default",
     "Facebook",
@@ -88,6 +88,7 @@ const char* const captive_portals[CAPTIVE_PORTAL_SIZE] = {
     "Apple",
     "Microsoft",
     "Google",
+    "Custom (file)",
 
 };
 
@@ -214,6 +215,7 @@ typedef enum {
     BleScan = 7,
     BleBeacon = 8,
     BadBle = 9,
+    PortalFile = 10,
 } MainMenuIndex;
 
 // Tools submenu item IDs — stable across capability-gating (dispatch keys off these,
@@ -402,6 +404,7 @@ static void write_wpa_file(void) {
 
 static void listed_wifis_item_callback(void* context, uint32_t index);
 static bool delfy_has_cap(delfyRTL* app, char cap);
+static void delfy_load_portal(delfyRTL* app);
 void delfyRTL_menu_callback(void* context, uint32_t index) {
     FURI_LOG_D(TAG, __func__);
     delfyRTL* app = context;
@@ -443,6 +446,10 @@ void delfyRTL_menu_callback(void* context, uint32_t index) {
         FURI_LOG_I("delfyRTL", "BadBle");
         scene_manager_handle_custom_event(app->scene_manager, BadBle);
         break;
+    case PortalFile:
+        FURI_LOG_I("delfyRTL", "PortalFile");
+        scene_manager_handle_custom_event(app->scene_manager, PortalFile);
+        break;
     case Exit:
         uart_helper_send(app->uart_helper, "STOP", 5);
         FURI_LOG_I("delfyRTL", "Exit");
@@ -465,6 +472,8 @@ void main_menu_scene_on_enter(void* context) {
         app->menu, "Send Beacon", &I_random_AP, CustomBeacon, delfyRTL_menu_callback, app);
     menu_add_item(app->menu, "Create AP", &I_Custom_AP, CreateAP, delfyRTL_menu_callback, app);
     menu_add_item(app->menu, "Channel Map", &I_Scan_Wifi, ChannelMap, delfyRTL_menu_callback, app);
+    if(delfy_has_cap(app, 'E'))
+        menu_add_item(app->menu, "Load Portal", &I_Custom_AP, PortalFile, delfyRTL_menu_callback, app);
     if(delfy_has_cap(app, 'L'))
         menu_add_item(app->menu, "BLE Scan", &I_Scan_Wifi, BleScan, delfyRTL_menu_callback, app);
     if(delfy_has_cap(app, 'I'))
@@ -533,6 +542,9 @@ bool main_menu_scene_on_event(void* context, SceneManagerEvent event) {
             snprintf(message, sizeof(message), "BadBLE 30s...");
             snprintf(popupHeader, sizeof(popupHeader), "BadBLE");
             scene_manager_next_scene(app->scene_manager, popupScene);
+            break;
+        case PortalFile:
+            delfy_load_portal(app);
             break;
         default:
             FURI_LOG_W("delfyRTL", "Evento desconocido: %ld", event.event);
@@ -1097,6 +1109,45 @@ static void delfy_start_pmkid_clientless(delfyRTL* app) {
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
     snprintf(message, sizeof(message), "PMKID(clientless) ch %d...", ch);
     snprintf(popupHeader, sizeof(popupHeader), "PMKID");
+    scene_manager_next_scene(app->scene_manager, popupScene);
+}
+
+// gap: send a custom portal HTML from /ext/delfy/portal.html to the board (chunked hex).
+static void delfy_load_portal(delfyRTL* app) {
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    File* f = storage_file_alloc(st);
+    static uint8_t buf[12288];
+    size_t n = 0;
+    if(storage_file_open(f, "/ext/delfy/portal.html", FSAM_READ, FSOM_OPEN_EXISTING)) {
+        n = storage_file_read(f, buf, sizeof(buf));
+        storage_file_close(f);
+    }
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+    if(n == 0) {
+        snprintf(message, sizeof(message), "Put HTML at\n/ext/delfy/portal.html");
+        snprintf(popupHeader, sizeof(popupHeader), "Portal");
+        scene_manager_next_scene(app->scene_manager, popupScene);
+        return;
+    }
+    uart_helper_send(app->uart_helper, "PORTALCLEAR\n", 12);
+    furi_delay_ms(150);
+    static char chunk[16 + 2 * 64 + 4];
+    size_t off = 0;
+    while(off < n) {
+        size_t cl = n - off;
+        if(cl > 64) cl = 64;   // small chunks: the board tolerates ~64B bursts
+        int p = snprintf(chunk, sizeof(chunk), "PORTALHTML ");
+        for(size_t i = 0; i < cl; i++) p += snprintf(chunk + p, sizeof(chunk) - p, "%02x", buf[off + i]);
+        chunk[p++] = '\n';
+        uart_helper_send(app->uart_helper, chunk, p);
+        off += cl;
+        furi_delay_ms(350);
+    }
+    furi_delay_ms(200);
+    uart_helper_send(app->uart_helper, "PORTAL 6\n", 9); // select Custom (file)
+    snprintf(message, sizeof(message), "Portal %u B loaded", (unsigned)n);
+    snprintf(popupHeader, sizeof(popupHeader), "Portal");
     scene_manager_next_scene(app->scene_manager, popupScene);
 }
 

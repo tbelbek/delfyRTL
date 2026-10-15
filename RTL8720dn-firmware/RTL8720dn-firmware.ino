@@ -23,7 +23,8 @@ enum portals{
   Amazon,
   Apple,
   Microsoft,
-  Google
+  Google,
+  Custom
 };
 
 
@@ -98,6 +99,13 @@ extern u8 rtw_get_band_type(void);
 static bool is_dfs_channel(int ch) {
   return (ch >= 52 && ch <= 64) || (ch >= 100 && ch <= 144);
 }
+
+static int hexnib(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
 String generateRandomString(int len){
   String randstr = "";
   const char setchar[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -118,6 +126,10 @@ String parseRequest(String request) {
 
 //DNS
 bool apActive = false;
+
+// Custom portal: HTML streamed from the Flipper (SD file) via PORTALHTML hex chunks.
+static char customPortal[12288];
+static volatile uint16_t customPortalLen = 0;
 
 
 int status = WL_IDLE_STATUS;   
@@ -310,6 +322,10 @@ void handleRequest(WiFiClient &client,enum portals portalType,String ssid){
     case Microsoft:
       webPage = (const char *)microsoft;
       len = microsoft_len;
+      break;
+    case Custom:
+      webPage = customPortal;
+      len = customPortalLen;
       break;
     default:
       webPage = default_web(ssid);
@@ -853,22 +869,11 @@ static void ble_stream() {
 }
 
 void loop() {
-  while (Serial1.available()) {
-    delay(3);  //delay to allow buffer to fill
-    if (Serial1.available() >0) {
-      char c = Serial1.read();  //gets one byte from serial buffer
-      readString += c; //makes the string readString
-    }
-  }
-  // Also accept the same commands over USB (Serial/CH340) so the board can be driven
-  // from a host for testing without the Flipper attached. Same readString pipeline.
-  while (Serial.available()) {
-    delay(3);
-    if (Serial.available() > 0) {
-      readString += (char)Serial.read();
-    }
-  }
-  if(readString.length()>0){
+  // Drain both UARTs fast (no per-char delay) so long chunked lines aren't dropped; we
+  // only process once a full '\n'-terminated command is in.
+  while (Serial1.available()) { readString += (char)Serial1.read(); }
+  while (Serial.available())   { readString += (char)Serial.read(); }
+  if(readString.length() > 0 && readString.charAt(readString.length() - 1) == '\n'){
     if(readString.substring(0,4)=="SCAN"){
       if(apActive)
         destroyAP();
@@ -955,6 +960,27 @@ void loop() {
     }else if(readString.substring(0,9)=="GHOSTSPAM"){
       ghostSpam = true;
       DEBUG_SER_PRINT("Start GHOSTSPAM\n");
+    }else if(readString.substring(0,10)=="PORTALHTML"){
+      // Custom portal: append hex-encoded HTML (chunked from the Flipper SD file).
+      // Parse hex char-by-char (no String temporaries -> no heap churn over many chunks).
+      int s1 = readString.indexOf(' ');
+      String hex = (s1 > 0) ? readString.substring(s1+1, readString.length()-1) : String("");
+      const char* h = hex.c_str();
+      uint16_t added = 0;
+      for(int i = 0; h[i] && h[i+1] && customPortalLen < sizeof(customPortal) - 1; i += 2){
+        int hi = hexnib(h[i]);
+        int lo = hexnib(h[i+1]);
+        if(hi < 0 || lo < 0) break;
+        customPortal[customPortalLen++] = (char)((hi << 4) | lo);
+        added++;
+      }
+      customPortal[customPortalLen] = 0;
+      String r = "PORTALHTML:+" + String((unsigned)added) + " total=" + String((unsigned)customPortalLen);
+      Serial.println(r); Serial1.println(r);
+    }else if(readString.substring(0,11)=="PORTALCLEAR"){
+      customPortalLen = 0;
+      customPortal[0] = 0;
+      Serial.println("PORTALCLEAR:ok"); Serial1.println("PORTALCLEAR:ok");
     }else if(readString.substring(0,6)=="PORTAL"){
       portal = readString.substring(7,readString.length()-1).toInt();
        
