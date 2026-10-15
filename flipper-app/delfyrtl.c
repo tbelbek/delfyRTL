@@ -55,6 +55,8 @@ typedef enum {
     channelMapScene,
     bleAdvInputScene,
     ibeaconInputScene,
+    wifiHubScene,
+    bleHubScene,
 
     DelfyRTLSceneCount
 } delfyRTLScene;
@@ -224,6 +226,8 @@ typedef enum {
     BleAdvReplay = 12,
     IBeaconUuid = 13,
     BadBleFile = 14,
+    WifiHub = 15,
+    BleHub = 16,
 } MainMenuIndex;
 
 // Tools submenu item IDs — stable across capability-gating (dispatch keys off these,
@@ -472,6 +476,12 @@ void delfyRTL_menu_callback(void* context, uint32_t index) {
     case BadBleFile:
         scene_manager_handle_custom_event(app->scene_manager, BadBleFile);
         break;
+    case WifiHub:
+        scene_manager_handle_custom_event(app->scene_manager, WifiHub);
+        break;
+    case BleHub:
+        scene_manager_handle_custom_event(app->scene_manager, BleHub);
+        break;
     case Exit:
         uart_helper_send(app->uart_helper, "STOP", 5);
         FURI_LOG_I("delfyRTL", "Exit");
@@ -488,28 +498,12 @@ void main_menu_scene_on_enter(void* context) {
     FURI_LOG_D(TAG, __func__);
     delfyRTL* app = context;
     menu_reset(app->menu);
-    menu_add_item(app->menu, "Scan Wifi", &I_Scan_Wifi, ScanWifi, delfyRTL_menu_callback, app);
-    menu_add_item(app->menu, "List Wifis", &I_List_Wifi, ListWifis, delfyRTL_menu_callback, app);
+    menu_add_item(app->menu, "Wi-Fi", &I_Scan_Wifi, WifiHub, delfyRTL_menu_callback, app);
+    if(delfy_has_cap(app, 'L'))
+        menu_add_item(app->menu, "BLE", &I_Scan_Wifi, BleHub, delfyRTL_menu_callback, app);
     menu_add_item(
         app->menu, "Send Beacon", &I_random_AP, CustomBeacon, delfyRTL_menu_callback, app);
     menu_add_item(app->menu, "Create AP", &I_Custom_AP, CreateAP, delfyRTL_menu_callback, app);
-    menu_add_item(app->menu, "Channel Map", &I_Scan_Wifi, ChannelMap, delfyRTL_menu_callback, app);
-    if(delfy_has_cap(app, 'E'))
-        menu_add_item(app->menu, "Load Portal", &I_Custom_AP, PortalFile, delfyRTL_menu_callback, app);
-    if(delfy_has_cap(app, 'L'))
-        menu_add_item(app->menu, "BLE Scan", &I_Scan_Wifi, BleScan, delfyRTL_menu_callback, app);
-    if(delfy_has_cap(app, 'I')) {
-        menu_add_item(app->menu, "BLE iBeacon", &I_Scan_Wifi, BleBeacon, delfyRTL_menu_callback, app);
-        menu_add_item(app->menu, "iBeacon UUID", &I_Scan_Wifi, IBeaconUuid, delfyRTL_menu_callback, app);
-    }
-    if(delfy_has_cap(app, 'K')) {
-        menu_add_item(app->menu, "BadBLE HID", &I_Scan_Wifi, BadBle, delfyRTL_menu_callback, app);
-        menu_add_item(app->menu, "BadBLE file", &I_Scan_Wifi, BadBleFile, delfyRTL_menu_callback, app);
-    }
-    if(delfy_has_cap(app, 'L')) {
-        menu_add_item(app->menu, "BLE Adv (hex)", &I_Scan_Wifi, BleAdvHex, delfyRTL_menu_callback, app);
-        menu_add_item(app->menu, "BLE Adv replay", &I_Scan_Wifi, BleAdvReplay, delfyRTL_menu_callback, app);
-    }
     menu_add_item(app->menu, "Help", &I_help, Help, delfyRTL_menu_callback, app);
     menu_add_item(app->menu, "Exit", &I_exit, Exit, delfyRTL_menu_callback, app);
     menu_set_selected_item(app->menu, app->menuIndex);
@@ -587,6 +581,12 @@ bool main_menu_scene_on_event(void* context, SceneManagerEvent event) {
             break;
         case BadBleFile:
             delfy_badble_file(app);
+            break;
+        case WifiHub:
+            scene_manager_next_scene(app->scene_manager, wifiHubScene);
+            break;
+        case BleHub:
+            scene_manager_next_scene(app->scene_manager, bleHubScene);
             break;
         default:
             FURI_LOG_W("delfyRTL", "Evento desconocido: %ld", event.event);
@@ -1319,6 +1319,90 @@ void ibeacon_input_scene_on_exit(void* context) {
     UNUSED(context);
 }
 
+static void delfy_ble_scan(delfyRTL* app) {
+    recon_text[0] = '\0';
+    snprintf(recon_title, sizeof(recon_title), "BLE");
+    uart_helper_send(app->uart_helper, "BLESCAN 8\n", 10);
+    snprintf(message, sizeof(message), "Scanning BLE...");
+    snprintf(popupHeader, sizeof(popupHeader), "BLE");
+    scene_manager_next_scene(app->scene_manager, popupScene);
+}
+static void delfy_ibeacon_default(delfyRTL* app) {
+    const char* c = "BLEIBEACON 0102030405060708090A0B0C0D0E0F10 1 1 30\n";
+    uart_helper_send(app->uart_helper, c, strlen(c));
+    snprintf(message, sizeof(message), "iBeacon 30s...");
+    snprintf(popupHeader, sizeof(popupHeader), "BLE");
+    scene_manager_next_scene(app->scene_manager, popupScene);
+}
+static void delfy_badble_run(delfyRTL* app) {
+    uart_helper_send(app->uart_helper, "BADBLE 30\n", 10);
+    snprintf(message, sizeof(message), "BadBLE 30s...");
+    snprintf(popupHeader, sizeof(popupHeader), "BadBLE");
+    scene_manager_next_scene(app->scene_manager, popupScene);
+}
+
+static void wifi_hub_cb(void* context, uint32_t index) {
+    delfyRTL* app = context;
+    switch(index) {
+    case 0: scene_manager_next_scene(app->scene_manager, scanNetworksScene); break;
+    case 1: scene_manager_next_scene(app->scene_manager, listNetworksScene); break;
+    case 2: scene_manager_next_scene(app->scene_manager, channelMapScene); break;
+    case 3: delfy_load_portal(app); break;
+    }
+}
+void wifi_hub_scene_on_enter(void* context) {
+    delfyRTL* app = context;
+    submenu_reset(app->submenu);
+    submenu_set_header(app->submenu, "Wi-Fi");
+    submenu_add_item(app->submenu, "Scan Wifi", 0, wifi_hub_cb, app);
+    submenu_add_item(app->submenu, "List Wifis", 1, wifi_hub_cb, app);
+    submenu_add_item(app->submenu, "Channel Map", 2, wifi_hub_cb, app);
+    submenu_add_item(app->submenu, "Load Portal", 3, wifi_hub_cb, app);
+    view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
+}
+bool wifi_hub_scene_on_event(void* context, SceneManagerEvent event) {
+    UNUSED(context);
+    UNUSED(event);
+    return false;
+}
+void wifi_hub_scene_on_exit(void* context) {
+    UNUSED(context);
+}
+
+static void ble_hub_cb(void* context, uint32_t index) {
+    delfyRTL* app = context;
+    switch(index) {
+    case 0: delfy_ble_scan(app); break;
+    case 1: delfy_ibeacon_default(app); break;
+    case 2: scene_manager_next_scene(app->scene_manager, ibeaconInputScene); break;
+    case 3: delfy_badble_run(app); break;
+    case 4: delfy_badble_file(app); break;
+    case 5: scene_manager_next_scene(app->scene_manager, bleAdvInputScene); break;
+    case 6: delfy_adv_replay(app); break;
+    }
+}
+void ble_hub_scene_on_enter(void* context) {
+    delfyRTL* app = context;
+    submenu_reset(app->submenu);
+    submenu_set_header(app->submenu, "BLE");
+    submenu_add_item(app->submenu, "BLE Scan", 0, ble_hub_cb, app);
+    submenu_add_item(app->submenu, "iBeacon (demo)", 1, ble_hub_cb, app);
+    submenu_add_item(app->submenu, "iBeacon UUID", 2, ble_hub_cb, app);
+    submenu_add_item(app->submenu, "BadBLE HID", 3, ble_hub_cb, app);
+    submenu_add_item(app->submenu, "BadBLE file", 4, ble_hub_cb, app);
+    submenu_add_item(app->submenu, "BLE Adv (hex)", 5, ble_hub_cb, app);
+    submenu_add_item(app->submenu, "BLE Adv replay", 6, ble_hub_cb, app);
+    view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
+}
+bool ble_hub_scene_on_event(void* context, SceneManagerEvent event) {
+    UNUSED(context);
+    UNUSED(event);
+    return false;
+}
+void ble_hub_scene_on_exit(void* context) {
+    UNUSED(context);
+}
+
 static void delfy_toggle_hop(delfyRTL* app) {
     hop_on = !hop_on;
     uart_helper_send(app->uart_helper, hop_on ? "HOP 500\n" : "HOP 0\n", hop_on ? 8 : 6);
@@ -1950,7 +2034,9 @@ void (*const delfyRTL_scene_on_enter_handlers[])(void*) = {
     tools_menu_scene_on_enter,
     channel_map_scene_on_enter,
     ble_adv_input_scene_on_enter,
-    ibeacon_input_scene_on_enter};
+    ibeacon_input_scene_on_enter,
+    wifi_hub_scene_on_enter,
+    ble_hub_scene_on_enter};
 
 bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     main_menu_scene_on_event,
@@ -1970,7 +2056,9 @@ bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     tools_menu_scene_on_event,
     channel_map_scene_on_event,
     ble_adv_input_scene_on_event,
-    ibeacon_input_scene_on_event};
+    ibeacon_input_scene_on_event,
+    wifi_hub_scene_on_event,
+    ble_hub_scene_on_event};
 
 void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     main_menu_scene_on_exit,
@@ -1990,7 +2078,9 @@ void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     tools_menu_scene_on_exit,
     channel_map_scene_on_exit,
     ble_adv_input_scene_on_exit,
-    ibeacon_input_scene_on_exit};
+    ibeacon_input_scene_on_exit,
+    wifi_hub_scene_on_exit,
+    ble_hub_scene_on_exit};
 
 static const SceneManagerHandlers delfyRTL_scene_manager_handlers = {
     .on_enter_handlers = delfyRTL_scene_on_enter_handlers,
