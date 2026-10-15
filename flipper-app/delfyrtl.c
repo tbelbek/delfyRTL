@@ -66,6 +66,7 @@ typedef enum {
     sessionScene,
     gattScene,
     blespamScene,
+    trackerScene,
 
     DelfyRTLSceneCount
 } delfyRTLScene;
@@ -215,10 +216,20 @@ static int sess_pmf = 0;
 static int sess_wifis = 0;
 
 // --- D1: BLE devices seen in the last scan (so "GATT enumerate" can pick one) -----
+// A3/D4: ble_list_tag holds the firmware's vendor/fingerprint label (Apple/FindMy/Tile/...)
+// so the "Trackers" screen can flag likely tracker devices.
 #define BLE_LIST_MAX 16
 static char ble_list_mac[BLE_LIST_MAX][18];
 static char ble_list_name[BLE_LIST_MAX][24];
+static char ble_list_tag[BLE_LIST_MAX][16];
 static int ble_list_n = 0;
+
+// Devices whose vendor/fingerprint label marks them as (possible) location trackers.
+static bool ble_is_tracker(const char* tag) {
+    if(!tag || !tag[0]) return false;
+    return !strcmp(tag, "FindMy") || !strcmp(tag, "Airtag") || !strcmp(tag, "AirTag") ||
+           !strcmp(tag, "Tile") || !strcmp(tag, "SmartTag") || !strcmp(tag, "Samsung");
+}
 // E: guided-audit context (written to /ext/delfy/audit.json when a grab finishes)
 static bool audit_mode = false;
 static char audit_ssid[33];
@@ -1717,6 +1728,7 @@ static void ble_hub_cb(void* context, uint32_t index) {
     case 7: scene_manager_next_scene(app->scene_manager, bleAdvLibScene); break;
     case 8: scene_manager_next_scene(app->scene_manager, gattScene); break;
     case 9: scene_manager_next_scene(app->scene_manager, blespamScene); break;
+    case 10: scene_manager_next_scene(app->scene_manager, trackerScene); break;
     }
 }
 void ble_hub_scene_on_enter(void* context) {
@@ -1734,6 +1746,7 @@ void ble_hub_scene_on_enter(void* context) {
     submenu_add_item(app->submenu, "Saved adverts", 7, ble_hub_cb, app);
     submenu_add_item(app->submenu, "GATT enumerate", 8, ble_hub_cb, app);
     submenu_add_item(app->submenu, "BLE Spam", 9, ble_hub_cb, app);
+    submenu_add_item(app->submenu, "Trackers", 10, ble_hub_cb, app);
     view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
 }
 bool ble_hub_scene_on_event(void* context, SceneManagerEvent event) {
@@ -2050,6 +2063,46 @@ bool blespam_scene_on_event(void* context, SceneManagerEvent event) {
     return false;
 }
 void blespam_scene_on_exit(void* context) {
+    UNUSED(context);
+}
+
+// A3/D4: flag the scanned devices that look like location trackers.
+void tracker_scene_on_enter(void* context) {
+    delfyRTL* app = context;
+    widget_reset(app->widget);
+    widget_add_string_element(
+        app->widget, 64, 2, AlignCenter, AlignTop, FontPrimary, "Tracker scan");
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf), "* = possible tracker\n");
+    int found = 0;
+    for(int i = 0; i < ble_list_n && n < (int)sizeof(buf) - 40; i++) {
+        bool tr = ble_is_tracker(ble_list_tag[i]);
+        if(tr) found++;
+        n += snprintf(
+            buf + n,
+            sizeof(buf) - n,
+            "%s%s %s\n",
+            tr ? "*" : " ",
+            ble_list_tag[i][0] ? ble_list_tag[i] : "?",
+            ble_list_mac[i]);
+    }
+    if(ble_list_n == 0) n += snprintf(buf + n, sizeof(buf) - n, "(run BLE Scan first)\n");
+    snprintf(
+        buf + (n < (int)sizeof(buf) - 1 ? n : (int)sizeof(buf) - 1),
+        sizeof(buf) - (n < (int)sizeof(buf) - 1 ? n : (int)sizeof(buf) - 1),
+        "\n%d/%d flagged",
+        found,
+        ble_list_n);
+    widget_add_text_scroll_element(app->widget, 0, 14, 128, 50, buf);
+    delfy_save_scan("trackers", buf);
+    view_dispatcher_switch_to_view(app->view_dispatcher, pmfView);
+}
+bool tracker_scene_on_event(void* context, SceneManagerEvent event) {
+    UNUSED(context);
+    UNUSED(event);
+    return false;
+}
+void tracker_scene_on_exit(void* context) {
     UNUSED(context);
 }
 
@@ -2921,7 +2974,7 @@ void (*const delfyRTL_scene_on_enter_handlers[])(void*) = {
     wifi_hub_scene_on_enter,
     ble_hub_scene_on_enter,
     ble_adv_lib_scene_on_enter,
-    portal_list_scene_on_enter, settings_scene_on_enter, session_scene_on_enter, gatt_scene_on_enter, blespam_scene_on_enter};
+    portal_list_scene_on_enter, settings_scene_on_enter, session_scene_on_enter, gatt_scene_on_enter, blespam_scene_on_enter, tracker_scene_on_enter};
 
 bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     main_menu_scene_on_event,
@@ -2946,7 +2999,7 @@ bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     wifi_hub_scene_on_event,
     ble_hub_scene_on_event,
     ble_adv_lib_scene_on_event,
-    portal_list_scene_on_event, settings_scene_on_event, session_scene_on_event, gatt_scene_on_event, blespam_scene_on_event};
+    portal_list_scene_on_event, settings_scene_on_event, session_scene_on_event, gatt_scene_on_event, blespam_scene_on_event, tracker_scene_on_event};
 
 void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     main_menu_scene_on_exit,
@@ -2971,7 +3024,7 @@ void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     wifi_hub_scene_on_exit,
     ble_hub_scene_on_exit,
     ble_adv_lib_scene_on_exit,
-    portal_list_scene_on_exit, settings_scene_on_exit, session_scene_on_exit, gatt_scene_on_exit, blespam_scene_on_exit};
+    portal_list_scene_on_exit, settings_scene_on_exit, session_scene_on_exit, gatt_scene_on_exit, blespam_scene_on_exit, tracker_scene_on_exit};
 
 static const SceneManagerHandlers delfyRTL_scene_manager_handlers = {
     .on_enter_handlers = delfyRTL_scene_on_enter_handlers,
@@ -3243,14 +3296,22 @@ void uart_process_line(FuriString* line, void* context) {
         }
         if(mac[0]) {
             char name[24] = "";
-            const char* p2 = p1 ? strchr(p1 + 1, '|') : NULL; // rssi
-            const char* p3 = p2 ? strchr(p2 + 1, '|') : NULL; // name
-            const char* p4 = p3 ? strchr(p3 + 1, '|') : NULL; // vendor
+            char tag[16] = "";
+            // fields after "BLE:": mac | rssi | name | vendor | raw
+            const char* p2 = p1 ? strchr(p1 + 1, '|') : NULL; // end of rssi
+            const char* p3 = p2 ? strchr(p2 + 1, '|') : NULL; // end of name
+            const char* p4 = p3 ? strchr(p3 + 1, '|') : NULL; // end of vendor
+            if(p2 && p3) {
+                size_t n = (size_t)(p3 - p2 - 1);
+                if(n > 23) n = 23;
+                memcpy(name, p2 + 1, n);
+                name[n] = '\0';
+            }
             if(p3 && p4) {
                 size_t n = (size_t)(p4 - p3 - 1);
-                if(n > 23) n = 23;
-                memcpy(name, p3 + 1, n);
-                name[n] = '\0';
+                if(n > 15) n = 15;
+                memcpy(tag, p3 + 1, n);
+                tag[n] = '\0';
             }
             if(!name[0]) strncpy(name, "(no name)", sizeof(name) - 1);
             bool have = false;
@@ -3263,6 +3324,8 @@ void uart_process_line(FuriString* line, void* context) {
                 strncpy(ble_list_mac[ble_list_n], mac, sizeof(ble_list_mac[0]) - 1);
                 ble_list_name[ble_list_n][0] = '\0';
                 strncpy(ble_list_name[ble_list_n], name, sizeof(ble_list_name[0]) - 1);
+                ble_list_tag[ble_list_n][0] = '\0';
+                strncpy(ble_list_tag[ble_list_n], tag, sizeof(ble_list_tag[0]) - 1);
                 ble_list_n++;
             }
         }
