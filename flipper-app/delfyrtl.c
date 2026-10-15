@@ -63,6 +63,7 @@ typedef enum {
     bleAdvLibScene,
     portalListScene,
     settingsScene,
+    sessionScene,
 
     DelfyRTLSceneCount
 } delfyRTLScene;
@@ -203,6 +204,13 @@ static bool set_save = true;
 static int delfy_def_ch(void) {
     return atoi(set_channels[set_channel_idx]);
 }
+
+// --- E8: per-run session counters (shown on the "Session summary" screen) ---------
+static int sess_creds = 0;
+static int sess_probes = 0;
+static int sess_stas = 0;
+static int sess_pmf = 0;
+static int sess_wifis = 0;
 // E: guided-audit context (written to /ext/delfy/audit.json when a grab finishes)
 static bool audit_mode = false;
 static char audit_ssid[33];
@@ -793,6 +801,7 @@ void list_networks_scene_on_enter(void* context) {
         app->wifiList[j + 1] = key;
     }
     delfy_save_wifi_list(app);   // persist the scanned AP list to /ext/delfy/scans/
+    sess_wifis = app->wifiCount;
     app->menuIndex = 1;
     app->submenuIndex = 0;
     submenu_reset(app->submenu);
@@ -1646,6 +1655,7 @@ static void wifi_hub_cb(void* context, uint32_t index) {
     case 6: delfy_apclone(app); break;
     case 7: delfy_probeflood(app); break;
     case 8: scene_manager_next_scene(app->scene_manager, settingsScene); break;
+    case 9: scene_manager_next_scene(app->scene_manager, sessionScene); break;
     }
 }
 // Re-ask the board for its IDENT while we have not heard back yet. The board answers HELLO
@@ -1673,6 +1683,7 @@ void wifi_hub_scene_on_enter(void* context) {
         submenu_add_item(app->submenu, "Probe flood", 7, wifi_hub_cb, app);
     }
     submenu_add_item(app->submenu, "Settings", 8, wifi_hub_cb, app);
+    submenu_add_item(app->submenu, "Session summary", 9, wifi_hub_cb, app);
     view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
 }
 bool wifi_hub_scene_on_event(void* context, SceneManagerEvent event) {
@@ -1918,6 +1929,49 @@ bool settings_scene_on_event(void* context, SceneManagerEvent event) {
     return false;
 }
 void settings_scene_on_exit(void* context) {
+    UNUSED(context);
+}
+
+// E8: session summary — how much this app run found, plus a session.txt snapshot.
+void session_scene_on_enter(void* context) {
+    delfyRTL* app = context;
+    widget_reset(app->widget);
+    widget_add_string_element(
+        app->widget, 64, 2, AlignCenter, AlignTop, FontPrimary, "Session summary");
+    char buf[256];
+    snprintf(
+        buf,
+        sizeof(buf),
+        "id %s\nAPs %d\nSTA %d\nPMF %d\nProbe devs %d\nCreds %d\n/ext/delfy/sessions/%s/",
+        delfy_session_id,
+        sess_wifis,
+        sess_stas,
+        sess_pmf,
+        sess_probes,
+        sess_creds,
+        delfy_session_id);
+    widget_add_text_scroll_element(app->widget, 0, 14, 128, 50, buf);
+    char body[256];
+    snprintf(
+        body,
+        sizeof(body),
+        "APs=%d\nSTA=%d\nPMF=%d\nProbeDevices=%d\nCreds=%d\nfw=%s caps=%s\n",
+        sess_wifis,
+        sess_stas,
+        sess_pmf,
+        sess_probes,
+        sess_creds,
+        app->fw_version[0] ? app->fw_version : "-",
+        app->fw_caps[0] ? app->fw_caps : "-");
+    delfy_save_scan("session", body);
+    view_dispatcher_switch_to_view(app->view_dispatcher, pmfView);
+}
+bool session_scene_on_event(void* context, SceneManagerEvent event) {
+    UNUSED(context);
+    UNUSED(event);
+    return false;
+}
+void session_scene_on_exit(void* context) {
     UNUSED(context);
 }
 
@@ -2789,7 +2843,7 @@ void (*const delfyRTL_scene_on_enter_handlers[])(void*) = {
     wifi_hub_scene_on_enter,
     ble_hub_scene_on_enter,
     ble_adv_lib_scene_on_enter,
-    portal_list_scene_on_enter, settings_scene_on_enter};
+    portal_list_scene_on_enter, settings_scene_on_enter, session_scene_on_enter};
 
 bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     main_menu_scene_on_event,
@@ -2814,7 +2868,7 @@ bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     wifi_hub_scene_on_event,
     ble_hub_scene_on_event,
     ble_adv_lib_scene_on_event,
-    portal_list_scene_on_event, settings_scene_on_event};
+    portal_list_scene_on_event, settings_scene_on_event, session_scene_on_event};
 
 void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     main_menu_scene_on_exit,
@@ -2839,7 +2893,7 @@ void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     wifi_hub_scene_on_exit,
     ble_hub_scene_on_exit,
     ble_adv_lib_scene_on_exit,
-    portal_list_scene_on_exit, settings_scene_on_exit};
+    portal_list_scene_on_exit, settings_scene_on_exit, session_scene_on_exit};
 
 static const SceneManagerHandlers delfyRTL_scene_manager_handlers = {
     .on_enter_handlers = delfyRTL_scene_on_enter_handlers,
@@ -2868,6 +2922,7 @@ static bool delfyRTL_custom_callback(void* context, uint32_t custom_event) {
         return true;
     }
     if(custom_event == DELFY_EVT_CREDS) {
+        sess_creds++;
         if(set_vibro) {
             furi_hal_vibro_on(true);
             furi_delay_ms(120);
@@ -3002,18 +3057,24 @@ void uart_process_line(FuriString* line, void* context) {
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
     } else if(strncmp(furi_string_get_cstr(line), "PMFDONE:", 8) == 0) {
         snprintf(recon_title, sizeof(recon_title), "PMF / WPA3");
+        const char* s = strstr(furi_string_get_cstr(line), "aps=");
+        sess_pmf = s ? atoi(s + 4) : 0;
         delfy_save_scan("pmf", recon_text);
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "PMF:", 4) == 0) {
         recon_append(furi_string_get_cstr(line) + 4);
     } else if(strncmp(furi_string_get_cstr(line), "STADONE:", 8) == 0) {
         snprintf(recon_title, sizeof(recon_title), "Stations");
+        const char* s = strstr(furi_string_get_cstr(line), "n=");
+        sess_stas = s ? atoi(s + 2) : 0;
         delfy_save_scan("stations", recon_text);
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "STA:", 4) == 0) {
         recon_append(furi_string_get_cstr(line) + 4);
     } else if(strncmp(furi_string_get_cstr(line), "PROBEDONE:", 10) == 0) {
         snprintf(recon_title, sizeof(recon_title), "Probe / PNL");
+        const char* s = strstr(furi_string_get_cstr(line), "n=");
+        sess_probes += s ? atoi(s + 2) : 0;
         delfy_save_scan("probe", recon_text);
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "PROBE:", 6) == 0) {
