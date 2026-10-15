@@ -65,6 +65,7 @@ typedef enum {
     settingsScene,
     sessionScene,
     gattScene,
+    blespamScene,
 
     DelfyRTLSceneCount
 } delfyRTLScene;
@@ -1715,6 +1716,7 @@ static void ble_hub_cb(void* context, uint32_t index) {
     case 6: delfy_adv_replay(app); break;
     case 7: scene_manager_next_scene(app->scene_manager, bleAdvLibScene); break;
     case 8: scene_manager_next_scene(app->scene_manager, gattScene); break;
+    case 9: scene_manager_next_scene(app->scene_manager, blespamScene); break;
     }
 }
 void ble_hub_scene_on_enter(void* context) {
@@ -1731,6 +1733,7 @@ void ble_hub_scene_on_enter(void* context) {
     submenu_add_item(app->submenu, "BLE Adv replay", 6, ble_hub_cb, app);
     submenu_add_item(app->submenu, "Saved adverts", 7, ble_hub_cb, app);
     submenu_add_item(app->submenu, "GATT enumerate", 8, ble_hub_cb, app);
+    submenu_add_item(app->submenu, "BLE Spam", 9, ble_hub_cb, app);
     view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
 }
 bool ble_hub_scene_on_event(void* context, SceneManagerEvent event) {
@@ -2018,6 +2021,35 @@ bool gatt_scene_on_event(void* context, SceneManagerEvent event) {
     return false;
 }
 void gatt_scene_on_exit(void* context) {
+    UNUSED(context);
+}
+
+// D2: pick a BLE spam payload family (Apple continuity / Microsoft Swift Pair).
+static void blespam_item_cb(void* context, uint32_t index) {
+    delfyRTL* app = context;
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "BLESPAM %u 30\n", (unsigned)index);
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    delfy_busy_ex(app, "BLE spam", "Blasting 30s...", 30);
+}
+void blespam_scene_on_enter(void* context) {
+    delfyRTL* app = context;
+    app->submenuIndex = 0;
+    submenu_reset(app->submenu);
+    submenu_set_header(app->submenu, "BLE spam");
+    submenu_add_item(app->submenu, "Apple Pair (Pods/Tag)", 0, blespam_item_cb, app);
+    submenu_add_item(app->submenu, "Apple Action (iPhone/TV)", 1, blespam_item_cb, app);
+    submenu_add_item(app->submenu, "Apple AirDrop", 2, blespam_item_cb, app);
+    submenu_add_item(app->submenu, "Microsoft Swift Pair", 3, blespam_item_cb, app);
+    submenu_add_item(app->submenu, "All (rotate)", 4, blespam_item_cb, app);
+    view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
+}
+bool blespam_scene_on_event(void* context, SceneManagerEvent event) {
+    UNUSED(context);
+    UNUSED(event);
+    return false;
+}
+void blespam_scene_on_exit(void* context) {
     UNUSED(context);
 }
 
@@ -2889,7 +2921,7 @@ void (*const delfyRTL_scene_on_enter_handlers[])(void*) = {
     wifi_hub_scene_on_enter,
     ble_hub_scene_on_enter,
     ble_adv_lib_scene_on_enter,
-    portal_list_scene_on_enter, settings_scene_on_enter, session_scene_on_enter, gatt_scene_on_enter};
+    portal_list_scene_on_enter, settings_scene_on_enter, session_scene_on_enter, gatt_scene_on_enter, blespam_scene_on_enter};
 
 bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     main_menu_scene_on_event,
@@ -2914,7 +2946,7 @@ bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     wifi_hub_scene_on_event,
     ble_hub_scene_on_event,
     ble_adv_lib_scene_on_event,
-    portal_list_scene_on_event, settings_scene_on_event, session_scene_on_event, gatt_scene_on_event};
+    portal_list_scene_on_event, settings_scene_on_event, session_scene_on_event, gatt_scene_on_event, blespam_scene_on_event};
 
 void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     main_menu_scene_on_exit,
@@ -2939,7 +2971,7 @@ void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     wifi_hub_scene_on_exit,
     ble_hub_scene_on_exit,
     ble_adv_lib_scene_on_exit,
-    portal_list_scene_on_exit, settings_scene_on_exit, session_scene_on_exit, gatt_scene_on_exit};
+    portal_list_scene_on_exit, settings_scene_on_exit, session_scene_on_exit, gatt_scene_on_exit, blespam_scene_on_exit};
 
 static const SceneManagerHandlers delfyRTL_scene_manager_handlers = {
     .on_enter_handlers = delfyRTL_scene_on_enter_handlers,
@@ -3182,6 +3214,13 @@ void uart_process_line(FuriString* line, void* context) {
         snprintf(recon_title, sizeof(recon_title), "BLE");
         delfy_save_scan("ble", recon_text);
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
+    } else if(strncmp(furi_string_get_cstr(line), "BLESPAM:", 8) == 0) {
+        // reply is "BLESPAM:off <count>" -> show just the count
+        const char* s = furi_string_get_cstr(line) + 8;
+        const char* sp = strchr(s, ' ');
+        snprintf(message, sizeof(message), "Sent %s payloads", sp ? sp + 1 : s);
+        snprintf(popupHeader, sizeof(popupHeader), "BLE spam");
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
     } else if(strncmp(furi_string_get_cstr(line), "GATT:done", 9) == 0) {
         snprintf(recon_title, sizeof(recon_title), "GATT");
         delfy_save_scan("gatt", recon_text);

