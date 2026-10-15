@@ -1151,7 +1151,7 @@ static void delfy_start_pmkid_clientless(delfyRTL* app) {
 static void delfy_load_portal(delfyRTL* app) {
     Storage* st = furi_record_open(RECORD_STORAGE);
     File* f = storage_file_alloc(st);
-    static uint8_t buf[12288];
+    static uint8_t buf[8192];
     size_t n = 0;
     if(storage_file_open(f, "/ext/delfy/portal.html", FSAM_READ, FSOM_OPEN_EXISTING)) {
         n = storage_file_read(f, buf, sizeof(buf));
@@ -1167,17 +1167,17 @@ static void delfy_load_portal(delfyRTL* app) {
     }
     uart_helper_send(app->uart_helper, "PORTALCLEAR\n", 12);
     furi_delay_ms(150);
-    static char chunk[16 + 2 * 64 + 4];
+    static char chunk[16 + 2 * 256 + 4];
     size_t off = 0;
     while(off < n) {
         size_t cl = n - off;
-        if(cl > 64) cl = 64;   // small chunks: the board tolerates ~64B bursts
+        if(cl > 256) cl = 256;   // board reads 256B bursts reliably (64B stalls)
         int p = snprintf(chunk, sizeof(chunk), "PORTALHTML ");
         for(size_t i = 0; i < cl; i++) p += snprintf(chunk + p, sizeof(chunk) - p, "%02x", buf[off + i]);
         chunk[p++] = '\n';
         uart_helper_send(app->uart_helper, chunk, p);
         off += cl;
-        furi_delay_ms(350);
+        furi_delay_ms(150);
     }
     furi_delay_ms(200);
     uart_helper_send(app->uart_helper, "PORTAL 6\n", 9); // select Custom (file)
