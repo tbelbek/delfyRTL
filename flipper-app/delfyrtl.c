@@ -62,6 +62,7 @@ typedef enum {
     bleHubScene,
     bleAdvLibScene,
     portalListScene,
+    settingsScene,
 
     DelfyRTLSceneCount
 } delfyRTLScene;
@@ -88,6 +89,7 @@ typedef enum {
     toolsListView,
     channelMapView,
     cardMenuView,
+    settingsView,
 
 } delfyRTLView;
 
@@ -187,6 +189,20 @@ static uint32_t portal_exp_hash = 0;
 static uint16_t portal_exp_len = 0;
 // Session id captured at app start; all scan artefacts go under /ext/delfy/sessions/<id>/.
 static char delfy_session_id[32] = "session";
+
+// --- E4 settings globals: Def. channel / Scan wait / Vibration / Save results -----
+#define SET_CHANNELS_N 21
+static const char* const set_channels[SET_CHANNELS_N] = {
+    "1",  "2",  "3",  "4",  "5",  "6", "7",  "8",   "9",   "10", "11",
+    "12", "13", "36", "40", "44", "48", "149", "153", "157", "161"};
+static int set_channel_idx = 5; // -> "6"
+static int set_scan_wait = 12;
+static bool set_vibro = true;
+static bool set_save = true;
+
+static int delfy_def_ch(void) {
+    return atoi(set_channels[set_channel_idx]);
+}
 // E: guided-audit context (written to /ext/delfy/audit.json when a grab finishes)
 static bool audit_mode = false;
 static char audit_ssid[33];
@@ -485,6 +501,7 @@ static void delfy_ident(delfyRTL* app);
 // every Wi-Fi/PMF/STA/BLE result survives a reboot and can be reviewed later.
 static void delfy_save_scan(const char* kind, const char* body) {
     if(!kind) return;
+    if(!set_save) return;   // E4: "Save results" off -> nothing is written
     Storage* st = furi_record_open(RECORD_STORAGE);
     storage_common_mkdir(st, "/ext/delfy");
     storage_common_mkdir(st, "/ext/delfy/sessions");
@@ -732,7 +749,7 @@ void scan_networks_scene_on_enter(void* context) {
     uart_helper_send(app->uart_helper, "SCAN\n", 5);
     scanFinish = false;
     int times = 0;
-    while(scanFinish == false && times < 20) {
+    while(scanFinish == false && times < set_scan_wait * 2) {
         furi_delay_ms(500);
         times++;
     }
@@ -1102,7 +1119,7 @@ void mac_type_change_call_back(VariableItem* item) {
 
 static void delfy_start_capture(delfyRTL* app, bool grab) {
     FURI_LOG_D(TAG, __func__);
-    int ch = 6;
+    int ch = delfy_def_ch();
     if(app->selectedWifi >= 0 && app->selectedWifi < app->wifiCount) {
         ch = app->wifiList[app->selectedWifi].chanel;
     }
@@ -1132,7 +1149,7 @@ static void delfy_start_capture(delfyRTL* app, bool grab) {
 }
 
 static void delfy_start_pmf(delfyRTL* app) {
-    int ch = 6;
+    int ch = delfy_def_ch();
     if(app->selectedWifi >= 0 && app->selectedWifi < app->wifiCount) {
         ch = app->wifiList[app->selectedWifi].chanel;
     }
@@ -1271,7 +1288,7 @@ static void delfy_start_pmkid_clientless(delfyRTL* app) {
 
 // A1: probe-request sniffer — harvest nearby devices' remembered SSIDs (their PNL).
 static void delfy_start_probe(delfyRTL* app) {
-    int ch = 6;
+    int ch = delfy_def_ch();
     if(app->selectedWifi >= 0 && app->selectedWifi < app->wifiCount)
         ch = app->wifiList[app->selectedWifi].chanel;
     recon_text[0] = '\0';
@@ -1295,7 +1312,7 @@ static void delfy_apclone(delfyRTL* app) {
 
 // B7: emit probe requests (as a client) for the selected AP's SSID.
 static void delfy_probeflood(delfyRTL* app) {
-    int ch = 6;
+    int ch = delfy_def_ch();
     const char* ssid = "*";
     if(app->selectedWifi >= 0 && app->selectedWifi < app->wifiCount) {
         ch = app->wifiList[app->selectedWifi].chanel;
@@ -1626,6 +1643,7 @@ static void wifi_hub_cb(void* context, uint32_t index) {
     case 5: scene_manager_next_scene(app->scene_manager, portalListScene); break;
     case 6: delfy_apclone(app); break;
     case 7: delfy_probeflood(app); break;
+    case 8: scene_manager_next_scene(app->scene_manager, settingsScene); break;
     }
 }
 // Re-ask the board for its IDENT while we have not heard back yet. The board answers HELLO
@@ -1652,6 +1670,7 @@ void wifi_hub_scene_on_enter(void* context) {
         submenu_add_item(app->submenu, "AP Clone (spam)", 6, wifi_hub_cb, app);
         submenu_add_item(app->submenu, "Probe flood", 7, wifi_hub_cb, app);
     }
+    submenu_add_item(app->submenu, "Settings", 8, wifi_hub_cb, app);
     view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
 }
 bool wifi_hub_scene_on_event(void* context, SceneManagerEvent event) {
@@ -1787,6 +1806,117 @@ void config_attack_change_call_back(void* context, uint32_t index) {
     } else if(index == 4) {
         scene_manager_next_scene(app->scene_manager, aPmacAddresScene);
     }
+}
+
+// --- E4: app settings, persisted to /ext/delfy/settings.txt ---------------------
+// (globals live up top so scenes/helpers defined earlier can use them)
+static void delfy_settings_save(void) {
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    storage_common_mkdir(st, "/ext/delfy");
+    File* f = storage_file_alloc(st);
+    if(storage_file_open(f, "/ext/delfy/settings.txt", FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        char buf[128];
+        int n = snprintf(
+            buf,
+            sizeof(buf),
+            "channel=%s\nscan_wait=%d\nvibro=%d\nsave=%d\n",
+            set_channels[set_channel_idx],
+            set_scan_wait,
+            set_vibro ? 1 : 0,
+            set_save ? 1 : 0);
+        storage_file_write(f, buf, (size_t)n);
+        storage_file_close(f);
+    }
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+}
+
+static void delfy_settings_load(void) {
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    File* f = storage_file_alloc(st);
+    if(storage_file_open(f, "/ext/delfy/settings.txt", FSAM_READ, FSOM_OPEN_EXISTING)) {
+        char buf[256];
+        size_t n = storage_file_read(f, buf, sizeof(buf) - 1);
+        buf[n] = '\0';
+        storage_file_close(f);
+        char* line = strtok(buf, "\n");
+        while(line) {
+            if(!strncmp(line, "channel=", 8)) {
+                int v = atoi(line + 8);
+                for(int i = 0; i < SET_CHANNELS_N; i++)
+                    if(atoi(set_channels[i]) == v) set_channel_idx = i;
+            } else if(!strncmp(line, "scan_wait=", 10)) {
+                int v = atoi(line + 10);
+                set_scan_wait = (v < 5 || v > 30) ? 12 : v;
+            } else if(!strncmp(line, "vibro=", 6)) {
+                set_vibro = atoi(line + 6) != 0;
+            } else if(!strncmp(line, "save=", 5)) {
+                set_save = atoi(line + 5) != 0;
+            }
+            line = strtok(NULL, "\n");
+        }
+    }
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+}
+
+static void settings_channel_cb(VariableItem* item) {
+    set_channel_idx = variable_item_get_current_value_index(item);
+    variable_item_set_current_value_text(item, set_channels[set_channel_idx]);
+    delfy_settings_save();
+}
+static void settings_wait_cb(VariableItem* item) {
+    set_scan_wait = variable_item_get_current_value_index(item) + 5;
+    char b[8];
+    snprintf(b, sizeof(b), "%ds", set_scan_wait);
+    variable_item_set_current_value_text(item, b);
+    delfy_settings_save();
+}
+static void settings_vibro_cb(VariableItem* item) {
+    set_vibro = variable_item_get_current_value_index(item) != 0;
+    variable_item_set_current_value_text(item, set_vibro ? "on" : "off");
+    delfy_settings_save();
+}
+static void settings_save_cb(VariableItem* item) {
+    set_save = variable_item_get_current_value_index(item) != 0;
+    variable_item_set_current_value_text(item, set_save ? "on" : "off");
+    delfy_settings_save();
+}
+
+void settings_scene_on_enter(void* context) {
+    delfyRTL* app = context;
+    VariableItem* item;
+    variable_item_list_reset(app->variableList);
+    item = variable_item_list_add(
+        app->variableList, "Def. channel", SET_CHANNELS_N, settings_channel_cb, app);
+    variable_item_set_current_value_index(item, set_channel_idx);
+    variable_item_set_current_value_text(item, set_channels[set_channel_idx]);
+
+    item = variable_item_list_add(app->variableList, "Scan wait", 26, settings_wait_cb, app);
+    variable_item_set_current_value_index(item, set_scan_wait - 5);
+    {
+        char b[8];
+        snprintf(b, sizeof(b), "%ds", set_scan_wait);
+        variable_item_set_current_value_text(item, b);
+    }
+
+    item = variable_item_list_add(app->variableList, "Vibration", 2, settings_vibro_cb, app);
+    variable_item_set_current_value_index(item, set_vibro ? 1 : 0);
+    variable_item_set_current_value_text(item, set_vibro ? "on" : "off");
+
+    item = variable_item_list_add(app->variableList, "Save results", 2, settings_save_cb, app);
+    variable_item_set_current_value_index(item, set_save ? 1 : 0);
+    variable_item_set_current_value_text(item, set_save ? "on" : "off");
+
+    view_dispatcher_switch_to_view(app->view_dispatcher, settingsView);
+}
+bool settings_scene_on_event(void* context, SceneManagerEvent event) {
+    UNUSED(context);
+    UNUSED(event);
+    return false;
+}
+void settings_scene_on_exit(void* context) {
+    UNUSED(context);
 }
 
 void config_attack_scene_on_enter(void* context) {
@@ -2630,7 +2760,7 @@ void (*const delfyRTL_scene_on_enter_handlers[])(void*) = {
     wifi_hub_scene_on_enter,
     ble_hub_scene_on_enter,
     ble_adv_lib_scene_on_enter,
-    portal_list_scene_on_enter};
+    portal_list_scene_on_enter, settings_scene_on_enter};
 
 bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     main_menu_scene_on_event,
@@ -2655,7 +2785,7 @@ bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     wifi_hub_scene_on_event,
     ble_hub_scene_on_event,
     ble_adv_lib_scene_on_event,
-    portal_list_scene_on_event};
+    portal_list_scene_on_event, settings_scene_on_event};
 
 void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     main_menu_scene_on_exit,
@@ -2680,7 +2810,7 @@ void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     wifi_hub_scene_on_exit,
     ble_hub_scene_on_exit,
     ble_adv_lib_scene_on_exit,
-    portal_list_scene_on_exit};
+    portal_list_scene_on_exit, settings_scene_on_exit};
 
 static const SceneManagerHandlers delfyRTL_scene_manager_handlers = {
     .on_enter_handlers = delfyRTL_scene_on_enter_handlers,
@@ -2709,6 +2839,11 @@ static bool delfyRTL_custom_callback(void* context, uint32_t custom_event) {
         return true;
     }
     if(custom_event == DELFY_EVT_CREDS) {
+        if(set_vibro) {
+            furi_hal_vibro_on(true);
+            furi_delay_ms(120);
+            furi_hal_vibro_on(false);
+        }
         if(!creds_scene_shown) {
             scene_manager_next_scene(app->scene_manager, evilCredsScene);
         } else {
@@ -3030,6 +3165,8 @@ static delfyRTL* app_alloc() {
         app->view_dispatcher, configAttackView, variable_item_list_get_view(app->variableList));
     view_dispatcher_add_view(
         app->view_dispatcher, configAPView, variable_item_list_get_view(app->variableList));
+    view_dispatcher_add_view(
+        app->view_dispatcher, settingsView, variable_item_list_get_view(app->variableList));
 
     app->byteInput = byte_input_alloc();
     view_dispatcher_add_view(
@@ -3107,6 +3244,7 @@ static void app_free(delfyRTL* app) {
     view_dispatcher_remove_view(app->view_dispatcher, toolsListView);
     view_dispatcher_remove_view(app->view_dispatcher, channelMapView);
     view_dispatcher_remove_view(app->view_dispatcher, busyView);
+    view_dispatcher_remove_view(app->view_dispatcher, settingsView);
 
     scene_manager_free(app->scene_manager);
 
@@ -3138,6 +3276,7 @@ int32_t delfyRTL_app(void* p) {
     UNUSED(p);
 
     delfyRTL* app = app_alloc();
+    delfy_settings_load();
     {
         // Session id = app-launch timestamp; scan results land in sessions/<id>/.
         DateTime dt;
