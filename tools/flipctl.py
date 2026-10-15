@@ -170,6 +170,19 @@ def grab(s, timeout=1.5):
     return last
 
 
+def close_session(s):
+    """Stop the screen stream and the RPC session before closing the port.
+    Without this the device keeps the stream (and buffers) alive -> leaks RAM and a
+    later preload fails with 'Not enough memory'."""
+    try:
+        send(s, b"\xAA\x01\x00")   # Main.gui_stop_screen_stream_request (field 21)
+        time.sleep(0.15)
+        send(s, b"\x9A\x01\x00")   # Main.stop_session (field 19)
+        time.sleep(0.15)
+    except Exception:
+        pass
+
+
 def send_app(s, name, args=""):
     """Main.app_start_request (field 16) { name=1, args=2 } -> launch an app by id."""
     sub = b"\x0a" + varint(len(name)) + name.encode()
@@ -252,6 +265,7 @@ def main():
             print(__doc__)
             return 1
     finally:
+        close_session(s)
         s.close()
     return 0
 

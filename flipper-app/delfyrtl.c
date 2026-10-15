@@ -838,43 +838,43 @@ void info_wifi_scene_on_enter(void* context) {
             security = "OPEN";
             break;
         case(WEP_ENABLED):
-            security = "WEP_PSK";
+            security = "WEP";
             break;
         case(WEP_ENABLED | SHARED_ENABLED):
-            security = "WEP_SHARED";
+            security = "WEP-SH";
             break;
         case(WPA_SECURITY | TKIP_ENABLED):
-            security = "WPA_TKIP_PSK";
+            security = "WPA-TK";
             break;
         case(WPA_SECURITY | AES_ENABLED):
-            security = "WPA_AES_PSK";
+            security = "WPA-AES";
             break;
         case(WPA2_SECURITY | AES_ENABLED):
-            security = "WPA2_AES_PSK";
+            security = "WPA2-AES";
             break;
         case(WPA2_SECURITY | TKIP_ENABLED):
-            security = "WPA2_TKIP_PSK";
+            security = "WPA2-TK";
             break;
         case(WPA2_SECURITY | AES_ENABLED | TKIP_ENABLED):
-            security = "WPA2_MIXED_TKIP";
+            security = "WPA2-MIXTK";
             break;
         case(WPA_SECURITY | WPA2_SECURITY):
-            security = "WPA_WPA2_MIXED";
+            security = "WPA/2";
             break;
         case(WPA_SECURITY | WPA2_SECURITY | TKIP_ENABLED):
-            security = "WPA_WPA2_MIXED_TKIP";
+            security = "WPA/2-TK";
             break;
         case(WPA_SECURITY | WPA2_SECURITY | AES_ENABLED):
-            security = "WPA_WPA2_MIXED_AES";
+            security = "WPA/2-AES";
             break;
         case(WPA_SECURITY | WPA2_SECURITY | TKIP_ENABLED | AES_ENABLED):
-            security = "WPA_WPA2_MIXED_MIXED";
+            security = "WPA/2-MIX";
             break;
         case(WPA3_SECURITY | AES_ENABLED):
-            security = "WPA3_AES_PSK";
+            security = "WPA3";
             break;
         case(WPA2_SECURITY | WPA3_SECURITY | AES_ENABLED):
-            security = "WPA2_WPA3_MIXED";
+            security = "WPA2/3";
             break;
         default:
             security = "";
@@ -887,11 +887,14 @@ void info_wifi_scene_on_enter(void* context) {
             security,
             (app->wifiList[app->selectedWifi].security & WPA3_SECURITY) ? " SAE" : "",
             delfy_pmf_tag(app->wifiList[app->selectedWifi].security));
+        char ssidshort[22];   // keep the SSID on one line: a wrapped line pushes the
+        strncpy(ssidshort, app->wifiList[app->selectedWifi].APssid, sizeof(ssidshort) - 1);
+        ssidshort[sizeof(ssidshort) - 1] = '\0';   // whole block off the top of the screen
         snprintf(
             infoWifi,
             99,
-            "AP: %s\n%s\nChannel: %d    RSSI: %d\nMAC: %s",
-            app->wifiList[app->selectedWifi].APssid,
+            "%s\n%s\nch %d  RSSI %d\nMAC %s",
+            ssidshort,
             secbuf,
             app->wifiList[app->selectedWifi].chanel,
             app->wifiList[app->selectedWifi].rssi,
@@ -1877,8 +1880,11 @@ static void busy_view_draw(Canvas* canvas, void* model) {
 }
 
 static void busy_timer_cb(void* context) {
+    // Commit the model straight from the timer thread -- the same pattern the (working)
+    // RickRoll widget animation uses. Going through view_dispatcher_send_custom_event
+    // left the phase stuck, so the spinner never rotated.
     delfyRTL* app = context;
-    view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_BUSY_TICK);
+    with_view_model(app->busyView, BusyModel* m, { m->phase++; }, true);
 }
 
 static void busy_show(delfyRTL* app) {
