@@ -53,6 +53,7 @@ typedef enum {
     pmfScene,
     toolsMenuScene,
     channelMapScene,
+    bleAdvInputScene,
 
     DelfyRTLSceneCount
 } delfyRTLScene;
@@ -201,6 +202,7 @@ typedef struct delfyRTL {
     char fw_version[16]; // from the board's IDENT (HELLO handshake)
     char fw_caps[16];    // capability letters, e.g. "DSEBH"
     View* chanMapView;   // G: channel-map canvas view
+    char bleAdvHex[80];  // #5: BLE adv hex payload (typed / saved)
 } delfyRTL;
 
 //Las opciones del menu
@@ -216,6 +218,8 @@ typedef enum {
     BleBeacon = 8,
     BadBle = 9,
     PortalFile = 10,
+    BleAdvHex = 11,
+    BleAdvReplay = 12,
 } MainMenuIndex;
 
 // Tools submenu item IDs — stable across capability-gating (dispatch keys off these,
@@ -405,6 +409,7 @@ static void write_wpa_file(void) {
 static void listed_wifis_item_callback(void* context, uint32_t index);
 static bool delfy_has_cap(delfyRTL* app, char cap);
 static void delfy_load_portal(delfyRTL* app);
+static void delfy_adv_replay(delfyRTL* app);
 void delfyRTL_menu_callback(void* context, uint32_t index) {
     FURI_LOG_D(TAG, __func__);
     delfyRTL* app = context;
@@ -450,6 +455,12 @@ void delfyRTL_menu_callback(void* context, uint32_t index) {
         FURI_LOG_I("delfyRTL", "PortalFile");
         scene_manager_handle_custom_event(app->scene_manager, PortalFile);
         break;
+    case BleAdvHex:
+        scene_manager_handle_custom_event(app->scene_manager, BleAdvHex);
+        break;
+    case BleAdvReplay:
+        scene_manager_handle_custom_event(app->scene_manager, BleAdvReplay);
+        break;
     case Exit:
         uart_helper_send(app->uart_helper, "STOP", 5);
         FURI_LOG_I("delfyRTL", "Exit");
@@ -480,6 +491,10 @@ void main_menu_scene_on_enter(void* context) {
         menu_add_item(app->menu, "BLE iBeacon", &I_Scan_Wifi, BleBeacon, delfyRTL_menu_callback, app);
     if(delfy_has_cap(app, 'K'))
         menu_add_item(app->menu, "BadBLE HID", &I_Scan_Wifi, BadBle, delfyRTL_menu_callback, app);
+    if(delfy_has_cap(app, 'L')) {
+        menu_add_item(app->menu, "BLE Adv (hex)", &I_Scan_Wifi, BleAdvHex, delfyRTL_menu_callback, app);
+        menu_add_item(app->menu, "BLE Adv replay", &I_Scan_Wifi, BleAdvReplay, delfyRTL_menu_callback, app);
+    }
     menu_add_item(app->menu, "Help", &I_help, Help, delfyRTL_menu_callback, app);
     menu_add_item(app->menu, "Exit", &I_exit, Exit, delfyRTL_menu_callback, app);
     menu_set_selected_item(app->menu, app->menuIndex);
@@ -545,6 +560,12 @@ bool main_menu_scene_on_event(void* context, SceneManagerEvent event) {
             break;
         case PortalFile:
             delfy_load_portal(app);
+            break;
+        case BleAdvHex:
+            scene_manager_next_scene(app->scene_manager, bleAdvInputScene);
+            break;
+        case BleAdvReplay:
+            delfy_adv_replay(app);
             break;
         default:
             FURI_LOG_W("delfyRTL", "Evento desconocido: %ld", event.event);
@@ -1149,6 +1170,76 @@ static void delfy_load_portal(delfyRTL* app) {
     snprintf(message, sizeof(message), "Portal %u B loaded", (unsigned)n);
     snprintf(popupHeader, sizeof(popupHeader), "Portal");
     scene_manager_next_scene(app->scene_manager, popupScene);
+}
+
+// #5: BLE adv library — save the typed hex to /ext/delfy/adv.txt, replay it, or broadcast.
+static void delfy_adv_save(delfyRTL* app) {
+    if(app->bleAdvHex[0] == '\0') return;
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    storage_common_mkdir(st, "/ext/delfy");
+    File* f = storage_file_alloc(st);
+    if(storage_file_open(f, "/ext/delfy/adv.txt", FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        storage_file_write(f, app->bleAdvHex, strlen(app->bleAdvHex));
+        storage_file_close(f);
+    }
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+}
+
+static void delfy_adv_replay(delfyRTL* app) {
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    File* f = storage_file_alloc(st);
+    char hex[80] = "";
+    if(storage_file_open(f, "/ext/delfy/adv.txt", FSAM_READ, FSOM_OPEN_EXISTING)) {
+        size_t n = storage_file_read(f, hex, sizeof(hex) - 1);
+        hex[n] = '\0';
+        for(size_t i = 0; i < n; i++) if(hex[i] == '\r' || hex[i] == '\n') { hex[i] = '\0'; break; }
+        storage_file_close(f);
+    }
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+    if(hex[0] == '\0') {
+        snprintf(message, sizeof(message), "No saved advert");
+    } else {
+        char cmd[100];
+        snprintf(cmd, sizeof(cmd), "BLEADV %s 30\n", hex);
+        uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+        snprintf(message, sizeof(message), "Adv replay sent");
+    }
+    snprintf(popupHeader, sizeof(popupHeader), "BLE Adv");
+    scene_manager_next_scene(app->scene_manager, popupScene);
+}
+
+static void delfy_adv_input_cb(void* context) {
+    // text_input already wrote the typed hex into app->bleAdvHex on save.
+    delfyRTL* app = context;
+    char cmd[100];
+    snprintf(cmd, sizeof(cmd), "BLEADV %s 30\n", app->bleAdvHex);
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    delfy_adv_save(app);
+    scene_manager_previous_scene(app->scene_manager);
+}
+
+void ble_adv_input_scene_on_enter(void* context) {
+    delfyRTL* app = context;
+    text_input_reset(app->text_input);
+    text_input_set_header_text(app->text_input, "BLE adv hex (AD bytes)");
+    text_input_set_result_callback(
+        app->text_input,
+        delfy_adv_input_cb,
+        app,
+        app->bleAdvHex,
+        sizeof(app->bleAdvHex) - 1,
+        false);
+    view_dispatcher_switch_to_view(app->view_dispatcher, bssidTextInputView);
+}
+bool ble_adv_input_scene_on_event(void* context, SceneManagerEvent event) {
+    UNUSED(context);
+    UNUSED(event);
+    return false;
+}
+void ble_adv_input_scene_on_exit(void* context) {
+    UNUSED(context);
 }
 
 static void delfy_toggle_hop(delfyRTL* app) {
@@ -1780,7 +1871,8 @@ void (*const delfyRTL_scene_on_enter_handlers[])(void*) = {
     popup_scene_on_enter,
     pmf_scene_on_enter,
     tools_menu_scene_on_enter,
-    channel_map_scene_on_enter};
+    channel_map_scene_on_enter,
+    ble_adv_input_scene_on_enter};
 
 bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     main_menu_scene_on_event,
@@ -1798,7 +1890,8 @@ bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     popup_scene_on_event,
     pmf_scene_on_event,
     tools_menu_scene_on_event,
-    channel_map_scene_on_event};
+    channel_map_scene_on_event,
+    ble_adv_input_scene_on_event};
 
 void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     main_menu_scene_on_exit,
@@ -1816,7 +1909,8 @@ void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     popup_scene_on_exit,
     pmf_scene_on_exit,
     tools_menu_scene_on_exit,
-    channel_map_scene_on_exit};
+    channel_map_scene_on_exit,
+    ble_adv_input_scene_on_exit};
 
 static const SceneManagerHandlers delfyRTL_scene_manager_handlers = {
     .on_enter_handlers = delfyRTL_scene_on_enter_handlers,
@@ -2065,6 +2159,7 @@ static delfyRTL* app_alloc() {
     app->submenuIndex = 0;
     app->fw_version[0] = '\0';
     app->fw_caps[0] = '\0';
+    app->bleAdvHex[0] = '\0';
     app->scene_manager = scene_manager_alloc(&delfyRTL_scene_manager_handlers, app);
     app->view_dispatcher = view_dispatcher_alloc();
     //strncpy(app->customMac, "00:E0:4C:01:02:03", 18);

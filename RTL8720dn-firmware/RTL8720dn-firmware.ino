@@ -128,7 +128,7 @@ String parseRequest(String request) {
 bool apActive = false;
 
 // Custom portal: HTML streamed from the Flipper (SD file) via PORTALHTML hex chunks.
-static char customPortal[12288];
+static char customPortal[8192];
 static volatile uint16_t customPortalLen = 0;
 
 
@@ -801,6 +801,7 @@ static volatile int cap_ch = 6;
 static char ble_addr[BLE_MAX][20];
 static char ble_name[BLE_MAX][24];
 static char ble_tag[BLE_MAX][12];
+static char ble_raw[BLE_MAX][64];   // raw advertising data as hex
 static int8_t ble_rssi[BLE_MAX];
 static volatile uint8_t ble_n = 0;
 static BLEAdvertData ble_adv;
@@ -834,9 +835,17 @@ static void ble_scan_cb(T_LE_CB_DATA* p_data) {
   const char* as = a.str();
   char tag[12];
   ble_classify(ble_adv, tag, sizeof(tag));
+  // Raw advertising data (hex) straight from the stack.
+  T_LE_SCAN_INFO* si = p_data->p_le_scan_info;
+  uint8_t dl = si->data_len; if(dl > 31) dl = 31;
+  char raw[64]; int rp = 0;
+  for(uint8_t k = 0; k < dl && rp < 60; k++) rp += snprintf(raw + rp, 3, "%02x", si->data[k]);
+  raw[rp] = '\0';
   for (uint8_t i = 0; i < ble_n; i++) {
-    if (strcmp(ble_addr[i], as) == 0) {          // already seen -> refresh name/tag/rssi
+    if (strcmp(ble_addr[i], as) == 0) {          // already seen -> refresh name/tag/rssi/raw
       ble_rssi[i] = ble_adv.getRSSI();
+      strncpy(ble_raw[i], raw, sizeof(ble_raw[0]) - 1);
+      ble_raw[i][sizeof(ble_raw[0]) - 1] = '\0';
       if(ble_tag[i][0] == '\0' && tag[0]) { strncpy(ble_tag[i], tag, sizeof(ble_tag[0]) - 1); }
       if (ble_name[i][0] == '\0' && ble_adv.hasName()) {
         strncpy(ble_name[i], ble_adv.getName().c_str(), sizeof(ble_name[0]) - 1);
@@ -854,14 +863,16 @@ static void ble_scan_cb(T_LE_CB_DATA* p_data) {
   }
   strncpy(ble_tag[ble_n], tag, sizeof(ble_tag[0]) - 1);
   ble_tag[ble_n][sizeof(ble_tag[0]) - 1] = '\0';
+  strncpy(ble_raw[ble_n], raw, sizeof(ble_raw[0]) - 1);
+  ble_raw[ble_n][sizeof(ble_raw[0]) - 1] = '\0';
   ble_rssi[ble_n] = ble_adv.getRSSI();
   ble_n++;
 }
 
 static void ble_stream() {
   for (uint8_t i = 0; i < ble_n; i++) {
-    char line[80];
-    snprintf(line, sizeof(line), "BLE:%s|%d|%s|%s", ble_addr[i], ble_rssi[i], ble_name[i], ble_tag[i]);
+    char line[160];
+    snprintf(line, sizeof(line), "BLE:%s|%d|%s|%s|%s", ble_addr[i], ble_rssi[i], ble_name[i], ble_tag[i], ble_raw[i]);
     Serial.println(line); Serial1.println(line);
   }
   String fin = "BLEDONE: n=" + String((unsigned)ble_n);
