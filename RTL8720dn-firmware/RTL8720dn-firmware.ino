@@ -799,6 +799,52 @@ static uint8_t blespam_pkt(uint8_t* p, uint8_t type) {
   return 31;
 }
 
+// --- A5: deauth/disassoc sniffer (IDS) ------------------------------------------
+// Flags other people's deauth attacks: counts deauth(0x0C)/disassoc(0x0A) frames per
+// (src,dst,reason) so the host can list who is knocking whom off, and why.
+#define IDS_MAX 16
+typedef struct { uint8_t src[6], dst[6]; uint8_t reason; uint16_t count; } ids_t;
+static ids_t ids[IDS_MAX];
+static uint8_t ids_n = 0;
+
+static void ids_add(const uint8_t* src, const uint8_t* dst, uint8_t reason) {
+  for(uint8_t i = 0; i < ids_n; i++)
+    if(!memcmp(ids[i].src, src, 6) && !memcmp(ids[i].dst, dst, 6) && ids[i].reason == reason) {
+      ids[i].count++;
+      return;
+    }
+  if(ids_n >= IDS_MAX) return;
+  memcpy(ids[ids_n].src, src, 6);
+  memcpy(ids[ids_n].dst, dst, 6);
+  ids[ids_n].reason = reason;
+  ids[ids_n].count = 1;
+  ids_n++;
+}
+
+static void promisc_ids_cb(unsigned char* buf, unsigned int len, void* ud) {
+  (void)ud;
+  if(len < 26) return;
+  uint8_t ftype = (buf[0] >> 2) & 3;
+  uint8_t stype = (buf[0] >> 4) & 0xF;
+  if(ftype != 0) return;
+  if(stype != 0x0C && stype != 0x0A) return;   // deauth / disassoc
+  ids_add(buf + 10 /*addr2 src*/, buf + 4 /*addr1 dst*/, buf[24]);
+}
+
+static void ids_stream(int ch) {
+  for(uint8_t i = 0; i < ids_n; i++) {
+    char line[96];
+    snprintf(line, sizeof(line),
+      "DEAUTH:%02X:%02X:%02X:%02X:%02X:%02X>%02X:%02X:%02X:%02X:%02X:%02X|r%u|x%u",
+      ids[i].src[0], ids[i].src[1], ids[i].src[2], ids[i].src[3], ids[i].src[4], ids[i].src[5],
+      ids[i].dst[0], ids[i].dst[1], ids[i].dst[2], ids[i].dst[3], ids[i].dst[4], ids[i].dst[5],
+      (unsigned)ids[i].reason, (unsigned)ids[i].count);
+    Serial.println(line); Serial1.println(line);
+  }
+  String fin = "DEAUTHDONE: ch=" + String(ch) + " n=" + String((unsigned)ids_n);
+  Serial.println(fin); Serial1.println(fin);
+}
+
 // --- P6: PMKID extraction from EAPOL-Key M1 ----------------------------------
 // Clientless PMKID: many WPA2 APs put the PMKID in the RSN key-data KDE of the very
 // first EAPOL-Key (M1). We identify M1 (key info ACK set, MIC clear, RSN descriptor)
@@ -1626,6 +1672,21 @@ void loop() {
       }
       String r = String("HOP:") + (hopping ? "on " : "off ") + String(hopping ? (unsigned)hop_interval_ms : 0u);
       Serial.println(r); Serial1.println(r);
+    }else if(readString.substring(0,11)=="SNIFFDEAUTH"){
+      // A5: count other people's deauth/disassoc frames (IDS).
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int ch = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1).toInt() : 6;
+      int secs = (s2 > 0) ? readString.substring(s2+1, readString.length()-1).toInt() : 10;
+      if(ch < 1 || ch > 165) ch = 6;
+      if(secs < 1 || secs > 60) secs = 10;
+      if(apActive) destroyAP();   // monitor capture needs the softAP torn down
+      ids_n = 0;
+      wext_set_channel(WLAN0_NAME, ch);
+      wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2*/, promisc_ids_cb, 0);
+      for(int i=0;i<secs;i++) delay(1000);
+      wifi_set_promisc(0, NULL, 0);
+      ids_stream(ch);
     }else if(readString.substring(0,10)=="PROBESNIFF"){
       // A1: harvest probe requests on <chan> for [secs] -> the PNL of nearby devices.
       int s1 = readString.indexOf(' ');

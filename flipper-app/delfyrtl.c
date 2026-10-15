@@ -214,6 +214,7 @@ static int sess_probes = 0;
 static int sess_stas = 0;
 static int sess_pmf = 0;
 static int sess_wifis = 0;
+static int sess_deauth = 0;
 
 // --- D1: BLE devices seen in the last scan (so "GATT enumerate" can pick one) -----
 // A3/D4: ble_list_tag holds the firmware's vendor/fingerprint label (Apple/FindMy/Tile/...)
@@ -326,6 +327,7 @@ typedef enum {
 #define TOOL_AUDIT   12
 #define TOOL_PKCLIENT 13
 #define TOOL_PROBE   14
+#define TOOL_IDS     15
 
 // Deferred GUI events posted from the UART worker thread (GUI must run on the GUI thread).
 #define DELFY_EVT_RECON 0x2000
@@ -1354,6 +1356,19 @@ static void delfy_probeflood(delfyRTL* app) {
     delfy_busy(app, "Probe flood", "Sending probes...");
 }
 
+// A5: deauth/disassoc IDS — list other people's deauth frames seen on the channel.
+static void delfy_start_ids(delfyRTL* app) {
+    int ch = delfy_def_ch();
+    if(app->selectedWifi >= 0 && app->selectedWifi < app->wifiCount)
+        ch = app->wifiList[app->selectedWifi].chanel;
+    recon_text[0] = '\0';
+    snprintf(recon_title, sizeof(recon_title), "Deauth IDS");
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "SNIFFDEAUTH %d 12\n", ch);
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    { char b[48]; snprintf(b, sizeof(b), "Watching ch %d...", ch); delfy_busy_ex(app, "Deauth IDS", b, 12); }
+}
+
 // gap: send a custom portal HTML from /ext/delfy/portal.html to the board (chunked hex).
 // Portal file browser: list *.html in /ext/delfy/portals/, pick one, stream it to the board.
 #define PORTAL_FILES_MAX 16
@@ -1777,6 +1792,7 @@ static void tools_item_callback(void* context, uint32_t index) {
     case TOOL_PMF: delfy_start_pmf(app); break;
     case TOOL_STA: delfy_start_sta(app); break;
     case TOOL_PROBE: delfy_start_probe(app); break;
+    case TOOL_IDS: delfy_start_ids(app); break;
     case TOOL_PMKID: delfy_start_pmkid(app, false); break;
     case TOOL_PKGRAB: delfy_start_pmkid(app, true); break;
     case TOOL_PKCLIENT: delfy_start_pmkid_clientless(app); break;
@@ -1820,6 +1836,7 @@ void tools_menu_scene_on_enter(void* context) {
         submenu_add_item(app->submenu, "Deauth list: + this AP", TOOL_DAADD, tools_item_callback, app);
         submenu_add_item(app->submenu, "Deauth list: RUN", TOOL_DARUN, tools_item_callback, app);
         submenu_add_item(app->submenu, "Deauth list: STOP", TOOL_DASTOP, tools_item_callback, app);
+        submenu_add_item(app->submenu, "Deauth IDS", TOOL_IDS, tools_item_callback, app);
     }
     submenu_add_item(app->submenu, "Channel hop on/off", TOOL_HOP, tools_item_callback, app);
     submenu_add_item(app->submenu, "Stop / clear", TOOL_STOP, tools_item_callback, app);
@@ -1968,12 +1985,13 @@ void session_scene_on_enter(void* context) {
     snprintf(
         buf,
         sizeof(buf),
-        "id %s\nAPs %d\nSTA %d\nPMF %d\nProbe devs %d\nCreds %d\n/ext/delfy/sessions/%s/",
+        "id %s\nAPs %d\nSTA %d\nPMF %d\nProbe devs %d\nDeauths %d\nCreds %d\n/ext/delfy/sessions/%s/",
         delfy_session_id,
         sess_wifis,
         sess_stas,
         sess_pmf,
         sess_probes,
+        sess_deauth,
         sess_creds,
         delfy_session_id);
     widget_add_text_scroll_element(app->widget, 0, 14, 128, 50, buf);
@@ -3202,6 +3220,14 @@ void uart_process_line(FuriString* line, void* context) {
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "STA:", 4) == 0) {
         recon_append(furi_string_get_cstr(line) + 4);
+    } else if(strncmp(furi_string_get_cstr(line), "DEAUTHDONE:", 11) == 0) {
+        snprintf(recon_title, sizeof(recon_title), "Deauth IDS");
+        const char* s = strstr(furi_string_get_cstr(line), "n=");
+        sess_deauth = s ? atoi(s + 2) : 0;
+        delfy_save_scan("deauth_ids", recon_text);
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
+    } else if(strncmp(furi_string_get_cstr(line), "DEAUTH:", 7) == 0) {
+        recon_append(furi_string_get_cstr(line) + 7);
     } else if(strncmp(furi_string_get_cstr(line), "PROBEDONE:", 10) == 0) {
         snprintf(recon_title, sizeof(recon_title), "Probe / PNL");
         const char* s = strstr(furi_string_get_cstr(line), "n=");
