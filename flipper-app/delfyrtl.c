@@ -516,7 +516,7 @@ void delfyRTL_menu_callback(void* context, uint32_t index) {
         scene_manager_handle_custom_event(app->scene_manager, BleHub);
         break;
     case Exit:
-        uart_helper_send(app->uart_helper, "STOP", 5);
+        uart_helper_send(app->uart_helper, "STOP\n", 5);
         FURI_LOG_I("delfyRTL", "Exit");
         view_dispatcher_stop(app->view_dispatcher);
         //scene_manager_handle_custom_event(app->scene_manager, Exit);
@@ -1669,9 +1669,12 @@ void config_attack_scene_on_exit(void* context) {
     UNUSED(context);
 }
 
+static bool creds_scene_shown = false;  // are we currently on the Captured-data scene?
+
 void evil_creds_scene_on_enter(void* context) {
     FURI_LOG_D(TAG, __func__);
     delfyRTL* app = context;
+    creds_scene_shown = true;
     widget_reset(app->widget);
     widget_add_string_multiline_element(
         app->widget, 64, 4, AlignCenter, AlignTop, FontSecondary, "Captured data");
@@ -1690,8 +1693,11 @@ bool evil_creds_scene_on_event(void* context, SceneManagerEvent event) {
 
 void evil_creds_scene_on_exit(void* context) {
     FURI_LOG_D(TAG, __func__);
-    delfyRTL* app = context;
-    uart_helper_send(app->uart_helper, "STOP\n", 5);
+    // Do NOT send STOP here. Leaving the "Captured data" screen must NOT tear the AP
+    // down -- that was killing the portal right after the first submit (every captured
+    // credential re-entered this scene -> on_exit -> STOP). Stop the AP explicitly via
+    // Tools -> "Stop / clear".
+    creds_scene_shown = false;
     UNUSED(context);
 }
 
@@ -2154,7 +2160,7 @@ static bool card_menu_input(InputEvent* event, void* context) {
         else if(card_sel == 1) scene_manager_next_scene(app->scene_manager, bleHubScene);
         else if(card_sel == 2) scene_manager_next_scene(app->scene_manager, helpScene);
         else {
-            uart_helper_send(app->uart_helper, "STOP", 4);
+            uart_helper_send(app->uart_helper, "STOP\n", 5);
             view_dispatcher_stop(app->view_dispatcher);
         }
         return true;
@@ -2414,7 +2420,16 @@ static bool delfyRTL_custom_callback(void* context, uint32_t custom_event) {
         return true;
     }
     if(custom_event == DELFY_EVT_CREDS) {
-        scene_manager_next_scene(app->scene_manager, evilCredsScene);
+        if(!creds_scene_shown) {
+            scene_manager_next_scene(app->scene_manager, evilCredsScene);
+        } else {
+            // Already on the captured-data screen: refresh the text in place. Pushing the
+            // scene again on every credential re-entered it (on_exit ran each time).
+            widget_reset(app->widget);
+            widget_add_string_multiline_element(
+                app->widget, 64, 4, AlignCenter, AlignTop, FontSecondary, "Captured data");
+            widget_add_text_scroll_element(app->widget, 0, 16, 128, 50, credentials);
+        }
         return true;
     }
     return scene_manager_handle_custom_event(app->scene_manager, custom_event);

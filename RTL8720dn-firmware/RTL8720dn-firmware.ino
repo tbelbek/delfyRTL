@@ -1025,6 +1025,14 @@ void loop() {
       customPortalLen = 0;
       customPortal[0] = 0;
       Serial.println("PORTALCLEAR:ok"); Serial1.println("PORTALCLEAR:ok");
+    }else if(readString.substring(0,10)=="PORTALHASH"){
+      // Diagnostic: length + FNV-1a hash of the loaded custom portal, so we can prove the
+      // bytes the board serves are identical to the SD file (catches upload corruption).
+      unsigned long h = 2166136261UL;
+      for(unsigned int i=0; i<customPortalLen; i++){ h ^= (uint8_t)customPortal[i]; h *= 16777619UL; }
+      char b[80];
+      snprintf(b, sizeof(b), "PORTALHASH:%u:%08lx", (unsigned)customPortalLen, h);
+      Serial.println(b); Serial1.println(b);
     }else if(readString.substring(0,6)=="PORTAL"){
       portal = readString.substring(7,readString.length()-1).toInt();
        
