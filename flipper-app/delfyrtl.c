@@ -231,6 +231,7 @@ typedef enum {
 #define TOOL_DASTOP  10
 #define TOOL_CAPSTOP 11
 #define TOOL_AUDIT   12
+#define TOOL_PKCLIENT 13
 
 // Deferred GUI events posted from the UART worker thread (GUI must run on the GUI thread).
 #define DELFY_EVT_RECON 0x2000
@@ -1048,6 +1049,25 @@ static void delfy_capture_stop(delfyRTL* app) {
     scene_manager_next_scene(app->scene_manager, popupScene);
 }
 
+// P6 clientless: raw-assoc PMKID grab using the selected AP's SSID.
+static void delfy_start_pmkid_clientless(delfyRTL* app) {
+    int ch;
+    char hex[13];
+    delfy_sel_ap(app, &ch, hex);
+    char ssid[33] = "";
+    if(app->selectedWifi >= 0 && app->selectedWifi < app->wifiCount)
+        strncpy(ssid, app->wifiList[app->selectedWifi].APssid, sizeof(ssid) - 1);
+    recon_text[0] = '\0';
+    wpa_lines[0] = '\0';
+    snprintf(recon_title, sizeof(recon_title), "PMKID");
+    char cmd[80];
+    snprintf(cmd, sizeof(cmd), "PMKIDCLIENT %d %s %s\n", ch, hex[0] ? hex : "FFFFFFFFFFFF", ssid);
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    snprintf(message, sizeof(message), "PMKID(clientless) ch %d...", ch);
+    snprintf(popupHeader, sizeof(popupHeader), "PMKID");
+    scene_manager_next_scene(app->scene_manager, popupScene);
+}
+
 static void delfy_toggle_hop(delfyRTL* app) {
     hop_on = !hop_on;
     uart_helper_send(app->uart_helper, hop_on ? "HOP 500\n" : "HOP 0\n", hop_on ? 8 : 6);
@@ -1068,6 +1088,7 @@ static void tools_item_callback(void* context, uint32_t index) {
     case TOOL_STA: delfy_start_sta(app); break;
     case TOOL_PMKID: delfy_start_pmkid(app, false); break;
     case TOOL_PKGRAB: delfy_start_pmkid(app, true); break;
+    case TOOL_PKCLIENT: delfy_start_pmkid_clientless(app); break;
     case TOOL_HOP: delfy_toggle_hop(app); break;
     case TOOL_DAADD: delfy_deauth_add(app); break;
     case TOOL_DARUN: delfy_deauth_run(app); break;
@@ -1090,6 +1111,7 @@ void tools_menu_scene_on_enter(void* context) {
         submenu_add_item(app->submenu, "Grab HS (deauth)", TOOL_GRAB, tools_item_callback, app);
         submenu_add_item(app->submenu, "PMKID (passive)", TOOL_PMKID, tools_item_callback, app);
         submenu_add_item(app->submenu, "PMKID grab (deauth)", TOOL_PKGRAB, tools_item_callback, app);
+        submenu_add_item(app->submenu, "PMKID clientless (raw)", TOOL_PKCLIENT, tools_item_callback, app);
         submenu_add_item(app->submenu, "Capture: STOP", TOOL_CAPSTOP, tools_item_callback, app);
         submenu_add_item(app->submenu, "Guided audit (this AP)", TOOL_AUDIT, tools_item_callback, app);
     }

