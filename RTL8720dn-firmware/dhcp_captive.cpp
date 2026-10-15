@@ -15,6 +15,8 @@ extern "C" struct netif xnetif[];
 
 static struct udp_pcb *dhcp_pcb = NULL;
 static struct netif *ap_netif = NULL;
+// Option-114 captive-portal URL (set by the sketch at AP start; host-based, not the IP).
+static char dhcp_cp_uri[96] = "http://192.168.4.1/cp.json";
 
 // apbegin always brings the SoftAP up at 192.168.1.1 (WiFiDrv default; setting it via
 // WiFi.config() before apbegin breaks the channel ioctl). Retarget that netif to our
@@ -57,7 +59,7 @@ static void dhcp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     pbuf_copy_partial(p, reqbuf, rlen, 0);
     pbuf_free(p);
 
-    size_t n = dhcp_build_reply(repbuf, sizeof(repbuf), reqbuf, rlen);
+    size_t n = dhcp_build_reply(repbuf, sizeof(repbuf), reqbuf, rlen, dhcp_cp_uri);
     if (n == 0) return;  // not a DISCOVER/REQUEST we answer
 
     struct pbuf *op = pbuf_alloc(PBUF_TRANSPORT, (u16_t)n, PBUF_RAM);
@@ -72,7 +74,11 @@ static void dhcp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     pbuf_free(op);
 }
 
-void start_DHCP_Server() {
+void start_DHCP_Server(const char *cp_uri) {
+    if (cp_uri && cp_uri[0]) {                 // remember the portal URL for option 114
+        strncpy(dhcp_cp_uri, cp_uri, sizeof(dhcp_cp_uri) - 1);
+        dhcp_cp_uri[sizeof(dhcp_cp_uri) - 1] = 0;
+    }
     if (dhcp_pcb != NULL) return;
     retarget_ap_netif();          // move SoftAP from 192.168.1.1 to our captive subnet
     ap_netif = find_ap_netif();
@@ -81,7 +87,8 @@ void start_DHCP_Server() {
     dhcp_pcb->so_options |= SOF_BROADCAST;
     err_t e = udp_bind(dhcp_pcb, IP4_ADDR_ANY, DHCP_SRV_PORT);
     udp_recv(dhcp_pcb, (udp_recv_fn)dhcp_recv_cb, NULL);
-    printf("DHCP: server up on :67 (bind=%d, ap_netif=%p)\n", (int)e, (void *)ap_netif);
+    printf("DHCP: server up on :67 (bind=%d, ap_netif=%p, opt114=%s)\n",
+           (int)e, (void *)ap_netif, dhcp_cp_uri);
 }
 
 void stop_DHCP_Server() {

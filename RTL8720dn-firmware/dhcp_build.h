@@ -18,9 +18,8 @@
 static const uint8_t DHCP_AP_IP[4]   = {192, 168, 4, 1};
 static const uint8_t DHCP_AP_MASK[4] = {255, 255, 255, 0};
 static const uint8_t DHCP_MAGIC[4]   = {99, 130, 83, 99};
-/* Option 114 points at the RFC 8908 captive-portal API endpoint (served by the sketch),
-   not the HTML root — Android's NetworkMonitor expects application/captive+json there. */
-static const char DHCP_CP_URI[] = "http://192.168.4.1/cp.json";
+/* Option 114 is filled at runtime from the sketch (a host derived from the AP name,
+   e.g. http://freewifi.com/cp.json) so the portal URL is a name, not an IP. */
 
 /* Find a DHCP option by code in the options area; returns value ptr or NULL. */
 static inline const uint8_t *dhcp_find_opt(const uint8_t *req, size_t len,
@@ -38,9 +37,11 @@ static inline const uint8_t *dhcp_find_opt(const uint8_t *req, size_t len,
     return NULL;
 }
 
-/* Build an OFFER (for DISCOVER) or ACK (for REQUEST). Returns reply length, or 0 to ignore. */
+/* Build an OFFER (for DISCOVER) or ACK (for REQUEST). Returns reply length, or 0 to ignore.
+   cp_uri = the RFC 8910 option-114 captive-portal URL (advertised to the client). */
 static inline size_t dhcp_build_reply(uint8_t *out, size_t cap,
-                                      const uint8_t *req, size_t req_len) {
+                                      const uint8_t *req, size_t req_len,
+                                      const char *cp_uri) {
     if (req_len < DHCP_FIXED_LEN + 4 || cap < DHCP_MIN_REPLY) return 0;
     if (memcmp(req + DHCP_FIXED_LEN, DHCP_MAGIC, 4) != 0) return 0;
 
@@ -75,8 +76,9 @@ static inline size_t dhcp_build_reply(uint8_t *out, size_t cap,
     *o++ = 3;  *o++ = 4; memcpy(o, DHCP_AP_IP, 4);   o += 4; /* router */
     *o++ = 6;  *o++ = 4; memcpy(o, DHCP_AP_IP, 4);   o += 4; /* DNS = AP (keeps DNS hijack alive) */
     {
-        uint8_t ul = (uint8_t)(sizeof(DHCP_CP_URI) - 1);    /* option 114, RFC 8910 */
-        *o++ = 114; *o++ = ul; memcpy(o, DHCP_CP_URI, ul); o += ul;
+        size_t ul = strlen(cp_uri);                          /* option 114, RFC 8910 */
+        if (ul > 255) ul = 255;
+        *o++ = 114; *o++ = (uint8_t)ul; memcpy(o, cp_uri, ul); o += ul;
     }
     *o++ = 255;                                             /* END */
 

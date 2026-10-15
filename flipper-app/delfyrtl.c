@@ -3,6 +3,7 @@
 #include <gui/gui.h>
 #include <expansion/expansion.h>
 #include <furi_hal.h>
+#include <furi_hal_rtc.h>
 #include "uart_helper.h"
 #include <gui/view_dispatcher.h>
 #include <gui/scene_manager.h>
@@ -418,6 +419,29 @@ static void write_wpa_file(void) {
     File* f = storage_file_alloc(st);
     if(storage_file_open(f, "/ext/delfy/pmkid.22000", FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
         storage_file_write(f, wpa_lines, strlen(wpa_lines));
+        storage_file_close(f);
+    }
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+}
+
+// Captured captive-portal creds -> /ext/delfy/creds.txt (append, timestamped), so they
+// persist on the SD instead of only living in the on-screen RAM buffer.
+static void creds_append_sd(const char* line) {
+    if(!line || line[0] == '\0') return;
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    storage_common_mkdir(st, "/ext/delfy");
+    File* f = storage_file_alloc(st);
+    if(storage_file_open(f, "/ext/delfy/creds.txt", FSAM_WRITE, FSOM_OPEN_APPEND)) {
+        DateTime dt;
+        furi_hal_rtc_get_datetime(&dt);
+        char stamp[48];
+        int n = snprintf(
+            stamp, sizeof(stamp), "[%04d-%02d-%02d %02d:%02d:%02d] ",
+            dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second);
+        storage_file_write(f, stamp, (size_t)n);
+        storage_file_write(f, line, strlen(line));
+        storage_file_write(f, "\n", 1);
         storage_file_close(f);
     }
     storage_file_free(f);
@@ -2461,6 +2485,7 @@ void uart_process_line(FuriString* line, void* context) {
             strcat(credentials, token);
             strcat(credentials, "\n");
         }
+        creds_append_sd(token);   // also persist to /ext/delfy/creds.txt
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_CREDS);
     } else if(strncmp(furi_string_get_cstr(line), "ERROR:", 6) == 0) {
         char buffer[128];

@@ -4,7 +4,7 @@
 #ifndef DHCP_CAPTIVE_H
 #define DHCP_CAPTIVE_H
 
-void start_DHCP_Server();
+void start_DHCP_Server(const char *cp_uri);   // cp_uri = option-114 portal URL
 void stop_DHCP_Server();
 
 #endif

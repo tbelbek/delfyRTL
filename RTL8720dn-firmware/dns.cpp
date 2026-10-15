@@ -27,6 +27,7 @@ static void dnss_receive_udp_packet_handler(
 
         memcpy(&dnsHeader, udp_packet_buffer->payload, DNS_HEADER_SIZE);
         if (dnsHeader.QR != DNS_QR_QUERY) {
+          pbuf_free(udp_packet_buffer);
           return;  // ignore non-query messages
         }
 
@@ -48,6 +49,7 @@ static void dnss_receive_udp_packet_handler(
                 proper dns req should have label terminator at least 4 bytes before end of packet
               */
             if (dnsQuestion.QNameLength > udp_packet_buffer->len - DNS_HEADER_SIZE - sizeof(dnsQuestion.QType) - sizeof(dnsQuestion.QClass)) {
+              pbuf_free(udp_packet_buffer);
               return;  // malformed packet
             }         
             memcpy(&dnsQuestion.QType, enoflbls, sizeof(dnsQuestion.QType));
@@ -55,6 +57,21 @@ static void dnss_receive_udp_packet_handler(
         }
         if (dnsHeader.OPCode == DNS_OPCODE_QUERY && requestIncludesOnlyOneQuestion(dnsHeader)){
             struct dns_hdr *q = (struct dns_hdr*) udp_packet_buffer->payload;
+
+            // Log the name we're hijacking (labels -> dotted) so the serial log shows
+            // whether the client's lookups actually reach us.
+            {
+              char nm[80]; int qo = 0, k = 0;
+              while (k < (int)dnsQuestion.QNameLength && qo < 78) {
+                uint8_t L = dnsQuestion.QName[k++];
+                if (L == 0) break;
+                for (uint8_t j = 0; j < L && k < (int)dnsQuestion.QNameLength && qo < 78; j++)
+                  nm[qo++] = (char)dnsQuestion.QName[k++];
+                nm[qo++] = '.';
+              }
+              nm[qo] = 0;
+              printf("DNS: \"%s\" qtype=%u -> 192.168.4.1\n", nm, dnsQuestion.QType);
+            }
                 
 
             int questionSectionSize = dnsQuestion.QNameLength + sizeof(uint16_t) + sizeof(uint16_t);  // QName + QType + QClass
@@ -135,13 +152,15 @@ void unbind_all_udp(){
 }
 
 void unbind_dns(){
-  //Buscamos el puerto udp de las dns para matarloo
-  struct udp_pcb *pcb;
-  for (pcb = udp_pcbs; pcb != NULL; pcb = pcb->next) {
-    
-    if(pcb->local_port==DNS_SERVER_PORT){
+  // Remove every pcb bound to :53. Grab ->next BEFORE udp_remove(): the removed pcb is
+  // freed, so the old "pcb = pcb->next" walked freed memory (use-after-free).
+  struct udp_pcb *pcb = udp_pcbs;
+  while (pcb != NULL) {
+    struct udp_pcb *next = pcb->next;
+    if (pcb->local_port == DNS_SERVER_PORT) {
       udp_remove(pcb);
     }
+    pcb = next;
   }
 }
 

