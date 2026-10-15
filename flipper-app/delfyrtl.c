@@ -1350,7 +1350,7 @@ void wifi_hub_scene_on_enter(void* context) {
     submenu_reset(app->submenu);
     submenu_set_header(app->submenu, "Wi-Fi");
     submenu_add_item(app->submenu, "Scan Wifi", 0, wifi_hub_cb, app);
-    submenu_add_item(app->submenu, "List Wifis", 1, wifi_hub_cb, app);
+    submenu_add_item(app->submenu, "List Wifi", 1, wifi_hub_cb, app);
     submenu_add_item(app->submenu, "Channel Map", 2, wifi_hub_cb, app);
     submenu_add_item(app->submenu, "Create AP", 3, wifi_hub_cb, app);
     submenu_add_item(app->submenu, "Send Beacon", 4, wifi_hub_cb, app);
@@ -2352,11 +2352,14 @@ static delfyRTL* app_alloc() {
     //app->ssidAPLength = 0;
     app->captivePortal = 0;
     app->deauthReason = 2;
-    app->mac_type = 0;
+    app->mac_type = 1; // default: random AP MAC
     app->securityAP = 0;
     app->channelAP = 9;
-    app->ssidAP = "TEST";
-    app->passwordAP = "password123";
+    app->ssidAP = malloc(app->ssidAPLength);
+    strcpy(app->ssidAP, "Free_Wifi");
+    app->passwordAPLength = 64;
+    app->passwordAP = malloc(app->passwordAPLength);
+    strcpy(app->passwordAP, "password123");
     app->selectedWifi = 0;
     app->wifiCount = 0;
     app->menuIndex = 0;
@@ -2367,8 +2370,21 @@ static delfyRTL* app_alloc() {
     app->ibeaconUuid[0] = '\0';
     app->scene_manager = scene_manager_alloc(&delfyRTL_scene_manager_handlers, app);
     app->view_dispatcher = view_dispatcher_alloc();
-    //strncpy(app->customMac, "00:E0:4C:01:02:03", 18);
-    snprintf(app->customMac, sizeof(app->customMac), "00:E0:4C:01:02:03");
+    // Default AP MAC = random (locally administered)
+    {
+        unsigned char random_mac[6];
+        generate_mac_address(random_mac);
+        snprintf(
+            app->customMac,
+            sizeof(app->customMac),
+            "%02X:%02X:%02X:%02X:%02X:%02X",
+            random_mac[0],
+            random_mac[1],
+            random_mac[2],
+            random_mac[3],
+            random_mac[4],
+            random_mac[5]);
+    }
     parse_mac(app->customMac, app->byte_input_store);
 
     view_dispatcher_set_event_callback_context(app->view_dispatcher, app);
@@ -2462,6 +2478,8 @@ static void app_free(delfyRTL* app) {
     view_dispatcher_remove_view(app->view_dispatcher, apNameTextInputView);
     view_dispatcher_remove_view(app->view_dispatcher, apPasswordTextInputView);
     view_dispatcher_remove_view(app->view_dispatcher, cardMenuView);
+    view_dispatcher_remove_view(app->view_dispatcher, pmfView);
+    view_dispatcher_remove_view(app->view_dispatcher, toolsListView);
 
     scene_manager_free(app->scene_manager);
 
@@ -2485,6 +2503,7 @@ static void app_free(delfyRTL* app) {
     app->rickIndex = 0;
 
     free(app->ssidAP);
+    free(app->passwordAP);
     furi_record_close(RECORD_GUI);
     furi_hal_power_disable_otg();
     free(app);
