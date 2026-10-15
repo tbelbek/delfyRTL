@@ -1337,12 +1337,17 @@ static void delfy_start_probe(delfyRTL* app) {
 // B6: clone the selected AP's SSID across many random BSSIDs (AP clone spam).
 static void delfy_apclone(delfyRTL* app) {
     const char* ssid = "*";
-    if(app->selectedWifi >= 0 && app->selectedWifi < app->wifiCount)
+    int ch = delfy_def_ch();
+    if(app->selectedWifi >= 0 && app->selectedWifi < app->wifiCount) {
         ssid = app->wifiList[app->selectedWifi].APssid;
+        ch = app->wifiList[app->selectedWifi].chanel;
+    }
     char cmd[80];
-    snprintf(cmd, sizeof(cmd), "APCLONE %s 8\n", ssid);
+    // The board must be tuned to a channel before each raw TX or the SDK spins forever
+    // inside the TX path, so the target's channel goes along with the clone request.
+    snprintf(cmd, sizeof(cmd), "APCLONE %s 8 %d\n", ssid, ch);
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
-    { char b[48]; snprintf(b, sizeof(b), "Cloning %.22s", ssid); delfy_busy(app, "AP clone", b); }
+    { char b[48]; snprintf(b, sizeof(b), "Cloning %.16s ch %d", ssid, ch); delfy_busy(app, "AP clone", b); }
 }
 
 // B7: emit probe requests (as a client) for the selected AP's SSID.
@@ -2457,6 +2462,15 @@ void beacon_info_scene_on_enter(void* context) {
             app->widget, 80, 10, AlignCenter, AlignTop, FontPrimary, "Ghost AP");
         break;
     }
+    // These modes flood beacons for as long as this screen is up; say so, and say how to stop.
+    widget_add_string_multiline_element(
+        app->widget,
+        64,
+        30,
+        AlignCenter,
+        AlignTop,
+        FontSecondary,
+        "Beacon flood active\nBACK to stop");
     view_dispatcher_switch_to_view(app->view_dispatcher, beaconInfoView);
 }
 
@@ -2470,7 +2484,9 @@ void beacon_info_scene_on_exit(void* context) {
     UNUSED(context);
     delfyRTL* app = context;
     furi_timer_stop(app->timer);
-    uart_helper_send(app->uart_helper, "STOP\n", 5);
+    // STOP only cleared ghostSpam; random/rickroll/custom floods kept running after leaving
+    // this screen. BEACONOFF clears every beacon mode.
+    uart_helper_send(app->uart_helper, "BEACONOFF\n", 10);
 }
 
 void help_scene_on_enter(void* context) {

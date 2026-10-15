@@ -756,6 +756,66 @@ static void tx_probe_req(const uint8_t* src, const char* ssid) {
   wifi_tx_raw_frame(f, n);
 }
 
+// Beacon/SSID-flood frames built by hand and pushed through the SAME raw TX path the probe
+// and auth frames use. The SDK's wifi_tx_beacon_frame() (wifi_cust_tx.cpp) locks the board up
+// hard: 6 beacon frames in a row hang the loop while 60 probe frames in a row are fine, so the
+// whole beacon-spam family (custom/random/rickroll/ghost/AP-clone) was dead. This avoids that
+// code path entirely. The raw TX buffer only has 0x68-0x28 = 64 usable bytes, so the SSID is
+// capped to keep the frame inside it.
+#define TX_RAW_MAX_PAYLOAD 64
+static const uint8_t TX_BCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+static int build_beacon_frame(uint8_t* f, const uint8_t* src, const uint8_t* dst,
+                              const char* ssid, uint8_t ftype) {
+  int n = 0;
+  f[n++] = ftype; f[n++] = 0x00;                // frame control (0x80 beacon / 0x50 probe resp)
+  f[n++] = 0x00; f[n++] = 0x00;                 // duration
+  memcpy(f + n, dst, 6); n += 6;                // addr1 destination
+  memcpy(f + n, src, 6); n += 6;                // addr2 source
+  memcpy(f + n, src, 6); n += 6;                // addr3 bssid
+  f[n++] = 0x00; f[n++] = 0x00;                 // sequence (set by the driver)
+  for(int i = 0; i < 8; i++) f[n++] = 0x00;     // timestamp
+  f[n++] = 0x64; f[n++] = 0x00;                 // beacon interval
+  f[n++] = 0x21; f[n++] = 0x00;                 // capability (ESS)
+  int sl = ssid ? (int)strlen(ssid) : 0;
+  if(sl > 18) sl = 18;                          // keep the whole frame <= TX_RAW_MAX_PAYLOAD
+  f[n++] = 0x00; f[n++] = (uint8_t)sl;          // SSID IE
+  for(int i = 0; i < sl; i++) f[n++] = (uint8_t)ssid[i];
+  f[n++] = 0x01; f[n++] = 0x04;                 // supported rates IE
+  f[n++] = 0x82; f[n++] = 0x84; f[n++] = 0x8b; f[n++] = 0x96;
+  return n;
+}
+
+// TX frame staging buffers live in BSS, not on the loop() stack: loop() already carries the
+// whole command dispatch and the TX path needs its own stack depth. Putting the frame array
+// directly in loop()'s frame wedged the board (observed), while the identical frame sent from
+// tx_probe_req() (array inside a called function) went out fine.
+static uint8_t tx_stage[128];
+
+static int tx_raw_hex(const char* h) {
+  int n = 0;
+  for(int i = 0; h[i] && h[i+1] && n < (int)sizeof(tx_stage); i += 2) {
+    int hi = hexnib(h[i]), lo = hexnib(h[i+1]);
+    if(hi < 0 || lo < 0) break;
+    tx_stage[n++] = (uint8_t)((hi << 4) | lo);
+  }
+  if(n > 0) wifi_tx_raw_frame(tx_stage, n);
+  return n;
+}
+
+// NOTE (root cause of the "board locks up" bug): wifi_tx_raw_frame()/dump_mgntframe() do NOT
+// complete unless the radio is tuned to a channel. Without a wext_set_channel() right before
+// the TX the SDK spins forever inside the TX path (board dead: no replies, no reboot, no fault
+// print). PROBEFLOOD always worked because it tunes the channel first; APCLONE and the beacon
+// spam code did not. Tuning inside this helper means no caller can forget it again.
+static void tx_beacon_raw(const uint8_t* src, const uint8_t* dst, const char* ssid, uint8_t ftype, int chan) {
+  if(chan < 1 || chan > 165) chan = 6;
+  wext_set_channel(WLAN0_NAME, chan);
+  int n = build_beacon_frame(tx_stage, src, dst, ssid, ftype);
+  if(n > (int)sizeof(tx_stage)) n = (int)sizeof(tx_stage);
+  if(n > 0) wifi_tx_raw_frame(tx_stage, n);
+}
+
 // --- D2: BLE advert spam (Apple continuity + Microsoft Swift Pair) ---------------
 // Packet layouts from https://github.com/Flipper-XFW/Xtreme-Apps ble_spam protocols.
 static uint8_t blespam_pkt(uint8_t* p, uint8_t type) {
@@ -1712,22 +1772,56 @@ void loop() {
       for(int i=0;i<secs;i++) delay(1000);
       wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
       probe_stream(ch);
-    }else if(readString.substring(0,7)=="APCLONE"){
-      // B6: clone <ssid> across [cnt] random locally-administered BSSIDs (AP clone spam).
+    }else if(readString.substring(0,9)=="BEACONOFF"){
+      // Stop every beacon/SSID-flood mode. Nothing else in the firmware turned all of them off
+      // (SCAN cleared randomSSID/rickroll, STOP only ghostSpam), so a running flood could not be
+      // stopped from the app at all.
+      randomSSID = false; rickroll = false; ghostSpam = false; ssid = "";
+      String r = "BEACONOFF:ok";
+      Serial.println(r); Serial1.println(r);
+    }else if(readString.substring(0,5)=="TXRAW"){
+      // DIAG: TXRAW <hexbytes> -> push an arbitrary 802.11 frame through wifi_tx_raw_frame.
+      // Lets us bisect live (no rebuild) which byte in a beacon-ish frame makes the SDK spin.
+      int s1 = readString.indexOf(' ');
+      String hex = (s1 > 0) ? readString.substring(s1+1, readString.length()-1) : String("");
+      wext_set_channel(WLAN0_NAME, 6);   // DIAG: raw TX only completes on a tuned channel
+      int n = tx_raw_hex(hex.c_str());
+      String r = "TXRAW:" + String((unsigned)n);
+      Serial.println(r); Serial1.println(r);
+    }else if(readString.substring(0,8)=="TXBEACON"){
+      // DIAG (B6 fix): TXBEACON <typehex> <count> [ssid] -> raw beacon frames with a settable
+      // frame-control byte, so we can prove which frame type/the old SDK beacon path was hanging.
       int s1 = readString.indexOf(' ');
       int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int s3 = (s2 > 0) ? readString.indexOf(' ', s2+1) : -1;
+      int s4 = (s3 > 0) ? readString.indexOf(' ', s3+1) : -1;
+      int ftype = (s1 > 0) ? (int)strtol(readString.substring(s1+1, s2>0?s2:readString.length()-1).c_str(), NULL, 16) : 0x80;
+      int cnt = (s2 > 0) ? readString.substring(s2+1, s3>0?s3:readString.length()-1).toInt() : 1;
+      String ssid = (s3 > 0) ? readString.substring(s3+1, s4>0?s4:readString.length()-1) : String("DIAG");
+      int chan = (s4 > 0) ? readString.substring(s4+1, readString.length()-1).toInt() : 5;
+      if(cnt < 1 || cnt > 40) cnt = 1;
+      uint8_t src[6] = {0x00,0xE0,0x4C,0x01,0x02,0x03};
+      for(int i=0;i<cnt;i++) tx_beacon_raw(src, TX_BCAST, ssid.c_str(), (uint8_t)ftype, chan);
+      String r = "TXBEACON:" + String(ftype, HEX) + ":" + String((unsigned)cnt);
+      Serial.println(r); Serial1.println(r);
+    }else if(readString.substring(0,7)=="APCLONE"){
+      // B6: clone <ssid> across [cnt] random locally-administered BSSIDs on [chan] (AP clone spam).
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int s3 = (s2 > 0) ? readString.indexOf(' ', s2+1) : -1;
       String ssid = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1) : String("");
-      int cnt = (s2 > 0) ? readString.substring(s2+1, readString.length()-1).toInt() : 8;
+      int cnt = (s2 > 0) ? readString.substring(s2+1, s3>0?s3:readString.length()-1).toInt() : 8;
+      int chan = (s3 > 0) ? readString.substring(s3+1, readString.length()-1).toInt() : 6;
       if(cnt < 1 || cnt > 40) cnt = 8;
       if(ssid.length() == 0){
-        Serial.println("ERROR: APCLONE needs <ssid> [count]"); Serial1.println("ERROR: APCLONE needs <ssid> [count]");
+        Serial.println("ERROR: APCLONE needs <ssid> [count] [chan]"); Serial1.println("ERROR: APCLONE needs <ssid> [count] [chan]");
       }else{
         if(apActive) destroyAP();
         for(int i=0;i<cnt;i++){
           uint8_t src[6];
           for(int k=0;k<6;k++) src[k] = (uint8_t)random(0x00, 0xFF);
           src[0] = (src[0] & 0xFC) | 0x02;      // locally administered, unicast
-          for(int x=0;x<3;x++) wifi_tx_beacon_frame(src, (void*)"\xFF\xFF\xFF\xFF\xFF\xFF", ssid.c_str());
+          for(int x=0;x<3;x++) tx_beacon_raw(src, TX_BCAST, ssid.c_str(), 0x80, chan);
         }
         String r = "APCLONE:" + String((unsigned)cnt) + "|" + ssid;
         Serial.println(r); Serial1.println(r);
@@ -1990,7 +2084,7 @@ void loop() {
     const char * ssid_cstr2 = ssid2.c_str();
     wext_set_channel(WLAN0_NAME,randomChannel);
     for(int x=0;x<5;x++){
-      wifi_tx_beacon_frame(randomString,(void *)"\xFF\xFF\xFF\xFF\xFF\xFF",ssid_cstr2);
+      tx_beacon_raw((const uint8_t*)randomString, TX_BCAST, ssid_cstr2, 0x80, randomChannel);
     }
   }
   if (rickroll){
@@ -2005,7 +2099,7 @@ void loop() {
       const char * ssid_cstr2 = ssid2.c_str();
       wext_set_channel(WLAN0_NAME,v+1);
       for(int x=0;x<5;x++){
-       wifi_tx_beacon_frame(randomString,(void *)"\xFF\xFF\xFF\xFF\xFF\xFF",ssid_cstr2);
+       tx_beacon_raw((const uint8_t*)randomString, TX_BCAST, ssid_cstr2, 0x80, v+1);
       }
     }
   }
@@ -2015,7 +2109,7 @@ void loop() {
       const char * ssid_cstr2 = ghost_ssids[v];
       wext_set_channel(WLAN0_NAME, v+1);
       for(int x=0;x<5;x++){
-        wifi_tx_beacon_frame((void *)"\x00\xE0\x4C\x01\x02\x03",(void *)"\xFF\xFF\xFF\xFF\xFF\xFF",ssid_cstr2);
+        tx_beacon_raw((const uint8_t*)"\x00\xE0\x4C\x01\x02\x03", TX_BCAST, ssid_cstr2, 0x80, v+1);
       }
     }
   }
@@ -2026,7 +2120,7 @@ void loop() {
     const char * ssid_cstr2 = ssid.c_str();
     for(int x=0; x<5; x++){
       DEBUG_SER_PRINT("START "+ssid);
-      wifi_tx_beacon_frame((void *)"\x00\xE0\x4C\x01\x02\x03",(void *)"\xFF\xFF\xFF\xFF\xFF\xFF",ssid_cstr2);
+      tx_beacon_raw((const uint8_t*)"\x00\xE0\x4C\x01\x02\x03", TX_BCAST, ssid_cstr2, 0x80, channel);
     }
 
   }
