@@ -1885,6 +1885,15 @@ static int aps_on_channel(delfyRTL* app, int ch) {
     return n;
 }
 
+static int aps_on_band(delfyRTL* app, int lo, int hi) {
+    int n = 0;
+    for(int i = 0; i < app->wifiCount; i++) {
+        int ch = app->wifiList[i].chanel;
+        if(ch >= lo && ch <= hi) n++;
+    }
+    return n;
+}
+
 static delfyRTL* g_chmap = NULL;
 
 static void channel_map_draw(Canvas* c, void* model) {
@@ -1897,28 +1906,44 @@ static void channel_map_draw(Canvas* c, void* model) {
         canvas_draw_str(c, 2, 30, "Scan Wi-Fi first");
         return;
     }
-    int maxc = 1, n5 = 0;
+    // 2.4 GHz: channels 1..13
+    int maxc = 1;
     for(int ch = 1; ch <= 13; ch++) {
         int n = aps_on_channel(app, ch);
         if(n > maxc) maxc = n;
     }
-    for(int i = 0; i < app->wifiCount; i++)
-        if(app->wifiList[i].chanel > 14) n5++;
-    char b5[16];
-    snprintf(b5, sizeof(b5), "5G:%d", n5);
-    canvas_draw_str(c, 96, 9, b5);
     for(int ch = 1; ch <= 13; ch++) {
         int n = aps_on_channel(app, ch);
         if(n <= 0) continue;
-        int h = (n * 34) / maxc;
-        int x = 3 + (ch - 1) * 9;
-        canvas_draw_box(c, x, 56 - h, 7, h);
+        int h = (n * 14) / maxc;
+        int x = 2 + (ch - 1) * 9;
+        canvas_draw_box(c, x, 28 - h, 7, h);
         char num[12];
         snprintf(num, sizeof(num), "%d", n);
-        canvas_draw_str(c, x + 1, 56 - h - 1, num);
+        canvas_draw_str(c, x + 1, 28 - h - 1, num);
     }
-    canvas_draw_str(c, 3, 63, "1");
-    canvas_draw_str(c, 108, 63, "13");
+    canvas_draw_str(c, 2, 38, "2.4G 1-13");
+
+    // 5 GHz: U-NII bands (36-48, 52-64, 100-144, 149-165)
+    static const int blo[4] = {36, 52, 100, 149};
+    static const int bhi[4] = {48, 64, 144, 165};
+    static const char* blb[4] = {"U1", "U2a", "U2c", "U3"};
+    int maxb = 1;
+    for(int b = 0; b < 4; b++) {
+        int n = aps_on_band(app, blo[b], bhi[b]);
+        if(n > maxb) maxb = n;
+    }
+    for(int b = 0; b < 4; b++) {
+        int n = aps_on_band(app, blo[b], bhi[b]);
+        int h = (n * 13) / maxb;
+        int x = 6 + b * 30;
+        if(n > 0) canvas_draw_box(c, x, 60 - h, 7, h);
+        char num[12];
+        snprintf(num, sizeof(num), "%d", n);
+        canvas_draw_str(c, x + 2, 46, num); // count above the 5G bar
+        canvas_draw_str(c, x + 1, 63, blb[b]); // U-NII band label
+    }
+    canvas_draw_str(c, 102, 38, "5G");
 }
 
 void channel_map_scene_on_enter(void* context) {
