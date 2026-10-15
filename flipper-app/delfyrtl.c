@@ -67,6 +67,7 @@ typedef enum {
     gattScene,
     blespamScene,
     trackerScene,
+    browseScene,
 
     DelfyRTLSceneCount
 } delfyRTLScene;
@@ -215,6 +216,8 @@ static int sess_stas = 0;
 static int sess_pmf = 0;
 static int sess_wifis = 0;
 static int sess_deauth = 0;
+// E7 browse: the hub sets this so a fresh entry starts at the session list (level 0).
+static bool browse_reset = true;
 
 // --- D1: BLE devices seen in the last scan (so "GATT enumerate" can pick one) -----
 // A3/D4: ble_list_tag holds the firmware's vendor/fingerprint label (Apple/FindMy/Tile/...)
@@ -1691,6 +1694,7 @@ static void wifi_hub_cb(void* context, uint32_t index) {
     case 7: delfy_probeflood(app); break;
     case 8: scene_manager_next_scene(app->scene_manager, settingsScene); break;
     case 9: scene_manager_next_scene(app->scene_manager, sessionScene); break;
+    case 10: browse_reset = true; scene_manager_next_scene(app->scene_manager, browseScene); break;
     }
 }
 // Re-ask the board for its IDENT while we have not heard back yet. The board answers HELLO
@@ -1719,6 +1723,7 @@ void wifi_hub_scene_on_enter(void* context) {
     }
     submenu_add_item(app->submenu, "Settings", 8, wifi_hub_cb, app);
     submenu_add_item(app->submenu, "Session summary", 9, wifi_hub_cb, app);
+    submenu_add_item(app->submenu, "Browse sessions", 10, wifi_hub_cb, app);
     view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
 }
 bool wifi_hub_scene_on_event(void* context, SceneManagerEvent event) {
@@ -2121,6 +2126,100 @@ bool tracker_scene_on_event(void* context, SceneManagerEvent event) {
     return false;
 }
 void tracker_scene_on_exit(void* context) {
+    UNUSED(context);
+}
+
+// --- E7: on-device browser for the saved sessions --------------------------------
+#define BROWSE_MAX 24
+static char browse_names[BROWSE_MAX][40];
+static int browse_n = 0;
+static int browse_level = 0; // 0 = sessions, 1 = files inside the selected session
+static char browse_dir[64] = "";
+
+static void browse_read_dir(const char* dir, bool want_dirs) {
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    browse_n = 0;
+    File* d = storage_file_alloc(st);
+    if(storage_dir_open(d, dir)) {
+        FileInfo fi;
+        char nm[64];
+        while(browse_n < BROWSE_MAX && storage_dir_read(d, &fi, nm, sizeof(nm))) {
+            if(file_info_is_dir(&fi) != want_dirs) continue;
+            strncpy(browse_names[browse_n], nm, sizeof(browse_names[0]) - 1);
+            browse_names[browse_n][sizeof(browse_names[0]) - 1] = '\0';
+            browse_n++;
+        }
+        storage_dir_close(d);
+    }
+    storage_file_free(d);
+    furi_record_close(RECORD_STORAGE);
+}
+
+static void browse_item_cb(void* context, uint32_t index);
+
+static void browse_fill(delfyRTL* app) {
+    app->submenuIndex = 0;
+    submenu_reset(app->submenu);
+    if(browse_level == 0) {
+        submenu_set_header(app->submenu, "Sessions");
+        browse_read_dir("/ext/delfy/sessions", true);
+    } else {
+        submenu_set_header(app->submenu, "Files");
+        browse_read_dir(browse_dir, false);
+    }
+    if(browse_n == 0) {
+        submenu_add_item(app->submenu, "(empty)", 0, NULL, app);
+    } else {
+        for(int i = 0; i < browse_n; i++)
+            submenu_add_item(app->submenu, browse_names[i], i, browse_item_cb, app);
+    }
+    view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
+}
+
+static void browse_item_cb(void* context, uint32_t index) {
+    delfyRTL* app = context;
+    if((int)index >= browse_n) return;
+    if(browse_level == 0) {
+        snprintf(browse_dir, sizeof(browse_dir), "/ext/delfy/sessions/%s", browse_names[index]);
+        browse_level = 1;
+        browse_fill(app);
+        return;
+    }
+    // level 1: read the file (up to ~1 KB) and show it in the recon view
+    char path[128];
+    snprintf(path, sizeof(path), "%s/%s", browse_dir, browse_names[index]);
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    File* f = storage_file_alloc(st);
+    recon_text[0] = '\0';
+    if(storage_file_open(f, path, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        uint16_t n = storage_file_read(f, recon_text, sizeof(recon_text) - 1);
+        recon_text[n] = '\0';
+        storage_file_close(f);
+    }
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+    snprintf(recon_title, sizeof(recon_title), "%.22s", browse_names[index]);
+    scene_manager_next_scene(app->scene_manager, pmfScene);
+}
+
+void browse_scene_on_enter(void* context) {
+    delfyRTL* app = context;
+    if(browse_reset) {
+        browse_level = 0;
+        browse_reset = false;
+    }
+    browse_fill(app);
+}
+bool browse_scene_on_event(void* context, SceneManagerEvent event) {
+    delfyRTL* app = context;
+    if(event.type == SceneManagerEventTypeBack && browse_level == 1) {
+        browse_level = 0; // back from the file list -> the session list
+        browse_fill(app);
+        return true;
+    }
+    return false;
+}
+void browse_scene_on_exit(void* context) {
     UNUSED(context);
 }
 
@@ -2992,7 +3091,7 @@ void (*const delfyRTL_scene_on_enter_handlers[])(void*) = {
     wifi_hub_scene_on_enter,
     ble_hub_scene_on_enter,
     ble_adv_lib_scene_on_enter,
-    portal_list_scene_on_enter, settings_scene_on_enter, session_scene_on_enter, gatt_scene_on_enter, blespam_scene_on_enter, tracker_scene_on_enter};
+    portal_list_scene_on_enter, settings_scene_on_enter, session_scene_on_enter, gatt_scene_on_enter, blespam_scene_on_enter, tracker_scene_on_enter, browse_scene_on_enter};
 
 bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     main_menu_scene_on_event,
@@ -3017,7 +3116,7 @@ bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     wifi_hub_scene_on_event,
     ble_hub_scene_on_event,
     ble_adv_lib_scene_on_event,
-    portal_list_scene_on_event, settings_scene_on_event, session_scene_on_event, gatt_scene_on_event, blespam_scene_on_event, tracker_scene_on_event};
+    portal_list_scene_on_event, settings_scene_on_event, session_scene_on_event, gatt_scene_on_event, blespam_scene_on_event, tracker_scene_on_event, browse_scene_on_event};
 
 void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     main_menu_scene_on_exit,
@@ -3042,7 +3141,7 @@ void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     wifi_hub_scene_on_exit,
     ble_hub_scene_on_exit,
     ble_adv_lib_scene_on_exit,
-    portal_list_scene_on_exit, settings_scene_on_exit, session_scene_on_exit, gatt_scene_on_exit, blespam_scene_on_exit, tracker_scene_on_exit};
+    portal_list_scene_on_exit, settings_scene_on_exit, session_scene_on_exit, gatt_scene_on_exit, blespam_scene_on_exit, tracker_scene_on_exit, browse_scene_on_exit};
 
 static const SceneManagerHandlers delfyRTL_scene_manager_handlers = {
     .on_enter_handlers = delfyRTL_scene_on_enter_handlers,
