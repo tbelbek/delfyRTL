@@ -3211,7 +3211,25 @@ void uart_process_line(FuriString* line, void* context) {
         delfy_save_scan("pmf", recon_text);
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "PMF:", 4) == 0) {
-        recon_append(furi_string_get_cstr(line) + 4);
+        // A6: classify "<mac>|<ssid>|akm=N|sae=N|mfp=cap|req" into a WPA3/WPA2 verdict so the
+        // recon view reads like an inventory (and transition-mode downgrades stand out).
+        const char* s = furi_string_get_cstr(line) + 4;
+        const char* sae = strstr(s, "sae=");
+        const char* mfp = strstr(s, "mfp=");
+        int sae_v = sae ? atoi(sae + 4) : 0;
+        const char* cls;
+        if(sae_v && mfp && !strncmp(mfp + 4, "req", 3)) {
+            cls = "WPA3-only";
+        } else if(sae_v) {
+            cls = "WPA3(PMFcap)";
+        } else if(mfp && !strncmp(mfp + 4, "cap", 3)) {
+            cls = "WPA2+PMFcap";
+        } else {
+            cls = "WPA2";
+        }
+        char out[96];
+        snprintf(out, sizeof(out), "%.60s %s", s, cls);
+        recon_append(out);
     } else if(strncmp(furi_string_get_cstr(line), "STADONE:", 8) == 0) {
         snprintf(recon_title, sizeof(recon_title), "Stations");
         const char* s = strstr(furi_string_get_cstr(line), "n=");
