@@ -1982,6 +1982,7 @@ static bool card_menu_input(InputEvent* event, void* context) {
         return false;
     }
     card_sel = row * 2 + col;
+    view_commit_model(app->cardView, true); // emit a refresh so the highlight moves
     return true;
 }
 
@@ -2526,6 +2527,7 @@ static delfyRTL* app_alloc() {
 
     // Card-grid main menu
     app->cardView = view_alloc();
+    view_allocate_model(app->cardView, ViewModelTypeLockFree, 1); // enable view_commit_model refresh
     view_set_context(app->cardView, app);
     view_set_draw_callback(app->cardView, card_menu_draw);
     view_set_input_callback(app->cardView, card_menu_input);
