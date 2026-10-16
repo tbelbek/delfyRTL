@@ -351,6 +351,15 @@ typedef enum {
 #define DELFY_EVT_KARMA_POLL 0x2007
 #define DELFY_EVT_SCRIPT_TICK 0x2008
 #define DELFY_EVT_REC_REFRESH 0x2009
+// Info screen buttons (Edit / Deauth / Evil). They are posted as custom events instead of being
+// handled in the widget button callback: on the installed firmware the GUI is an event loop and
+// handle_input() binds a key to the view that is current when the key is *processed*, so switching
+// the view (or resetting the widget) from inside that handler faults the Flipper. Pressing Edit
+// used to reach the attack config by luck; it does not on this build - it hard-resets the device.
+// Posted events are handled between frames, which is safe (same fix as the KARMA screen).
+#define DELFY_EVT_INFO_EDIT 0x200A
+#define DELFY_EVT_INFO_DEAUTH 0x200B
+#define DELFY_EVT_INFO_EVIL 0x200C
 // B1: raw payload of the last KARMALIST reply ("<n>|ssid|ssid|..."), rendered by the KARMA scene.
 static char karma_list[192];
 // C1: same scene drives both modes - plain KARMA (answer probes) and Trap (clone the network for
@@ -969,38 +978,28 @@ static const char* delfy_pmf_tag(int security) {
 
 void info_wifi_scene_on_enter(void* context);
 void info_wifi_button_press(GuiButtonType result, InputType type, void* context) {
-    FURI_LOG_D(TAG, __func__);
-    FURI_LOG_D(TAG, "%d %d", type, result);
     delfyRTL* app = context;
-    char cadena[13] = "";
-    if(result == GuiButtonTypeCenter && type == 0) {
-        if(app->wifiList[app->selectedWifi].deauth == false) {
-            app->wifiList[app->selectedWifi].deauth = true;
-            snprintf(cadena, 13, "DEAUTH %d\n", app->selectedWifi);
-        } else {
-            app->wifiList[app->selectedWifi].deauth = false;
-            snprintf(cadena, 13, "STOP %d\n", app->selectedWifi);
-        }
-        info_wifi_scene_on_enter(app);
-        uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-    } else if(result == GuiButtonTypeLeft && type == 0) {
-        scene_manager_next_scene(app->scene_manager, configAttackScene);
-    } else if(result == GuiButtonTypeRight && type == 0) {
-        credentials[0] = '\0';
-        snprintf(cadena, 13, "EVIL %d\n", app->selectedWifi);
-
-        info_wifi_scene_on_enter(app);
-        FURI_LOG_D(TAG, "%s", cadena);
-        uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-        scene_manager_next_scene(app->scene_manager, evilCredsScene);
-    }
+    // The widget's button element invokes this for EVERY event type of the matching key (press,
+    // release, repeat), so act on the press only - otherwise one tap fires twice.
+    if(type != InputTypePress) return;
+    FURI_LOG_D(TAG, "%s %d %d", __func__, type, result);
+    // Do not touch the widget and do not switch scenes here: this runs inside the widget's own
+    // input dispatch (see the note on DELFY_EVT_INFO_*). Post an event and let the scene's
+    // on_event do it, which runs between frames.
+    uint32_t ev = DELFY_EVT_INFO_EDIT;
+    if(result == GuiButtonTypeCenter) ev = DELFY_EVT_INFO_DEAUTH;
+    else if(result == GuiButtonTypeRight) ev = DELFY_EVT_INFO_EVIL;
+    view_dispatcher_send_custom_event(app->view_dispatcher, ev);
 }
 void info_wifi_scene_on_enter(void* context) {
     FURI_LOG_D(TAG, __func__);
     delfyRTL* app = context;
 
     widget_reset(app->widget);
-    char infoWifi[100] = "No wifi";
+    // Handed to the widget, so it has to outlive this call: the widget's draw callback reads it
+    // after we return, and a stack buffer here is dead by then. Kept static on purpose.
+    static char infoWifi[100];
+    snprintf(infoWifi, sizeof(infoWifi), "No wifi");
     if(app->selectedWifi >= 0 && app->selectedWifi < app->wifiCount) {
         char* security;
         switch(app->wifiList[app->selectedWifi].security) {
@@ -1102,10 +1101,38 @@ void info_wifi_scene_on_enter(void* context) {
     furi_delay_ms(200);
 }
 bool info_wifi_scene_on_event(void* context, SceneManagerEvent event) {
-    FURI_LOG_D(TAG, __func__);
-
-    UNUSED(context);
-    UNUSED(event);
+    delfyRTL* app = context;
+    if(event.type != SceneManagerEventTypeCustom) return false;
+    char cadena[24] = "";
+    switch(event.event) {
+    case DELFY_EVT_INFO_DEAUTH:
+        FURI_LOG_D(TAG, "%s deauth", __func__);
+        if(app->selectedWifi < 0 || app->selectedWifi >= app->wifiCount) return true;
+        if(app->wifiList[app->selectedWifi].deauth == false) {
+            app->wifiList[app->selectedWifi].deauth = true;
+            snprintf(cadena, sizeof(cadena), "DEAUTH %d\n", app->selectedWifi);
+        } else {
+            app->wifiList[app->selectedWifi].deauth = false;
+            snprintf(cadena, sizeof(cadena), "STOP %d\n", app->selectedWifi);
+        }
+        info_wifi_scene_on_enter(app);
+        uart_helper_send(app->uart_helper, cadena, strlen(cadena));
+        return true;
+    case DELFY_EVT_INFO_EVIL:
+        FURI_LOG_D(TAG, "%s evil", __func__);
+        if(app->selectedWifi < 0 || app->selectedWifi >= app->wifiCount) return true;
+        credentials[0] = '\0';
+        snprintf(cadena, sizeof(cadena), "EVIL %d\n", app->selectedWifi);
+        info_wifi_scene_on_enter(app);
+        FURI_LOG_D(TAG, "%s", cadena);
+        uart_helper_send(app->uart_helper, cadena, strlen(cadena));
+        scene_manager_next_scene(app->scene_manager, evilCredsScene);
+        return true;
+    case DELFY_EVT_INFO_EDIT:
+        FURI_LOG_D(TAG, "%s edit", __func__);
+        scene_manager_next_scene(app->scene_manager, configAttackScene);
+        return true;
+    }
     return false;
 }
 void info_wifi_scene_on_exit(void* context) {
@@ -1796,6 +1823,7 @@ static void wifi_hub_cb(void* context, uint32_t index) {
     case 12: karma_trap = true;  scene_manager_next_scene(app->scene_manager, karmaScene); break;
     case 13: scene_manager_next_scene(app->scene_manager, scriptListScene); break;
     case 14: scene_manager_next_scene(app->scene_manager, recordScene); break;
+    case 15: scene_manager_next_scene(app->scene_manager, toolsMenuScene); break;
     }
 }
 // Re-ask the board for its IDENT while we have not heard back yet. The board answers HELLO
@@ -1827,6 +1855,10 @@ void wifi_hub_scene_on_enter(void* context) {
     submenu_set_header(app->submenu, "Wi-Fi");
     submenu_add_item(app->submenu, "Scan Wifi", 0, wifi_hub_cb, app);
     submenu_add_item(app->submenu, "List Wifi", 1, wifi_hub_cb, app);
+    // The capture/recon Tools menu used to be reachable only through AP info -> Edit, and that
+    // info screen currently resets the device on this firmware (see the DELFY_EVT_INFO_* note),
+    // so the whole menu was unreachable. Give it a first-class entry here.
+    submenu_add_item(app->submenu, "Tools (capture / recon)", 15, wifi_hub_cb, app);
     submenu_add_item(app->submenu, "Channel Map", 2, wifi_hub_cb, app);
     submenu_add_item(app->submenu, "Create AP", 3, wifi_hub_cb, app);
     submenu_add_item(app->submenu, "Send Beacon", 4, wifi_hub_cb, app);
@@ -2073,6 +2105,11 @@ void settings_scene_on_enter(void* context) {
     delfyRTL* app = context;
     VariableItem* item;
     variable_item_list_reset(app->variableList);
+    // reset() frees the items but leaves model->position/window_position untouched, so a position
+    // left over from a longer list survives. The enter callback is handed model->position, and
+    // get_selected_item() walks position steps into the (now shorter) array without a bounds guard
+    // and returns a pointer past the end - pressing OK then dereferences it. Pin the selection to 0.
+    variable_item_list_set_selected_item(app->variableList, 0);
     item = variable_item_list_add(
         app->variableList, "Def. channel", SET_CHANNELS_N, settings_channel_cb, app);
     variable_item_set_current_value_index(item, set_channel_idx);
@@ -2353,6 +2390,11 @@ void config_attack_scene_on_enter(void* context) {
     delfyRTL* app = context;
     VariableItem* item;
     variable_item_list_reset(app->variableList);
+    // reset() frees the items but leaves model->position/window_position untouched, so a position
+    // left over from a longer list survives. The enter callback is handed model->position, and
+    // get_selected_item() walks position steps into the (now shorter) array without a bounds guard
+    // and returns a pointer past the end - pressing OK then dereferences it. Pin the selection to 0.
+    variable_item_list_set_selected_item(app->variableList, 0);
     item = variable_item_list_add(
         app->variableList, "Reason", 25, deauth_reason_change_call_back, app);
     variable_item_set_current_value_index(item, app->deauthReason);
@@ -3587,6 +3629,11 @@ void config_ap_scene_on_enter(void* context) {
     app->menuIndex = CreateAP;
     credentials[0] = '\0';
     variable_item_list_reset(app->variableList);
+    // reset() frees the items but leaves model->position/window_position untouched, so a position
+    // left over from a longer list survives. The enter callback is handed model->position, and
+    // get_selected_item() walks position steps into the (now shorter) array without a bounds guard
+    // and returns a pointer past the end - pressing OK then dereferences it. Pin the selection to 0.
+    variable_item_list_set_selected_item(app->variableList, 0);
     int idx = 0;
     app->ap_idx_name = idx++;
     item = variable_item_list_add(app->variableList, "AP NAME", 1, NULL, NULL);
