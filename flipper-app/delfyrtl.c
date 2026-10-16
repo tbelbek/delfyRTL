@@ -68,6 +68,7 @@ typedef enum {
     blespamScene,
     trackerScene,
     browseScene,
+    karmaScene,
 
     DelfyRTLSceneCount
 } delfyRTLScene;
@@ -282,6 +283,7 @@ typedef struct delfyRTL {
     View* cardView;      // card-grid main menu
     View* busyView;      // animated "working" screen (name + spinner, no dolphin)
     FuriTimer* busyTimer;
+    FuriTimer* karmaTimer;   // B1: polls the board for caught SSIDs while the KARMA screen is up
     char bleAdvHex[80];  // #5: BLE adv hex payload (typed / saved)
     char ibeaconUuid[40];// #6: iBeacon UUID hex (typed)
 } delfyRTL;
@@ -339,6 +341,10 @@ typedef enum {
 #define DELFY_EVT_BUSY_TIMEOUT 0x2004
 #define DELFY_EVT_EXIT 0x2005
 #define DELFY_EVT_CREDS 0x2002
+#define DELFY_EVT_KARMA 0x2006
+#define DELFY_EVT_KARMA_POLL 0x2007
+// B1: raw payload of the last KARMALIST reply ("<n>|ssid|ssid|..."), rendered by the KARMA scene.
+static char karma_list[192];
 
 typedef enum {
     SsidAPInputSceneSaveEvent,
@@ -1732,6 +1738,7 @@ static void wifi_hub_cb(void* context, uint32_t index) {
     case 8: scene_manager_next_scene(app->scene_manager, settingsScene); break;
     case 9: scene_manager_next_scene(app->scene_manager, sessionScene); break;
     case 10: browse_reset = true; scene_manager_next_scene(app->scene_manager, browseScene); break;
+    case 11: scene_manager_next_scene(app->scene_manager, karmaScene); break;
     }
 }
 // Re-ask the board for its IDENT while we have not heard back yet. The board answers HELLO
@@ -1775,6 +1782,8 @@ void wifi_hub_scene_on_enter(void* context) {
     submenu_add_item(app->submenu, "Settings", 8, wifi_hub_cb, app);
     submenu_add_item(app->submenu, "Session summary", 9, wifi_hub_cb, app);
     submenu_add_item(app->submenu, "Browse sessions", 10, wifi_hub_cb, app);
+    if(delfy_has_cap(app, 'R'))   // B1: firmware advertises the KARMA responder with "R"
+        submenu_add_item(app->submenu, "KARMA (responder)", 11, wifi_hub_cb, app);
     view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
 }
 bool wifi_hub_scene_on_event(void* context, SceneManagerEvent event) {
@@ -2489,6 +2498,74 @@ void beacon_info_scene_on_exit(void* context) {
     uart_helper_send(app->uart_helper, "BEACONOFF\n", 10);
 }
 
+// --- B1: KARMA / known-beacon responder scene ----------------------------------
+// The board sniffs probe requests and answers each requested SSID with a fake AP of the same name.
+// This screen turns it on and polls KARMALIST so the caught SSIDs show up live; leaving it turns
+// the responder off (so it never runs unattended).
+// NOTE: this uses its own timer. busyTimer must not be reused: its callback only commits the busy
+// model directly and never posts DELFY_EVT_BUSY_TICK, so a tick-based poll there would never run.
+static void karma_timer_cb(void* context) {
+    delfyRTL* app = context;
+    // Poll from the timer thread via a custom event; the scene then sends KARMALIST.
+    view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_KARMA_POLL);
+}
+
+static void karma_render(delfyRTL* app) {
+    widget_reset(app->widget);
+    widget_add_string_element(app->widget, 64, 2, AlignCenter, AlignTop, FontPrimary, "KARMA");
+    int n = karma_list[0] ? atoi(karma_list) : 0;
+    char hdr[40];
+    snprintf(hdr, sizeof(hdr), "%d SSID%s answered", n, n == 1 ? "" : "s");
+    widget_add_string_element(app->widget, 64, 14, AlignCenter, AlignTop, FontSecondary, hdr);
+    char body[192];
+    int o = 0;
+    const char* q = strchr(karma_list, '|');
+    while(q && o < 150) {
+        const char* e = strchr(q + 1, '|');
+        int l = e ? (int)(e - q - 1) : (int)strlen(q + 1);
+        if(l > 0) o += snprintf(body + o, sizeof(body) - (size_t)o, "%.*s\n", l, q + 1);
+        q = e;
+    }
+    if(o > 0) {
+        widget_add_string_multiline_element(app->widget, 64, 26, AlignCenter, AlignTop, FontSecondary, body);
+    } else {
+        widget_add_string_element(
+            app->widget, 64, 30, AlignCenter, AlignTop, FontSecondary, "no probes seen yet");
+    }
+    widget_add_string_element(app->widget, 64, 54, AlignCenter, AlignTop, FontSecondary, "BACK to stop");
+    view_dispatcher_switch_to_view(app->view_dispatcher, beaconInfoView);
+}
+
+void karma_scene_on_enter(void* context) {
+    delfyRTL* app = context;
+    karma_list[0] = '\0';
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "KARMA 1 %d\n", delfy_def_ch());
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    karma_render(app);
+    uart_helper_send(app->uart_helper, "KARMALIST\n", 10);
+    furi_timer_start(app->karmaTimer, 1500);
+}
+
+bool karma_scene_on_event(void* context, SceneManagerEvent event) {
+    delfyRTL* app = context;
+    if(event.type == SceneManagerEventTypeCustom && event.event == DELFY_EVT_KARMA) {
+        karma_render(app);
+        return true;
+    }
+    if(event.type == SceneManagerEventTypeCustom && event.event == DELFY_EVT_KARMA_POLL) {
+        uart_helper_send(app->uart_helper, "KARMALIST\n", 10);
+        return true;
+    }
+    return false;
+}
+
+void karma_scene_on_exit(void* context) {
+    delfyRTL* app = context;
+    furi_timer_stop(app->karmaTimer);
+    uart_helper_send(app->uart_helper, "KARMA 0\n", 8);
+}
+
 void help_scene_on_enter(void* context) {
     delfyRTL* app = context;
     delfy_ident(app);
@@ -3152,7 +3229,7 @@ void (*const delfyRTL_scene_on_enter_handlers[])(void*) = {
     wifi_hub_scene_on_enter,
     ble_hub_scene_on_enter,
     ble_adv_lib_scene_on_enter,
-    portal_list_scene_on_enter, settings_scene_on_enter, session_scene_on_enter, gatt_scene_on_enter, blespam_scene_on_enter, tracker_scene_on_enter, browse_scene_on_enter};
+    portal_list_scene_on_enter, settings_scene_on_enter, session_scene_on_enter, gatt_scene_on_enter, blespam_scene_on_enter, tracker_scene_on_enter, browse_scene_on_enter, karma_scene_on_enter};
 
 bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     main_menu_scene_on_event,
@@ -3177,7 +3254,7 @@ bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     wifi_hub_scene_on_event,
     ble_hub_scene_on_event,
     ble_adv_lib_scene_on_event,
-    portal_list_scene_on_event, settings_scene_on_event, session_scene_on_event, gatt_scene_on_event, blespam_scene_on_event, tracker_scene_on_event, browse_scene_on_event};
+    portal_list_scene_on_event, settings_scene_on_event, session_scene_on_event, gatt_scene_on_event, blespam_scene_on_event, tracker_scene_on_event, browse_scene_on_event, karma_scene_on_event};
 
 void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     main_menu_scene_on_exit,
@@ -3202,7 +3279,7 @@ void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     wifi_hub_scene_on_exit,
     ble_hub_scene_on_exit,
     ble_adv_lib_scene_on_exit,
-    portal_list_scene_on_exit, settings_scene_on_exit, session_scene_on_exit, gatt_scene_on_exit, blespam_scene_on_exit, tracker_scene_on_exit, browse_scene_on_exit};
+    portal_list_scene_on_exit, settings_scene_on_exit, session_scene_on_exit, gatt_scene_on_exit, blespam_scene_on_exit, tracker_scene_on_exit, browse_scene_on_exit, karma_scene_on_exit};
 
 static const SceneManagerHandlers delfyRTL_scene_manager_handlers = {
     .on_enter_handlers = delfyRTL_scene_on_enter_handlers,
@@ -3422,6 +3499,12 @@ void uart_process_line(FuriString* line, void* context) {
         snprintf(message, sizeof(message), "Sent %s probes", furi_string_get_cstr(line) + 11);
         snprintf(popupHeader, sizeof(popupHeader), "Probe flood");
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+    } else if(strncmp(furi_string_get_cstr(line), "KARMALIST:", 10) == 0) {
+        // B1: "<n>|ssid|ssid|..." - the KARMA scene renders this live.
+        snprintf(karma_list, sizeof(karma_list), "%s", furi_string_get_cstr(line) + 10);
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_KARMA);
+    } else if(strncmp(furi_string_get_cstr(line), "KARMA:", 6) == 0) {
+        // on/off ack - the scene shows live state from the KARMALIST polls instead
     } else if(strncmp(furi_string_get_cstr(line), "PORTALHASH:", 11) == 0) {
         // Reply to our PORTALHASH request: len + FNV-1a of what the board actually holds.
         // (Parsed with strtol — sscanf is not in the firmware export table.)
@@ -3683,6 +3766,7 @@ static delfyRTL* app_alloc() {
     view_set_draw_callback(app->busyView, busy_view_draw);
     view_dispatcher_add_view(app->view_dispatcher, busyView, app->busyView);
     app->busyTimer = furi_timer_alloc(busy_timer_cb, FuriTimerTypePeriodic, app);
+    app->karmaTimer = furi_timer_alloc(karma_timer_cb, FuriTimerTypePeriodic, app);
 
     app->uart_helper = uart_helper_alloc();
     uart_helper_set_baud_rate(app->uart_helper, DEVICE_BAUDRATE);
@@ -3706,8 +3790,10 @@ static void app_free(delfyRTL* app) {
 
     furi_timer_stop(app->timer);
     furi_timer_stop(app->busyTimer);
+    furi_timer_stop(app->karmaTimer);
     furi_timer_free(app->timer);
     furi_timer_free(app->busyTimer);
+    furi_timer_free(app->karmaTimer);
     uart_helper_free(app->uart_helper);
 
     view_dispatcher_remove_view(app->view_dispatcher, mainMenuView);

