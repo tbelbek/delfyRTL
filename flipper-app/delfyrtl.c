@@ -353,6 +353,8 @@ static char karma_list[192];
 // real with a softAP + portal). The hub items set this before entering.
 static bool karma_trap = false;
 static char trap_state[40];   // last "ap=..." reported by the board (Trap mode)
+static char karma_saved[192]; // last SSID list written to SD (so we only write on change)
+static int karma_chan_sel = 0;// Trap/KARMA channel picked with UP/DOWN on that screen
 
 typedef enum {
     SsidAPInputSceneSaveEvent,
@@ -2531,8 +2533,9 @@ static void script_timer_cb(void* context) {
 
 static void karma_render(delfyRTL* app) {
     widget_reset(app->widget);
-    widget_add_string_element(
-        app->widget, 64, 2, AlignCenter, AlignTop, FontPrimary, karma_trap ? "TRAP" : "KARMA");
+    char title[24];
+    snprintf(title, sizeof(title), "%s ch%d", karma_trap ? "TRAP" : "KARMA", karma_chan_sel);
+    widget_add_string_element(app->widget, 64, 2, AlignCenter, AlignTop, FontPrimary, title);
     int n = karma_list[0] ? atoi(karma_list) : 0;
     char hdr[48];
     if(karma_trap) {
@@ -2572,7 +2575,7 @@ static void karma_render(delfyRTL* app) {
         AlignCenter,
         AlignTop,
         FontSecondary,
-        karma_trap ? "< >:portal  BACK:stop" : "BACK to stop");
+        karma_trap ? "< >:port ^v:ch BACK:stop" : "^v:ch  BACK to stop");
     view_dispatcher_switch_to_view(app->view_dispatcher, beaconInfoView);
 }
 
@@ -2583,7 +2586,21 @@ static void karma_render(delfyRTL* app) {
 // through a custom event so it happens between frames instead.
 static bool karma_input_callback(InputEvent* event, void* context) {
     delfyRTL* app = context;
-    if(!app || event->type != InputTypeShort || !karma_trap) return false;
+    if(!app || event->type != InputTypeShort) return false;
+    if(event->key == InputKeyUp || event->key == InputKeyDown) {
+        // Channel (both modes): changing it re-arms the responder, so any clone that was up is
+        // gone - that is why trap_state is cleared here.
+        karma_chan_sel += (event->key == InputKeyUp) ? 1 : -1;
+        if(karma_chan_sel > 13) karma_chan_sel = 1;
+        if(karma_chan_sel < 1) karma_chan_sel = 13;
+        trap_state[0] = '\0';
+        char cmd[32];
+        snprintf(cmd, sizeof(cmd), karma_trap ? "TRAP 1 %d\n" : "KARMA 1 %d\n", karma_chan_sel);
+        uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_KARMA);
+        return true;
+    }
+    if(!karma_trap) return false;   // the portal picker below only makes sense for Trap
     if(event->key == InputKeyLeft || event->key == InputKeyRight) {
         int i = app->captivePortal;
         i = (event->key == InputKeyRight) ? (i + 1) : (i - 1 + CAPTIVE_PORTAL_SIZE);
@@ -2602,9 +2619,11 @@ static bool karma_input_callback(InputEvent* event, void* context) {
 void karma_scene_on_enter(void* context) {
     delfyRTL* app = context;
     karma_list[0] = '\0';
+    karma_saved[0] = '\0';
     trap_state[0] = '\0';
+    if(karma_chan_sel < 1 || karma_chan_sel > 13) karma_chan_sel = delfy_def_ch();
     char cmd[32];
-    snprintf(cmd, sizeof(cmd), karma_trap ? "TRAP 1 %d\n" : "KARMA 1 %d\n", delfy_def_ch());
+    snprintf(cmd, sizeof(cmd), karma_trap ? "TRAP 1 %d\n" : "KARMA 1 %d\n", karma_chan_sel);
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
     if(karma_trap) {
         // Make sure the board holds the chosen portal before any clone starts.
@@ -3785,8 +3804,22 @@ void uart_process_line(FuriString* line, void* context) {
         snprintf(popupHeader, sizeof(popupHeader), "Probe flood");
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
     } else if(strncmp(furi_string_get_cstr(line), "KARMALIST:", 10) == 0) {
-        // B1: "<n>|ssid|ssid|..." - the KARMA scene renders this live.
+        // B1: "<n>|ssid|ssid|..." - the KARMA scene renders this live, and the list is persisted
+        // to the run's session folder (once per change, not once per poll).
         snprintf(karma_list, sizeof(karma_list), "%s", furi_string_get_cstr(line) + 10);
+        if(strcmp(karma_list, karma_saved) != 0) {
+            snprintf(karma_saved, sizeof(karma_saved), "%s", karma_list);
+            char body[192];
+            int o = 0;
+            const char* q = strchr(karma_list, '|');
+            while(q && o < 150) {
+                const char* e = strchr(q + 1, '|');
+                int l = e ? (int)(e - q - 1) : (int)strlen(q + 1);
+                if(l > 0) o += snprintf(body + o, sizeof(body) - (size_t)o, "%.*s\n", l, q + 1);
+                q = e;
+            }
+            delfy_save_scan("karma", o > 0 ? body : "(none)\n");
+        }
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_KARMA);
     } else if(strncmp(furi_string_get_cstr(line), "KARMA:", 6) == 0) {
         // on/off ack - the scene shows live state from the KARMALIST polls instead
@@ -3810,8 +3843,19 @@ void uart_process_line(FuriString* line, void* context) {
     } else if(strncmp(furi_string_get_cstr(line), "TRAPCTL:", 8) == 0) {
         // C1: Trap on/off ack
     } else if(strncmp(furi_string_get_cstr(line), "TRAP:", 5) == 0) {
-        // C1: the board cloned a network for real - show which one on the Trap screen
+        // C1: the board cloned a network for real - show which one on the Trap screen and record
+        // it (with the portal that was armed) in the run's session folder.
         snprintf(trap_state, sizeof(trap_state), "%s", furi_string_get_cstr(line) + 5);
+        {
+            char body[96];
+            snprintf(
+                body,
+                sizeof(body),
+                "cloned AP: %s\nportal: %s\n",
+                trap_state,
+                captive_portals[app->captivePortal]);
+            delfy_save_scan("trap", body);
+        }
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_KARMA);
     } else if(strncmp(furi_string_get_cstr(line), "TRAPFAIL", 8) == 0) {
         snprintf(trap_state, sizeof(trap_state), "(clone failed - still KARMA)");

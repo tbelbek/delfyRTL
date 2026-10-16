@@ -2299,15 +2299,29 @@ void loop() {
     digitalWrite(LED_G, !digitalRead(LED_G));
     wext_set_channel(WLAN0_NAME,channel);
     const char * ssid_cstr2 = ssid.c_str();
-    for(int x=0; x<5; x++){
+    // Print once per SSID, not once per beacon: this runs every loop() pass (~150+/s), which
+    // flooded the USB log and made the out-of-band control channel unusable while beaconing.
+    static char last_ssid[33] = {0};
+    if(strcmp(last_ssid, ssid_cstr2) != 0) {
+      strncpy(last_ssid, ssid_cstr2, 32);
+      last_ssid[32] = '\0';
       DEBUG_SER_PRINT("START "+ssid);
+    }
+    for(int x=0; x<5; x++){
       tx_beacon_raw((const uint8_t*)"\x00\xE0\x4C\x01\x02\x03", TX_BCAST, ssid_cstr2, 0x80, channel);
     }
 
   }
   
   if (apActive) {
-    WiFiClient client = server.available();
+    // Poll the listen socket at most every 20 ms. loop() runs thousands of times a second, and
+    // calling server.available() (accept) that often makes the SDK spew
+    // "[ERROR] Accept connection failed" non-stop and burns CPU while barely helping latency.
+    static uint32_t last_accept_ms = 0;
+    uint32_t now_ms = millis();
+    bool poll_ok = (now_ms - last_accept_ms) >= 20;
+    if(poll_ok) last_accept_ms = now_ms;
+    WiFiClient client = poll_ok ? server.available() : WiFiClient();
     if (client) {
       //client.setRecvTimeout(500);
       String request;
