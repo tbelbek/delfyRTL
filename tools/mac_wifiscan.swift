@@ -23,5 +23,5 @@ guard let nets = try? iface.scanForNetworks(withName: nil) else {
 }
 print("COUNT \(nets.count)")
 for n in nets.sorted(by: { ($0.ssid ?? "") < ($1.ssid ?? "") }) {
-    print("\(n.ssid ?? "<hidden>") | ch \(n.wlanChannel?.channelNumber ?? 0) | rssi \(n.rssiValue)")
+    print("\(n.ssid ?? "<hidden>") | bssid \(n.bssid ?? "-") | ch \(n.wlanChannel?.channelNumber ?? 0) | rssi \(n.rssiValue)")
 }
