@@ -47,7 +47,7 @@ def shot(name):
     return ok
 
 
-def keys(*ks, settle=0.35):
+def keys(*ks, settle=1.0):
     args = [PY, os.path.join(HERE, "flipctl.py"), "drive", *ks, "--settle", str(settle)]
     try:
         subprocess.run(args, capture_output=True, text=True, timeout=45)
@@ -61,41 +61,18 @@ def nav_to_tools():
     time.sleep(5)
     cli(f"loader open {FAP}", wait=3.5)
     time.sleep(2.5)
-    keys("OK", settle=0.9)          # hub
-    keys("OK", settle=1.2)          # scan
-    time.sleep(13)
-    keys("DOWN", "OK", settle=0.5)  # hub -> List Wifi
-    time.sleep(1.2)
-    # pick list item #2: in every observed scan order that slot is a NAMED AP, whereas
-    # #0/#1 are sometimes the hidden "<empty>" AP, whose info screen has no <Edit button
-    # (so you cannot reach Tools). Verified against 3 different scan orders.
-    keys("DOWN", "DOWN", "OK", settle=0.5)  # list -> item #2 info
-    time.sleep(1.2)
-    keys("LEFT", settle=0.9)        # config
-    keys("DOWN", "DOWN", "DOWN", "OK", settle=0.4)   # Tools
+    # A fresh submenu starts on row 0 (submenu_reset resets the cursor), so this nav is absolute:
+    # OK on the hub = "Scan Wifi" (row 0), the scan finishes by itself and lands back on row 0,
+    # then two DOWNs reach "Tools (capture / recon)". The old detour through List Wifi -> AP info
+    # -> Edit is gone: it depended on the scan order (the hidden "<empty>" AP has no Edit button)
+    # and is no longer needed now that the hub carries a Tools entry.
+    keys("OK", settle=1.2)                      # main -> Wi-Fi hub (row 0)
+    keys("OK", settle=1.2)                      # row 0 = Scan Wifi
+    shot("b01-scan")
+    time.sleep(15)                              # scan wait -> back to the hub, row 0 again
+    keys("DOWN", "DOWN", "OK", settle=1.0)      # row 2 = Tools (capture / recon)
     time.sleep(1.2)
     shot("b00-tools")
-
-
-# (idx, name, wait_s) - idx is the ROW in the Tools menu. The menu now starts with the
-# "Target: <ssid>" picker, so every row below it is one further down than it used to be.
-TOOLS = {
-    0: ("Target_AP", 2),
-    14: ("Capture_HS_passive", 14),
-    1: ("Grab_HS_deauth", 24),
-    2: ("PMKID_passive", 12),
-    3: ("PMKID_grab_deauth", 16),
-    4: ("PMKID_clientless", 14),
-    5: ("Capture_STOP", 2),
-    6: ("Guided_audit", 20),
-    7: ("PMF_WPA3_scan", 12),
-    8: ("STASCAN", 12),
-    9: ("Deauth_list_addAP", 3),
-    10: ("Deauth_list_RUN", 6),
-    11: ("Deauth_list_STOP", 3),
-    12: ("Channel_hop", 3),
-    13: ("Stop_clear", 3),
-}
 
 
 def main():
@@ -108,11 +85,11 @@ def main():
             continue
         name, wait = TOOLS[i]
         log(f"  TOOL #{i} {name}")
-        keys(*(["DOWN"] * i + ["OK"]), settle=0.35)
+        keys(*(["DOWN"] * i + ["OK"]), settle=1.0)
         shot(f"b{i:02d}-{name}-busy")
         time.sleep(wait)
         shot(f"b{i:02d}-{name}-after")
-        keys("BACK", settle=0.6)
+        keys("BACK", settle=0.9)
         shot(f"b{i:02d}-{name}-back")
     log("================ BATCH done ================")
 

