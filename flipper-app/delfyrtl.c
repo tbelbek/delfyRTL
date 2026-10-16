@@ -2317,7 +2317,8 @@ void session_scene_on_enter(void* context) {
     snprintf(
         buf,
         sizeof(buf),
-        "id %s\nAPs %d\nSTA %d\nPMF %d\nProbe devs %d\nDeauths %d\nCreds %d\n/ext/delfy/sessions/%s/",
+        "id %s\nAPs %d\nSTA %d\nPMF %d\nProbe devs %d\nDeauths %d\nCreds %d\nfw %s caps %s\n/ext/delfy/sessions/%s/\n"
+        "github.com/tbelbek/delfyRTL",
         delfy_session_id,
         sess_wifis,
         sess_stas,
@@ -2325,6 +2326,8 @@ void session_scene_on_enter(void* context) {
         sess_probes,
         sess_deauth,
         sess_creds,
+        app->fw_version[0] ? app->fw_version : "-",
+        app->fw_caps[0] ? app->fw_caps : "-",
         delfy_session_id);
     widget_add_text_scroll_element(app->widget, 0, 14, 128, 50, buf);
     char body[256];

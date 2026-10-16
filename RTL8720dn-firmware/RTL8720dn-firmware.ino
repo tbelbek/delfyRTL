@@ -1255,7 +1255,11 @@ static void pmkid_clientless(int ch, const uint8_t* bssid, const char* ssid) {
   memcpy(auth + 4, bssid, 6);
   memcpy(auth + 10, sta, 6);
   memcpy(auth + 16, bssid, 6);
-  auth[26] = 0x01;   // auth seq number = 1
+  // The auth body is algorithm (u16 LE) at 26 then sequence (u16 LE) at 28. This used to write
+  // 0x01 into the algorithm field, i.e. ask for shared-key authentication with a zero sequence -
+  // which is not what an open network expects, so the AP should have rejected it (and many do).
+  auth[26] = 0x00; auth[27] = 0x00;   // auth algorithm: open system
+  auth[28] = 0x01; auth[29] = 0x00;   // auth sequence: 1
   wifi_tx_raw_frame(auth, 30);
   delay(30);
   // Association request (ESS + Privacy, SSID + rates + RSN WPA2-PSK/CCMP)
@@ -2197,6 +2201,24 @@ void loop() {
       wext_set_channel(WLAN0_NAME, 6);   // DIAG: raw TX only completes on a tuned channel
       int n = tx_raw_hex(hex.c_str());
       String r = "TXRAW:" + String((unsigned)n);
+      Serial.println(r); Serial1.println(r);
+    }else if(readString.substring(0,4)=="CHAN"){
+      // F3 diag: CHAN <n> -> tune the radio and report what it actually did.
+      // Everything that transmits (deauth/CSA/BTM/beacon) only completes when the radio is tuned
+      // to the target's channel, and wext_set_channel() silently ignores a channel the current
+      // band table does not contain. So "does 5 GHz injection work?" cannot be answered from the
+      // FAP side - the channel has to be read back, together with the band the SDK thinks it is
+      // on. got != req means the request was refused (5 GHz not available on this part/band table).
+      int ch = readString.substring(5).toInt();
+      if(ch < 1 || ch > 196) ch = 1;
+      if(apActive) destroyAP();
+      int setres = wext_set_channel(WLAN0_NAME, ch);
+      delay(50);
+      int got = -1;
+      int getres = wext_get_channel(WLAN0_NAME, &got);
+      String r = String("CHAN:req=") + String(ch) + " got=" + String(got) +
+                 " set=" + String(setres) + " get=" + String(getres) +
+                 " band=" + String(wifi_get_band_type());
       Serial.println(r); Serial1.println(r);
     }else if(readString.substring(0,8)=="TXBEACON"){
       // DIAG (B6 fix): TXBEACON <typehex> <count> [ssid] -> raw beacon frames with a settable
