@@ -1864,6 +1864,7 @@ void loop() {
       // C1: read-only status (a bare "TRAP" means "trap on", so a query needs its own name).
       String r = String("TRAPSTAT:") + (trap_on ? "on" : "off") + " ch=" + String(karma_chan) +
                  " ap=" + String(apActive ? trap_ssid : "-") +
+                 " portal=" + String(portal) +
                  " seen=" + String((unsigned)karma_seen_n);
       Serial.println(r); Serial1.println(r);
     }else if(readString.substring(0,4)=="TRAP" && readString.charAt(4)==' '){

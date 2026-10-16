@@ -2534,31 +2534,69 @@ static void karma_render(delfyRTL* app) {
     widget_add_string_element(
         app->widget, 64, 2, AlignCenter, AlignTop, FontPrimary, karma_trap ? "TRAP" : "KARMA");
     int n = karma_list[0] ? atoi(karma_list) : 0;
-    char hdr[40];
+    char hdr[48];
+    if(karma_trap) {
+        // C1: which portal the cloned AP will serve - cycled with LEFT/RIGHT on this screen.
+        snprintf(hdr, sizeof(hdr), "Portal: %.14s", captive_portals[app->captivePortal]);
+        widget_add_string_element(app->widget, 64, 13, AlignCenter, AlignTop, FontSecondary, hdr);
+    }
     snprintf(hdr, sizeof(hdr), "%d SSID%s answered", n, n == 1 ? "" : "s");
-    widget_add_string_element(app->widget, 64, 14, AlignCenter, AlignTop, FontSecondary, hdr);
+    widget_add_string_element(
+        app->widget, 64, karma_trap ? 22 : 14, AlignCenter, AlignTop, FontSecondary, hdr);
+    int y = karma_trap ? 31 : 24;
     if(karma_trap && trap_state[0]) {
         char ap[40];
         snprintf(ap, sizeof(ap), "AP: %.24s", trap_state);
-        widget_add_string_element(app->widget, 64, 24, AlignCenter, AlignTop, FontSecondary, ap);
+        widget_add_string_element(app->widget, 64, y, AlignCenter, AlignTop, FontSecondary, ap);
+        y += 9;
     }
     char body[192];
     int o = 0;
     const char* q = strchr(karma_list, '|');
-    while(q && o < 130) {
+    while(q && o < 110) {
         const char* e = strchr(q + 1, '|');
         int l = e ? (int)(e - q - 1) : (int)strlen(q + 1);
         if(l > 0) o += snprintf(body + o, sizeof(body) - (size_t)o, "%.*s\n", l, q + 1);
         q = e;
     }
     if(o > 0) {
-        widget_add_string_multiline_element(app->widget, 64, 34, AlignCenter, AlignTop, FontSecondary, body);
+        widget_add_string_multiline_element(app->widget, 64, y, AlignCenter, AlignTop, FontSecondary, body);
     } else if(!(karma_trap && trap_state[0])) {
         widget_add_string_element(
-            app->widget, 64, 30, AlignCenter, AlignTop, FontSecondary, "no probes seen yet");
+            app->widget, 64, y + 2, AlignCenter, AlignTop, FontSecondary, "waiting for probes");
     }
-    widget_add_string_element(app->widget, 64, 54, AlignCenter, AlignTop, FontSecondary, "BACK to stop");
+    widget_add_string_element(
+        app->widget,
+        64,
+        54,
+        AlignCenter,
+        AlignTop,
+        FontSecondary,
+        karma_trap ? "< >:portal  BACK:stop" : "BACK to stop");
     view_dispatcher_switch_to_view(app->view_dispatcher, beaconInfoView);
+}
+
+// C1: LEFT/RIGHT picks the portal the cloned AP will serve; OK opens the SD portal browser so a
+// custom .html can be loaded (that sets the Custom portal and sends PORTAL 6 to the board).
+// NOTE: do not redraw here. Touching the active view from inside its own input callback
+// (widget_reset + view_dispatcher_switch_to_view) crashed the Flipper hard - the redraw goes
+// through a custom event so it happens between frames instead.
+static bool karma_input_callback(InputEvent* event, void* context) {
+    delfyRTL* app = context;
+    if(!app || event->type != InputTypeShort || !karma_trap) return false;
+    if(event->key == InputKeyLeft || event->key == InputKeyRight) {
+        int i = app->captivePortal;
+        i = (event->key == InputKeyRight) ? (i + 1) : (i - 1 + CAPTIVE_PORTAL_SIZE);
+        app->captivePortal = i % CAPTIVE_PORTAL_SIZE;
+        delfy_send_portal_sel(app);
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_KARMA);
+        return true;
+    }
+    if(event->key == InputKeyOk && app->captivePortal == 6) {
+        scene_manager_next_scene(app->scene_manager, portalListScene);
+        return true;
+    }
+    return false;
 }
 
 void karma_scene_on_enter(void* context) {
@@ -2568,6 +2606,11 @@ void karma_scene_on_enter(void* context) {
     char cmd[32];
     snprintf(cmd, sizeof(cmd), karma_trap ? "TRAP 1 %d\n" : "KARMA 1 %d\n", delfy_def_ch());
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    if(karma_trap) {
+        // Make sure the board holds the chosen portal before any clone starts.
+        delfy_send_portal_sel(app);
+        view_set_input_callback(widget_get_view(app->widget), karma_input_callback);
+    }
     karma_render(app);
     uart_helper_send(app->uart_helper, "KARMALIST\n", 10);
     furi_timer_start(app->karmaTimer, 1500);
@@ -2590,6 +2633,8 @@ bool karma_scene_on_event(void* context, SceneManagerEvent event) {
 void karma_scene_on_exit(void* context) {
     delfyRTL* app = context;
     furi_timer_stop(app->karmaTimer);
+    // The widget view is shared with the beacon screens, so drop our key handler again.
+    view_set_input_callback(widget_get_view(app->widget), NULL);
     // Trap also owns the softAP, so TRAP 0 tears that down too.
     uart_helper_send(app->uart_helper, karma_trap ? "TRAP 0\n" : "KARMA 0\n", karma_trap ? 7 : 8);
 }
@@ -3987,6 +4032,11 @@ static delfyRTL* app_alloc() {
     view_dispatcher_add_view(app->view_dispatcher, loadingView, loading_get_view(app->loading));
 
     app->widget = widget_alloc();
+    // The widget view is registered for several scenes (wifiInfo/evilCreds/beaconInfo/...) and
+    // now also receives input (C1 portal picker). Without a context those callbacks get NULL as
+    // their context and dereferencing it hard-crashes the Flipper - which is exactly what
+    // happened the first time LEFT/RIGHT was pressed on the Trap screen.
+    view_set_context(widget_get_view(app->widget), app);
     view_dispatcher_add_view(app->view_dispatcher, wifiInfoView, widget_get_view(app->widget));
     view_dispatcher_add_view(app->view_dispatcher, evilCredsView, widget_get_view(app->widget));
     view_dispatcher_add_view(app->view_dispatcher, beaconInfoView, widget_get_view(app->widget));
