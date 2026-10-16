@@ -362,6 +362,10 @@ typedef enum {
 #define DELFY_EVT_INFO_EDIT 0x200A
 #define DELFY_EVT_INFO_DEAUTH 0x200B
 #define DELFY_EVT_INFO_EVIL 0x200C
+// AP config: the list's enter callback used to set the text input up and switch to it inline.
+// Same "view work inside a view callback" shape as DELFY_EVT_INFO_* - defer it to the scene.
+#define DELFY_EVT_AP_EDIT_NAME 0x200D
+#define DELFY_EVT_AP_EDIT_PASSWORD 0x200E
 // B1: raw payload of the last KARMALIST reply ("<n>|ssid|ssid|..."), rendered by the KARMA scene.
 static char karma_list[192];
 // C1: same scene drives both modes - plain KARMA (answer probes) and Trap (clone the network for
@@ -3654,22 +3658,12 @@ void config_ap_change_call_back(void* context, uint32_t index) {
     delfyRTL* app = context;
     char cadena[100] = "";
     if((int)index == app->ap_idx_name) {
-        text_input_reset(app->text_input);
-        text_input_set_header_text(app->text_input, "Acces Point Name");
-        text_input_set_result_callback(
-            app->text_input, config_ap_scene_on_enter, app, app->ssidAP, app->ssidAPLength, true);
-        view_dispatcher_switch_to_view(app->view_dispatcher, apNameTextInputView);
+        // This is the variable item list's ENTER callback, so anything that touches views here runs
+        // inside the list's own dispatch. Post the transition instead; config_ap_scene_on_event
+        // performs it between frames.
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_AP_EDIT_NAME);
     } else if((int)index == app->ap_idx_pass) {
-        text_input_reset(app->text_input);
-        text_input_set_header_text(app->text_input, "Acces Point Password");
-        text_input_set_result_callback(
-            app->text_input,
-            config_ap_scene_on_enter,
-            app,
-            app->passwordAP,
-            app->passwordAPLength,
-            true);
-        view_dispatcher_switch_to_view(app->view_dispatcher, apPasswordTextInputView);
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_AP_EDIT_PASSWORD);
     } else if((int)index == app->ap_idx_load) {
         scene_manager_next_scene(app->scene_manager, portalListScene); // pick .html from /ext/delfy/portals
     } else if((int)index == app->ap_idx_start) {
@@ -3765,6 +3759,30 @@ bool config_ap_scene_on_event(void* context, SceneManagerEvent event) {
     switch(event.type) {
     case SceneManagerEventTypeCustom:
         switch(event.event) {
+        case DELFY_EVT_AP_EDIT_NAME:
+            text_input_reset(app->text_input);
+            text_input_set_header_text(app->text_input, "Acces Point Name");
+            text_input_set_result_callback(
+                app->text_input,
+                config_ap_scene_on_enter,
+                app,
+                app->ssidAP,
+                app->ssidAPLength,
+                true);
+            view_dispatcher_switch_to_view(app->view_dispatcher, apNameTextInputView);
+            return true;
+        case DELFY_EVT_AP_EDIT_PASSWORD:
+            text_input_reset(app->text_input);
+            text_input_set_header_text(app->text_input, "Acces Point Password");
+            text_input_set_result_callback(
+                app->text_input,
+                config_ap_scene_on_enter,
+                app,
+                app->passwordAP,
+                app->passwordAPLength,
+                true);
+            view_dispatcher_switch_to_view(app->view_dispatcher, apPasswordTextInputView);
+            return true;
         case SsidAPInputSceneSaveEvent:
             FURI_LOG_D(TAG, "ssidAPLenght %d", strlen(app->ssidAP));
 
