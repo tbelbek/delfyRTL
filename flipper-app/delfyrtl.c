@@ -2581,6 +2581,8 @@ static void script_timer_cb(void* context) {
     view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_SCRIPT_TICK);
 }
 
+static void karma_button_cb(GuiButtonType result, InputType type, void* context);
+
 static void karma_render(delfyRTL* app) {
     widget_reset(app->widget);
     char title[24];
@@ -2625,45 +2627,39 @@ static void karma_render(delfyRTL* app) {
         AlignCenter,
         AlignTop,
         FontSecondary,
-        karma_trap ? "< >:port ^v:ch BACK:stop" : "^v:ch  BACK to stop");
+        karma_trap ? "ch+ / portal - +" : "centre: channel");
+    if(karma_trap) {
+        widget_add_button_element(app->widget, GuiButtonTypeLeft, "Port-", karma_button_cb, app);
+        widget_add_button_element(app->widget, GuiButtonTypeCenter, "Ch+", karma_button_cb, app);
+        widget_add_button_element(app->widget, GuiButtonTypeRight, "Port+", karma_button_cb, app);
+    } else {
+        widget_add_button_element(app->widget, GuiButtonTypeCenter, "Ch+", karma_button_cb, app);
+    }
     view_dispatcher_switch_to_view(app->view_dispatcher, beaconInfoView);
 }
 
-// C1: LEFT/RIGHT picks the portal the cloned AP will serve; OK opens the SD portal browser so a
-// custom .html can be loaded (that sets the Custom portal and sends PORTAL 6 to the board).
-// NOTE: do not redraw here. Touching the active view from inside its own input callback
-// (widget_reset + view_dispatcher_switch_to_view) crashed the Flipper hard - the redraw goes
-// through a custom event so it happens between frames instead.
-static bool karma_input_callback(InputEvent* event, void* context) {
+// C1: controls for the KARMA/Trap screen, as widget buttons on purpose. Hijacking the widget
+// view's input callback (an earlier attempt) replaces the widget's own button handling for every
+// screen sharing that view - it broke the AP info screen's Edit button, which is the only way
+// into the Tools menu. Buttons keep the widget in charge.
+static void karma_button_cb(GuiButtonType result, InputType type, void* context) {
     delfyRTL* app = context;
-    if(!app || !karma_active || event->type != InputTypeShort) return false;
-    if(event->key == InputKeyUp || event->key == InputKeyDown) {
-        // Channel (both modes): changing it re-arms the responder, so any clone that was up is
-        // gone - that is why trap_state is cleared here.
-        karma_chan_sel += (event->key == InputKeyUp) ? 1 : -1;
+    if(type != InputTypeShort || !karma_active) return;
+    if(karma_trap && (result == GuiButtonTypeLeft || result == GuiButtonTypeRight)) {
+        int i = app->captivePortal;
+        i = (result == GuiButtonTypeRight) ? (i + 1) : (i - 1 + CAPTIVE_PORTAL_SIZE);
+        app->captivePortal = i % CAPTIVE_PORTAL_SIZE;
+        delfy_send_portal_sel(app);
+    } else {
+        // channel (both modes): changing it re-arms the responder, so a clone that was up is gone
+        karma_chan_sel++;
         if(karma_chan_sel > 13) karma_chan_sel = 1;
-        if(karma_chan_sel < 1) karma_chan_sel = 13;
         trap_state[0] = '\0';
         char cmd[32];
         snprintf(cmd, sizeof(cmd), karma_trap ? "TRAP 1 %d\n" : "KARMA 1 %d\n", karma_chan_sel);
         uart_helper_send(app->uart_helper, cmd, strlen(cmd));
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_KARMA);
-        return true;
     }
-    if(!karma_trap) return false;   // the portal picker below only makes sense for Trap
-    if(event->key == InputKeyLeft || event->key == InputKeyRight) {
-        int i = app->captivePortal;
-        i = (event->key == InputKeyRight) ? (i + 1) : (i - 1 + CAPTIVE_PORTAL_SIZE);
-        app->captivePortal = i % CAPTIVE_PORTAL_SIZE;
-        delfy_send_portal_sel(app);
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_KARMA);
-        return true;
-    }
-    if(event->key == InputKeyOk && app->captivePortal == 6) {
-        scene_manager_next_scene(app->scene_manager, portalListScene);
-        return true;
-    }
-    return false;
+    view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_KARMA);
 }
 
 void karma_scene_on_enter(void* context) {
@@ -4272,9 +4268,10 @@ static delfyRTL* app_alloc() {
     // their context and dereferencing it hard-crashes the Flipper - which is exactly what
     // happened the first time LEFT/RIGHT was pressed on the Trap screen.
     view_set_context(widget_get_view(app->widget), app);
-    // Input handler for the KARMA/Trap screen, installed once and gated by a flag (see the note
-    // on karma_active: swapping it per scene crashes the Flipper).
-    view_set_input_callback(widget_get_view(app->widget), karma_input_callback);
+    // NOTE: do NOT view_set_input_callback() on the widget view here. That replaces the widget's
+    // own button handling for every screen that shares this view - which silently broke the AP
+    // info screen's Edit/Deauth/Evil buttons, and Edit is how the Tools menu is reached.
+    // The KARMA/Trap controls are widget buttons instead (see karma_button_cb).
     view_dispatcher_add_view(app->view_dispatcher, wifiInfoView, widget_get_view(app->widget));
     view_dispatcher_add_view(app->view_dispatcher, evilCredsView, widget_get_view(app->widget));
     view_dispatcher_add_view(app->view_dispatcher, beaconInfoView, widget_get_view(app->widget));
