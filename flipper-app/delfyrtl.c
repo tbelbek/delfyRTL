@@ -69,6 +69,8 @@ typedef enum {
     trackerScene,
     browseScene,
     karmaScene,
+    scriptListScene,
+    scriptRunScene,
 
     DelfyRTLSceneCount
 } delfyRTLScene;
@@ -284,6 +286,7 @@ typedef struct delfyRTL {
     View* busyView;      // animated "working" screen (name + spinner, no dolphin)
     FuriTimer* busyTimer;
     FuriTimer* karmaTimer;   // B1: polls the board for caught SSIDs while the KARMA screen is up
+    FuriTimer* scriptTimer;  // F1: advances the SD script engine one step per tick
     char bleAdvHex[80];  // #5: BLE adv hex payload (typed / saved)
     char ibeaconUuid[40];// #6: iBeacon UUID hex (typed)
 } delfyRTL;
@@ -343,6 +346,7 @@ typedef enum {
 #define DELFY_EVT_CREDS 0x2002
 #define DELFY_EVT_KARMA 0x2006
 #define DELFY_EVT_KARMA_POLL 0x2007
+#define DELFY_EVT_SCRIPT_TICK 0x2008
 // B1: raw payload of the last KARMALIST reply ("<n>|ssid|ssid|..."), rendered by the KARMA scene.
 static char karma_list[192];
 // C1: same scene drives both modes - plain KARMA (answer probes) and Trap (clone the network for
@@ -1744,6 +1748,7 @@ static void wifi_hub_cb(void* context, uint32_t index) {
     case 10: browse_reset = true; scene_manager_next_scene(app->scene_manager, browseScene); break;
     case 11: karma_trap = false; scene_manager_next_scene(app->scene_manager, karmaScene); break;
     case 12: karma_trap = true;  scene_manager_next_scene(app->scene_manager, karmaScene); break;
+    case 13: scene_manager_next_scene(app->scene_manager, scriptListScene); break;
     }
 }
 // Re-ask the board for its IDENT while we have not heard back yet. The board answers HELLO
@@ -1791,6 +1796,7 @@ void wifi_hub_scene_on_enter(void* context) {
         submenu_add_item(app->submenu, "KARMA (responder)", 11, wifi_hub_cb, app);
         submenu_add_item(app->submenu, "Trap (KARMA+portal)", 12, wifi_hub_cb, app);
     }
+    submenu_add_item(app->submenu, "Run script", 13, wifi_hub_cb, app);
     view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
 }
 bool wifi_hub_scene_on_event(void* context, SceneManagerEvent event) {
@@ -2517,6 +2523,12 @@ static void karma_timer_cb(void* context) {
     view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_KARMA_POLL);
 }
 
+// F1: same pattern - the tick only posts an event, the scene does the work on the GUI thread.
+static void script_timer_cb(void* context) {
+    delfyRTL* app = context;
+    view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_SCRIPT_TICK);
+}
+
 static void karma_render(delfyRTL* app) {
     widget_reset(app->widget);
     widget_add_string_element(
@@ -2580,6 +2592,216 @@ void karma_scene_on_exit(void* context) {
     furi_timer_stop(app->karmaTimer);
     // Trap also owns the softAP, so TRAP 0 tears that down too.
     uart_helper_send(app->uart_helper, karma_trap ? "TRAP 0\n" : "KARMA 0\n", karma_trap ? 7 : 8);
+}
+
+// --- F1: SD script engine --------------------------------------------------------------
+// /ext/delfy/scripts/*.txt holds one board command per line, "#" comments, and "WAIT <secs>".
+// The app plays them back, so the firmware needs no interpreter at all - it just receives the
+// same commands the menus send. While a script runs the reply popups are not pushed as scenes
+// (see delfyRTL_custom_callback), otherwise they would cover the runner screen.
+#define SCRIPT_DIR "/ext/delfy/scripts"
+#define SCRIPT_FILES_MAX 8
+#define SCRIPT_LINES_MAX 12
+#define SCRIPT_LINE_LEN 64
+static char script_names[SCRIPT_FILES_MAX][48];
+static int script_file_count = 0;
+static char script_name[48] = {0};
+static char script_lines[SCRIPT_LINES_MAX][SCRIPT_LINE_LEN];
+static int script_line_count = 0;
+static int script_pc = 0;
+static int script_wait = 0;
+static bool script_running = false;
+static char script_status[48] = {0};
+
+static const char* SCRIPT_DEMO =
+    "# delfy script - one board command per line, \"WAIT <secs>\" to pause, # = comment\n"
+    "HELLO\n"
+    "WAIT 1\n"
+    "SCAN\n"
+    "WAIT 8\n"
+    "KARMA 1 6\n"
+    "WAIT 6\n"
+    "KARMALIST\n"
+    "WAIT 2\n"
+    "KARMA 0\n";
+
+static void script_seed_demo(void) {
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    storage_common_mkdir(st, SCRIPT_DIR);
+    File* f = storage_file_alloc(st);
+    if(storage_file_open(f, SCRIPT_DIR "/demo.txt", FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        storage_file_write(f, SCRIPT_DEMO, strlen(SCRIPT_DEMO));
+        storage_file_close(f);
+    }
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+}
+
+static void script_list_load(void) {
+    script_file_count = 0;
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    storage_common_mkdir(st, SCRIPT_DIR);
+    File* dir = storage_file_alloc(st);
+    if(storage_dir_open(dir, SCRIPT_DIR)) {
+        FileInfo fi;
+        char name[64];
+        while(storage_dir_read(dir, &fi, name, sizeof(name)) && script_file_count < SCRIPT_FILES_MAX) {
+            if(file_info_is_dir(&fi)) continue;
+            size_t l = strlen(name);
+            if(l > 4 && strcmp(name + l - 4, ".txt") == 0) {
+                strncpy(script_names[script_file_count], name, 47);
+                script_names[script_file_count][47] = '\0';
+                script_file_count++;
+            }
+        }
+        storage_dir_close(dir);
+    }
+    storage_file_free(dir);
+    furi_record_close(RECORD_STORAGE);
+    if(script_file_count == 0) {
+        script_seed_demo();
+        strncpy(script_names[0], "demo.txt", 47);
+        script_names[0][47] = '\0';
+        script_file_count = 1;
+    }
+}
+
+// Load <name> into script_lines, trimming CR/LF and dropping blanks and comments.
+static bool script_load(const char* name) {
+    char path[96];
+    snprintf(path, sizeof(path), SCRIPT_DIR "/%s", name);
+    static char raw[SCRIPT_LINES_MAX * SCRIPT_LINE_LEN + SCRIPT_LINE_LEN];
+    size_t n = 0;
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    File* f = storage_file_alloc(st);
+    if(storage_file_open(f, path, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        n = storage_file_read(f, raw, sizeof(raw) - 1);
+        storage_file_close(f);
+    }
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+    raw[n] = '\0';
+    script_line_count = 0;
+    size_t i = 0;
+    while(i < n && script_line_count < SCRIPT_LINES_MAX) {
+        size_t j = i;
+        while(j < n && raw[j] != '\n') j++;
+        size_t len = j - i;
+        while(len > 0 && (raw[i + len - 1] == '\r' || raw[i + len - 1] == ' ')) len--;
+        if(len > 0 && raw[i] != '#' && len < SCRIPT_LINE_LEN) {
+            memcpy(script_lines[script_line_count], raw + i, len);
+            script_lines[script_line_count][len] = '\0';
+            script_line_count++;
+        }
+        i = j + 1;
+    }
+    return script_line_count > 0;
+}
+
+static void script_render(delfyRTL* app) {
+    widget_reset(app->widget);
+    widget_add_string_element(app->widget, 64, 2, AlignCenter, AlignTop, FontPrimary, "Script");
+    char hdr[48];
+    snprintf(hdr, sizeof(hdr), "%.18s  %d/%d", script_name, script_pc, script_line_count);
+    widget_add_string_element(app->widget, 64, 14, AlignCenter, AlignTop, FontSecondary, hdr);
+    if(script_pc < script_line_count) {
+        char line[40];
+        snprintf(line, sizeof(line), "> %.26s", script_lines[script_pc]);
+        widget_add_string_element(app->widget, 64, 26, AlignCenter, AlignTop, FontSecondary, line);
+    }
+    if(script_status[0]) {
+        widget_add_string_multiline_element(
+            app->widget, 64, 38, AlignCenter, AlignTop, FontSecondary, script_status);
+    }
+    view_dispatcher_switch_to_view(app->view_dispatcher, beaconInfoView);
+}
+
+// Advance one script step. Runs on the scriptTimer tick so the UI keeps painting.
+static void script_step(delfyRTL* app) {
+    if(script_pc >= script_line_count) {
+        furi_timer_stop(app->scriptTimer);
+        script_running = false;
+        snprintf(script_status, sizeof(script_status), "done");
+        script_render(app);
+        return;
+    }
+    if(script_wait > 0) {
+        script_wait--;
+        snprintf(script_status, sizeof(script_status), "wait %ds", script_wait);
+        script_render(app);
+        return;
+    }
+    char cmd[SCRIPT_LINE_LEN + 2];
+    snprintf(cmd, sizeof(cmd), "%s\n", script_lines[script_pc]);
+    if(strncmp(script_lines[script_pc], "WAIT ", 5) == 0) {
+        script_wait = atoi(script_lines[script_pc] + 5);
+        snprintf(script_status, sizeof(script_status), "waiting %ds", script_wait);
+        script_pc++;   // WAIT is consumed now; the next tick counts it down
+        script_render(app);
+        return;
+    }
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    snprintf(script_status, sizeof(script_status), "sent %.26s", script_lines[script_pc]);
+    script_pc++;
+    script_render(app);
+}
+
+static void script_item_cb(void* context, uint32_t index) {
+    delfyRTL* app = context;
+    if((int)index < script_file_count) {
+        snprintf(script_name, sizeof(script_name), "%s", script_names[index]);
+        scene_manager_next_scene(app->scene_manager, scriptRunScene);
+    }
+}
+
+void script_list_scene_on_enter(void* context) {
+    delfyRTL* app = context;
+    script_list_load();
+    submenu_reset(app->submenu);
+    submenu_set_header(app->submenu, "Scripts");
+    for(int i = 0; i < script_file_count; i++)
+        submenu_add_item(app->submenu, script_names[i], (uint32_t)i, script_item_cb, app);
+    view_dispatcher_switch_to_view(app->view_dispatcher, scannedWifisView);
+}
+
+bool script_list_scene_on_event(void* context, SceneManagerEvent event) {
+    UNUSED(context);
+    UNUSED(event);
+    return false;
+}
+
+void script_list_scene_on_exit(void* context) {
+    UNUSED(context);
+}
+
+void script_run_scene_on_enter(void* context) {
+    delfyRTL* app = context;
+    script_pc = 0;
+    script_wait = 0;
+    script_status[0] = '\0';
+    if(!script_load(script_name)) {
+        snprintf(script_status, sizeof(script_status), "empty or unreadable");
+        script_render(app);
+        return;
+    }
+    script_running = true;
+    script_render(app);
+    furi_timer_start(app->scriptTimer, 700);
+}
+
+bool script_run_scene_on_event(void* context, SceneManagerEvent event) {
+    delfyRTL* app = context;
+    if(event.type == SceneManagerEventTypeCustom && event.event == DELFY_EVT_SCRIPT_TICK) {
+        if(script_running) script_step(app);
+        return true;
+    }
+    return false;
+}
+
+void script_run_scene_on_exit(void* context) {
+    delfyRTL* app = context;
+    (void)app;
+    script_running = false;
 }
 
 void help_scene_on_enter(void* context) {
@@ -3245,7 +3467,7 @@ void (*const delfyRTL_scene_on_enter_handlers[])(void*) = {
     wifi_hub_scene_on_enter,
     ble_hub_scene_on_enter,
     ble_adv_lib_scene_on_enter,
-    portal_list_scene_on_enter, settings_scene_on_enter, session_scene_on_enter, gatt_scene_on_enter, blespam_scene_on_enter, tracker_scene_on_enter, browse_scene_on_enter, karma_scene_on_enter};
+    portal_list_scene_on_enter, settings_scene_on_enter, session_scene_on_enter, gatt_scene_on_enter, blespam_scene_on_enter, tracker_scene_on_enter, browse_scene_on_enter, karma_scene_on_enter, script_list_scene_on_enter, script_run_scene_on_enter};
 
 bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     main_menu_scene_on_event,
@@ -3270,7 +3492,7 @@ bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     wifi_hub_scene_on_event,
     ble_hub_scene_on_event,
     ble_adv_lib_scene_on_event,
-    portal_list_scene_on_event, settings_scene_on_event, session_scene_on_event, gatt_scene_on_event, blespam_scene_on_event, tracker_scene_on_event, browse_scene_on_event, karma_scene_on_event};
+    portal_list_scene_on_event, settings_scene_on_event, session_scene_on_event, gatt_scene_on_event, blespam_scene_on_event, tracker_scene_on_event, browse_scene_on_event, karma_scene_on_event, script_list_scene_on_event, script_run_scene_on_event};
 
 void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     main_menu_scene_on_exit,
@@ -3295,7 +3517,7 @@ void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     wifi_hub_scene_on_exit,
     ble_hub_scene_on_exit,
     ble_adv_lib_scene_on_exit,
-    portal_list_scene_on_exit, settings_scene_on_exit, session_scene_on_exit, gatt_scene_on_exit, blespam_scene_on_exit, tracker_scene_on_exit, browse_scene_on_exit, karma_scene_on_exit};
+    portal_list_scene_on_exit, settings_scene_on_exit, session_scene_on_exit, gatt_scene_on_exit, blespam_scene_on_exit, tracker_scene_on_exit, browse_scene_on_exit, karma_scene_on_exit, script_list_scene_on_exit, script_run_scene_on_exit};
 
 static const SceneManagerHandlers delfyRTL_scene_manager_handlers = {
     .on_enter_handlers = delfyRTL_scene_on_enter_handlers,
@@ -3314,11 +3536,13 @@ static bool delfyRTL_custom_callback(void* context, uint32_t custom_event) {
     // falls back into the spinner ("busy <-> result" loop). The ERROR: path can arrive
     // with no busy scene, hence the busy_active guard.
     if(custom_event == DELFY_EVT_RECON) {
+        if(script_running) return true;   // F1: keep result views off the script runner
         if(busy_active) scene_manager_previous_scene(app->scene_manager);
         scene_manager_next_scene(app->scene_manager, pmfScene);
         return true;
     }
     if(custom_event == DELFY_EVT_POPUP) {
+        if(script_running) return true;   // F1: ditto for the per-command popups
         if(busy_active) scene_manager_previous_scene(app->scene_manager);
         scene_manager_next_scene(app->scene_manager, popupScene);
         return true;
@@ -3809,6 +4033,7 @@ static delfyRTL* app_alloc() {
     view_dispatcher_add_view(app->view_dispatcher, busyView, app->busyView);
     app->busyTimer = furi_timer_alloc(busy_timer_cb, FuriTimerTypePeriodic, app);
     app->karmaTimer = furi_timer_alloc(karma_timer_cb, FuriTimerTypePeriodic, app);
+    app->scriptTimer = furi_timer_alloc(script_timer_cb, FuriTimerTypePeriodic, app);
 
     app->uart_helper = uart_helper_alloc();
     uart_helper_set_baud_rate(app->uart_helper, DEVICE_BAUDRATE);
@@ -3833,9 +4058,11 @@ static void app_free(delfyRTL* app) {
     furi_timer_stop(app->timer);
     furi_timer_stop(app->busyTimer);
     furi_timer_stop(app->karmaTimer);
+    furi_timer_stop(app->scriptTimer);
     furi_timer_free(app->timer);
     furi_timer_free(app->busyTimer);
     furi_timer_free(app->karmaTimer);
+    furi_timer_free(app->scriptTimer);
     uart_helper_free(app->uart_helper);
 
     view_dispatcher_remove_view(app->view_dispatcher, mainMenuView);
