@@ -236,7 +236,7 @@ bool uart_helper_read(UartHelper* helper, FuriString* text) {
 void uart_helper_send(UartHelper* helper, const char* data, size_t length) {
     FURI_LOG_D(TAG, __func__);
 
-    FURI_LOG_D(TAG, data);
+    FURI_LOG_D(TAG, "%s", data);
     if(length == 0) {
         length = strlen(data); // Exclude the null character.
         char* buf = malloc(length + 2); // Null and delimiter.

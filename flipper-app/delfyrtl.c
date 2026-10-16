@@ -1118,12 +1118,17 @@ bool info_wifi_scene_on_event(void* context, SceneManagerEvent event) {
     case DELFY_EVT_INFO_DEAUTH:
         FURI_LOG_D(TAG, "%s deauth", __func__);
         if(app->selectedWifi < 0 || app->selectedWifi >= app->wifiCount) return true;
-        if(app->wifiList[app->selectedWifi].deauth == false) {
-            app->wifiList[app->selectedWifi].deauth = true;
-            snprintf(cadena, sizeof(cadena), "DEAUTH %d\n", app->selectedWifi);
-        } else {
-            app->wifiList[app->selectedWifi].deauth = false;
-            snprintf(cadena, sizeof(cadena), "STOP %d\n", app->selectedWifi);
+        {
+            // Send idAP, not selectedWifi: the list is sorted by RSSI here, while the board's
+            // DEAUTH/STOP handlers index their own unsorted scan_results with the number we send.
+            int id = app->wifiList[app->selectedWifi].idAP;
+            if(app->wifiList[app->selectedWifi].deauth == false) {
+                app->wifiList[app->selectedWifi].deauth = true;
+                snprintf(cadena, sizeof(cadena), "DEAUTH %d\n", id);
+            } else {
+                app->wifiList[app->selectedWifi].deauth = false;
+                snprintf(cadena, sizeof(cadena), "STOP %d\n", id);
+            }
         }
         info_wifi_scene_on_enter(app);
         uart_helper_send(app->uart_helper, cadena, strlen(cadena));
@@ -1132,7 +1137,8 @@ bool info_wifi_scene_on_event(void* context, SceneManagerEvent event) {
         FURI_LOG_D(TAG, "%s evil", __func__);
         if(app->selectedWifi < 0 || app->selectedWifi >= app->wifiCount) return true;
         credentials[0] = '\0';
-        snprintf(cadena, sizeof(cadena), "EVIL %d\n", app->selectedWifi);
+        // idAP again - see the DEAUTH case: selectedWifi is a position in the RSSI-sorted list.
+        snprintf(cadena, sizeof(cadena), "EVIL %d\n", app->wifiList[app->selectedWifi].idAP);
         info_wifi_scene_on_enter(app);
         FURI_LOG_D(TAG, "%s", cadena);
         uart_helper_send(app->uart_helper, cadena, strlen(cadena));
@@ -3578,11 +3584,10 @@ void channel_map_scene_on_exit(void* context) {
 
 // Card-grid main menu (2x2) with real vector glyphs for Wi-Fi and Bluetooth.
 static int card_sel = 0;
-// Two cards plus an "About" pill. Exit used to be a fourth card, but BACK already leaves the app
-// (the back handler stops the dispatcher when there is no previous scene), so the card was noise.
-// Help/about is a pill - a rounded button - instead of a card.
-#define CARD_COUNT 3
-static const char* card_labels[CARD_COUNT] = {"Wi-Fi", "BLE", "About"};
+// Just the two radios. Exit was a fourth card, but BACK already leaves the app (the back handler
+// stops the dispatcher when there is no previous scene); the about/help pill went the same way.
+#define CARD_COUNT 2
+static const char* card_labels[CARD_COUNT] = {"Wi-Fi", "BLE"};
 
 static void card_menu_draw(Canvas* canvas, void* model) {
     UNUSED(model);
@@ -3590,7 +3595,7 @@ static void card_menu_draw(Canvas* canvas, void* model) {
     canvas_clear(canvas);
     canvas_set_font(canvas, FontSecondary);
     canvas_draw_str(canvas, 2, 9, "delfyRTL");
-    for(int i = 0; i < 2; i++) {                     // the two cards, side by side
+    for(int i = 0; i < CARD_COUNT; i++) {            // the two cards, side by side
         int x = 3 + i * 62, y = 12;
         bool sel = (i == card_sel);
         if(sel) canvas_draw_box(canvas, x, y, 60, 23);
@@ -3600,29 +3605,17 @@ static void card_menu_draw(Canvas* canvas, void* model) {
         canvas_draw_str(canvas, x + 20, y + 16, card_labels[i]);
         if(sel) canvas_set_color(canvas, ColorBlack);
     }
-    {                                                // the About pill
-        const int px = 28, py = 40, pw = 72, ph = 18;
-        bool sel = (card_sel == 2);
-        if(sel) canvas_draw_rbox(canvas, px, py, pw, ph, 4);
-        else canvas_draw_rframe(canvas, px, py, pw, ph, 4);
-        if(sel) canvas_set_color(canvas, ColorWhite);
-        canvas_draw_str_aligned(
-            canvas, px + pw / 2, py + 5, AlignCenter, AlignTop, card_labels[2]);
-        if(sel) canvas_set_color(canvas, ColorBlack);
-    }
 }
 static bool card_menu_input(InputEvent* event, void* context) {
     delfyRTL* app = context;
     if(event->type != InputTypeShort && event->type != InputTypeRepeat) return false;
     if(event->key == InputKeyLeft || event->key == InputKeyRight || event->key == InputKeyUp ||
        event->key == InputKeyDown) {
-        // one row of three: Wifi, BLE, About
         if(event->key == InputKeyLeft) card_sel = (card_sel + CARD_COUNT - 1) % CARD_COUNT;
         else card_sel = (card_sel + 1) % CARD_COUNT;
     } else if(event->key == InputKeyOk) {
         if(card_sel == 0) scene_manager_next_scene(app->scene_manager, wifiHubScene);
-        else if(card_sel == 1) scene_manager_next_scene(app->scene_manager, bleHubScene);
-        else scene_manager_next_scene(app->scene_manager, helpScene);
+        else scene_manager_next_scene(app->scene_manager, bleHubScene);
     } else {
         return false;
     }
@@ -4337,6 +4330,11 @@ static delfyRTL* app_alloc() {
     app->wifiCount = 0;
     app->menuIndex = 0;
     app->submenuIndex = 0;
+    // rickIndex drives rick[rickIndex] from the animation timer. It used to be first written during
+    // teardown only, so a beacon-mode animation started against whatever malloc left in the field -
+    // and a negative value stays negative under the timer's % 24 (C truncates toward zero), which is
+    // an out-of-bounds icon pointer. Initialise it here.
+    app->rickIndex = 0;
     app->fw_version[0] = '\0';
     app->fw_caps[0] = '\0';
     app->bleAdvHex[0] = '\0';
