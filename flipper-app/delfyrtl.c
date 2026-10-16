@@ -260,7 +260,6 @@ typedef struct delfyRTL {
     int menuIndex;
     TextInput* text_input;
     Widget* widget;
-    Popup* popup;
     char* ssidAP;
     uint8_t ssidAPLength;
     UartHelper* uart_helper;
@@ -2031,9 +2030,21 @@ static void tools_item_callback(void* context, uint32_t index) {
 void tools_menu_scene_on_enter(void* context) {
     delfyRTL* app = context;
     submenu_reset(app->submenu);
+    // The header names the AP the tools are aimed at instead of the board's fw version: the
+    // "Target:" row scrolls out of view as soon as you move down, and on an attack menu you want
+    // to see what you are pointed at at all times. The band marker is there because the same SSID
+    // shows up twice on a dual-band network. The fw version still lives in the session summary.
     char hdr[32];
-    if(app->fw_version[0]) snprintf(hdr, sizeof(hdr), "Tools  fw%s", app->fw_version);
-    else snprintf(hdr, sizeof(hdr), "Tools");
+    if(app->wifiCount > 0 && app->selectedWifi >= 0 && app->selectedWifi < app->wifiCount) {
+        snprintf(
+            hdr,
+            sizeof(hdr),
+            "Tools: %s%.14s",
+            (app->wifiList[app->selectedWifi].chanel > 14) ? "5G|" : "2G|",
+            app->wifiList[app->selectedWifi].APssid);
+    } else {
+        snprintf(hdr, sizeof(hdr), "Tools: no target");
+    }
     submenu_set_header(app->submenu, hdr);
     // Target first, and stable regardless of the caps below: every attack item needs
     // app->selectedWifi, which used to come only from the AP info screen's Edit button.
@@ -3577,14 +3588,17 @@ static void delfy_busy(delfyRTL* app, const char* header, const char* text) {
 
 void popup_scene_on_enter(void* context) {
     delfyRTL* app = context;
-    popup_reset(app->popup);
-    // The 45x42 dolphin sits at the left; the header + message must live in the remaining
-    // right-hand column. The old (0,0,AlignCenter) anchored the text off-screen / under
-    // the icon, so every popup (audit, BadBLE file, Channel hop, ...) showed the dolphin
-    // with no visible text.
-    popup_set_header(app->popup, popupHeader, 87, 5, AlignCenter, AlignTop);
-    popup_set_icon(app->popup, 0, 0, &I_WarningDolphin_45x42);
-    popup_set_text(app->popup, message, 87, 24, AlignCenter, AlignTop);
+    widget_reset(app->widget);
+    // Drawn with the Widget instead of the Popup view: the Popup only has header/icon/text slots,
+    // so every result screen ended with the whole lower half blank. Here the dolphin is centred in
+    // the left column, the header sits above a message that wraps (and scrolls if it is longer
+    // than the box, since the Widget handles that itself), and a footer anchors the bottom.
+    widget_add_icon_element(app->widget, 2, 7, &I_WarningDolphin_45x42);
+    widget_add_string_multiline_element(
+        app->widget, 87, 3, AlignCenter, AlignTop, FontPrimary, popupHeader);
+    widget_add_text_scroll_element(app->widget, 48, 18, 78, 33, message);
+    widget_add_string_element(
+        app->widget, 2, 54, AlignLeft, AlignTop, FontSecondary, "< Back");
     view_dispatcher_switch_to_view(app->view_dispatcher, popupView);
     UNUSED(context);
 }
@@ -4806,8 +4820,10 @@ static delfyRTL* app_alloc() {
     view_dispatcher_add_view(
         app->view_dispatcher, aPmacAddresView, byte_input_get_view(app->byteInput));
 
-    app->popup = popup_alloc();
-    view_dispatcher_add_view(app->view_dispatcher, popupView, popup_get_view(app->popup));
+    // The popup scene draws with the widget (see popup_scene_on_enter), so this slot points at
+    // the widget's view. widget_alloc() already set its context to the Widget, and the popup
+    // scene must not override it (that mistake cost us the AP info screen for three sessions).
+    view_dispatcher_add_view(app->view_dispatcher, popupView, widget_get_view(app->widget));
 
     // Card-grid main menu
     app->cardView = view_alloc();
@@ -4907,7 +4923,6 @@ static void app_free(delfyRTL* app) {
     submenu_free(app->submenu);
     variable_item_list_free(app->variableList);
     byte_input_free(app->byteInput);
-    popup_free(app->popup);
     widget_free(app->widget);
     view_free(app->cardView);
     view_free(app->chanMapView);
