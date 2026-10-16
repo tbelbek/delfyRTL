@@ -686,6 +686,75 @@ static void promisc_sta_cb(unsigned char* buf, unsigned int len, void* ud) {
   if (sta && !(sta[0] & 0x01)) sta_add(sta);           // skip multicast/broadcast
 }
 
+// --- A2: client tracker ----------------------------------------------------------
+// Timeline of the devices seen on a channel: any probe/auth/assoc/data frame identifies a device,
+// and we keep MAC -> first seen, last seen, how often. This SDK's promisc callback carries no
+// RSSI, so v1 tracks presence and timing only. TRACK <chan> [secs] streams
+// CLI:<mac>|<first-s>|<last-s>|<count> and ends with CLIDONE:<n>.
+#define CLI_MAX 10
+typedef struct { uint8_t mac[6]; uint16_t first; uint16_t last; uint16_t count; } cli_t;
+static cli_t cli_list[CLI_MAX];
+static volatile uint8_t cli_n = 0;
+static volatile bool cli_on = false;
+static uint32_t cli_base = 0;      // millis() at the window start; times are stored in seconds
+
+static void cli_add(const uint8_t* mac) {
+  uint16_t now = (uint16_t)((millis() - cli_base) / 1000UL);
+  for(uint8_t i = 0; i < cli_n; i++) {
+    if(!memcmp(cli_list[i].mac, mac, 6)) {
+      cli_list[i].last = now;
+      if(cli_list[i].count < 65535) cli_list[i].count++;
+      return;
+    }
+  }
+  if(cli_n >= CLI_MAX) return;
+  memcpy(cli_list[cli_n].mac, mac, 6);
+  cli_list[cli_n].first = now;
+  cli_list[cli_n].last = now;
+  cli_list[cli_n].count = 1;
+  cli_n++;
+}
+
+static void promisc_cli_cb(unsigned char* buf, unsigned int len, void* ud) {
+  (void)ud;
+  if(!cli_on || len < 24) return;
+  uint8_t ftype = (buf[0] >> 2) & 3;
+  uint8_t st = (buf[0] >> 4) & 0xF;
+  uint8_t tods = buf[1] & 0x01, fromds = (buf[1] >> 1) & 0x01;
+  const uint8_t *a1 = buf + 4, *a2 = buf + 10;
+  const uint8_t* dev = NULL;
+  if(ftype == 0) {                                  // mgmt
+    if(st == 4 || st == 11 || st == 0 || st == 2) dev = a2;   // probe-req/auth/assoc/reassoc
+  } else if(ftype == 2) {                           // data
+    if(tods && !fromds) dev = a2;
+    else if(!tods && fromds) dev = a1;
+    else return;                                    // IBSS / WDS - ambiguous
+  } else return;
+  if(dev && !(dev[0] & 0x01)) cli_add(dev);         // skip multicast/broadcast
+}
+
+static void cli_stream(int ch) {
+  for(uint8_t i = 0; i < cli_n; i++) {
+    char line[80];
+    snprintf(
+      line,
+      sizeof(line),
+      "CLI:%02X:%02X:%02X:%02X:%02X:%02X|%u|%u|%u",
+      cli_list[i].mac[0],
+      cli_list[i].mac[1],
+      cli_list[i].mac[2],
+      cli_list[i].mac[3],
+      cli_list[i].mac[4],
+      cli_list[i].mac[5],
+      (unsigned)cli_list[i].first,
+      (unsigned)cli_list[i].last,
+      (unsigned)cli_list[i].count);
+    Serial.println(line); Serial1.println(line);
+  }
+  String fin = "CLIDONE: ch=" + String(ch) + " n=" + String((unsigned)cli_n);
+  Serial.println(fin); Serial1.println(fin);
+}
+
 static void sta_stream(int ch) {
   for (uint8_t i = 0; i < sta_n; i++) {
     char line[64];
@@ -877,7 +946,7 @@ static uint8_t karma_client[6] = {0};
 static bool trap_on = false;
 static bool trap_armed = true;
 static char trap_ssid[33] = {0};
-#define KARMA_SEEN_MAX 16
+#define KARMA_SEEN_MAX 8
 static char karma_seen[KARMA_SEEN_MAX][33];
 static int karma_seen_n = 0;
 
@@ -2152,6 +2221,24 @@ void loop() {
       for(int i=0;i<secs;i++) delay(1000);
       wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
       pmf_stream(ch);
+    }else if(readString.substring(0,5)=="TRACK"){
+      // A2: TRACK <chan> [secs] - device timeline for a channel (see promisc_cli_cb).
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int ch = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1).toInt() : 6;
+      int secs = (s2 > 0) ? readString.substring(s2+1, readString.length()-1).toInt() : 30;
+      if(ch < 1 || ch > 165) ch = 6;
+      if(secs < 2 || secs > 120) secs = 30;
+      if(apActive) destroyAP();
+      cli_n = 0;
+      cli_on = true;
+      cli_base = millis();
+      wext_set_channel(WLAN0_NAME, ch);
+      wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2*/, promisc_cli_cb, 0);
+      for(int i=0;i<secs;i++) delay(1000);
+      wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
+      cli_on = false;
+      cli_stream(ch);
     }else if(readString.substring(0,7)=="STASCAN"){
       // P4: list stations seen for a BSSID. Args: STASCAN <chan> [secs] [bssid-12hex]
       int s1 = readString.indexOf(' ');

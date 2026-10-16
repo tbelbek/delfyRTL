@@ -338,6 +338,7 @@ typedef enum {
 #define TOOL_PROBE   14
 #define TOOL_IDS     15
 #define TOOL_CSA     16
+#define TOOL_TRACK   17
 
 // Deferred GUI events posted from the UART worker thread (GUI must run on the GUI thread).
 #define DELFY_EVT_RECON 0x2000
@@ -1297,6 +1298,18 @@ static bool delfy_has_cap(delfyRTL* app, char cap) {    if(app->fw_caps[0] == '\
 // C: append the selected AP to the board's multi-target deauth list.
 // B2: spoof channel-switch announcements from the selected AP so its clients hop away with no
 // deauth at all. Only clients without protected CSA (i.e. not PMF/WPA3-required) obey it.
+// A2: device timeline for a channel (MAC / first seen / last seen / frames). The board streams
+// CLI:<mac>|<first>|<last>|<count> and ends with CLIDONE:<n>.
+static void delfy_track(delfyRTL* app) {
+    int ch = delfy_def_ch();
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "TRACK %d 30\n", ch);
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    recon_text[0] = '\0';
+    snprintf(recon_title, sizeof(recon_title), "Client tracker");
+    { char b[48]; snprintf(b, sizeof(b), "ch %d, 30 s", ch); delfy_busy_ex(app, "Clients", b, 32); }
+}
+
 static void delfy_csa(delfyRTL* app) {
     int ch;
     char hex[13];
@@ -1907,6 +1920,7 @@ static void tools_item_callback(void* context, uint32_t index) {
     case TOOL_PROBE: delfy_start_probe(app); break;
     case TOOL_IDS: delfy_start_ids(app); break;
     case TOOL_CSA: delfy_csa(app); break;
+    case TOOL_TRACK: delfy_track(app); break;
     case TOOL_PMKID: delfy_start_pmkid(app, false); break;
     case TOOL_PKGRAB: delfy_start_pmkid(app, true); break;
     case TOOL_PKCLIENT: delfy_start_pmkid_clientless(app); break;
@@ -1952,6 +1966,7 @@ void tools_menu_scene_on_enter(void* context) {
         submenu_add_item(app->submenu, "Deauth list: STOP", TOOL_DASTOP, tools_item_callback, app);
         submenu_add_item(app->submenu, "Deauth IDS", TOOL_IDS, tools_item_callback, app);
         submenu_add_item(app->submenu, "CSA attack (this AP)", TOOL_CSA, tools_item_callback, app);
+        submenu_add_item(app->submenu, "Client tracker", TOOL_TRACK, tools_item_callback, app);
     }
     submenu_add_item(app->submenu, "Channel hop on/off", TOOL_HOP, tools_item_callback, app);
     submenu_add_item(app->submenu, "Stop / clear", TOOL_STOP, tools_item_callback, app);
@@ -3935,6 +3950,13 @@ void uart_process_line(FuriString* line, void* context) {
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "DEAUTH:", 7) == 0) {
         recon_append(furi_string_get_cstr(line) + 7);
+    } else if(strncmp(furi_string_get_cstr(line), "CLIDONE:", 8) == 0) {
+        // A2: the board finished the tracker window - keep the timeline in the session folder.
+        snprintf(recon_title, sizeof(recon_title), "Client tracker");
+        delfy_save_scan("clients", recon_text);
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
+    } else if(strncmp(furi_string_get_cstr(line), "CLI:", 4) == 0) {
+        recon_append(furi_string_get_cstr(line) + 4);
     } else if(strncmp(furi_string_get_cstr(line), "PROBEDONE:", 10) == 0) {
         snprintf(recon_title, sizeof(recon_title), "Probe / PNL");
         const char* s = strstr(furi_string_get_cstr(line), "n=");
