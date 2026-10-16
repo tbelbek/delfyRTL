@@ -77,9 +77,11 @@ def nav_to_tools():
     shot("b00-tools")
 
 
-# (idx, name, wait_s)
+# (idx, name, wait_s) - idx is the ROW in the Tools menu. The menu now starts with the
+# "Target: <ssid>" picker, so every row below it is one further down than it used to be.
 TOOLS = {
-    0: ("Capture_HS_passive", 14),
+    0: ("Target_AP", 2),
+    14: ("Capture_HS_passive", 14),
     1: ("Grab_HS_deauth", 24),
     2: ("PMKID_passive", 12),
     3: ("PMKID_grab_deauth", 16),
