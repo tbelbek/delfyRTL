@@ -75,6 +75,42 @@ def nav_to_tools():
     shot("b00-tools")
 
 
+# (idx, name, wait_s) - idx is the ROW in the Tools menu, in insertion order:
+#   row 0     Target: <ssid> picker (always present)
+#   rows 1-7  cap H (capture / grab / PMKID / audit)
+#   rows 8-10 cap S (PMF scan / STASCAN / probe sniff)
+#   rows 11-16 cap D (deauth list, IDS, CSA, client tracker)
+#   row 17    cap T (BTM)
+#   rows 18-19 channel hop / stop (always present)
+#   rows 20-21 cap F (auth flood, assoc+sleep flood)
+# A board whose IDENT advertises fewer caps shows fewer rows, so the numbers shift - check the
+# b00-tools screenshot (or the caps in the boot log) before trusting a row number.
+TOOLS = {
+    0: ("Target_AP", 2),
+    1: ("Capture_HS_passive", 14),
+    2: ("Grab_HS_deauth", 24),
+    3: ("PMKID_passive", 12),
+    4: ("PMKID_grab_deauth", 16),
+    5: ("PMKID_clientless", 14),
+    6: ("Capture_STOP", 2),
+    7: ("Guided_audit", 20),
+    8: ("PMF_WPA3_scan", 12),
+    9: ("STASCAN", 12),
+    10: ("Probe_sniff_PNL", 12),
+    11: ("Deauth_list_addAP", 3),
+    12: ("Deauth_list_RUN", 6),
+    13: ("Deauth_list_STOP", 3),
+    14: ("Deauth_IDS", 12),
+    15: ("CSA_attack", 4),
+    16: ("Client_tracker", 32),
+    17: ("BTM_attack", 4),
+    18: ("Channel_hop", 3),
+    19: ("Stop_clear", 3),
+    20: ("Auth_flood", 8),
+    21: ("Assoc_sleep_flood", 8),
+}
+
+
 def main():
     start = int(sys.argv[1]) if len(sys.argv) > 1 else 2
     count = int(sys.argv[2]) if len(sys.argv) > 2 else 4
