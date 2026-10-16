@@ -47,12 +47,21 @@ def shot(name):
     return ok
 
 
-def keys(*ks, settle=1.0):
-    args = [PY, os.path.join(HERE, "flipctl.py"), "drive", *ks, "--settle", str(settle)]
-    try:
-        subprocess.run(args, capture_output=True, text=True, timeout=45)
-    except subprocess.TimeoutExpired:
-        log("    drive TIMEOUT")
+def keys(*ks, settle=1.0, batch=5):
+    """Send a key sequence in small batches, each in its own RPC session.
+
+    Long bursts get lost: 25 DOWNs in one call dropped 4-5 of them on the review unit even at 1.0-1.2
+    seconds per key, while the same keys in batches of five all arrive. The device's input queue does
+    not keep up, so batching - not the settle - is what makes navigation reliable.
+    """
+    ks = list(ks)
+    for i in range(0, len(ks), batch):
+        args = [PY, os.path.join(HERE, "flipctl.py"), "drive", *ks[i : i + batch],
+                "--settle", str(settle)]
+        try:
+            subprocess.run(args, capture_output=True, text=True, timeout=90)
+        except subprocess.TimeoutExpired:
+            log("    drive TIMEOUT")
 
 
 def nav_to_tools():
