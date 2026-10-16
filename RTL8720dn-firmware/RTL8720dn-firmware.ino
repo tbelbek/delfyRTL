@@ -2268,6 +2268,22 @@ void loop() {
       int n = tx_raw_hex(hex.c_str());
       String r = "TXRAW:" + String((unsigned)n);
       Serial.println(r); Serial1.println(r);
+    }else if(readString.substring(0,7)=="CHANSET"){
+      // Which channels does this build's channel set actually contain?
+      // wext_set_channel() accepts a 5 GHz number and wext_get_channel() reads it back, but a raw
+      // TX on a channel the set does not contain never completes - the SDK spins inside its TX path
+      // and the board goes silent. wifi_get_ch_from_channel_set() asks the driver directly (it
+      // prints "channel supported/not supported" itself), and wifi_get_channel_plan() says which
+      // plan is being consulted. Together they decide whether 5 GHz is a channel-plan problem or
+      // something further down. No TX here, so this is safe to run on any channel.
+      uint8_t plan = 0xFF;
+      wifi_get_channel_plan(&plan);
+      int ch = readString.substring(8).toInt();
+      if(ch < 1 || ch > 196) ch = 1;
+      int in_set = wifi_get_ch_from_channel_set((uint8_t)ch);
+      String r = String("CHANSET:req=") + String(ch) + " plan=0x" + String((unsigned)plan, HEX) +
+                 " in_set=" + String(in_set) + " band=" + String(wifi_get_band_type());
+      Serial.println(r); Serial1.println(r);
     }else if(readString.substring(0,4)=="CHAN"){
       // F3 diag: CHAN <n> -> tune the radio and report what it actually did.
       // Everything that transmits (deauth/CSA/BTM/beacon) only completes when the radio is tuned
