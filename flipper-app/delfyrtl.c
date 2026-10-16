@@ -3593,16 +3593,18 @@ static void card_menu_draw(Canvas* canvas, void* model) {
     UNUSED(model);
     if(card_sel < 0 || card_sel >= CARD_COUNT) card_sel = 0;
     canvas_clear(canvas);
-    canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str(canvas, 2, 9, "delfyRTL");
-    for(int i = 0; i < CARD_COUNT; i++) {            // the two cards, side by side
-        int x = 3 + i * 62, y = 12;
+    // No title line: the two cards fill the whole screen. Icon above, big label under it.
+    for(int i = 0; i < CARD_COUNT; i++) {
+        int x = 3 + i * 62, y = 1, w = 60, h = 61;
         bool sel = (i == card_sel);
-        if(sel) canvas_draw_box(canvas, x, y, 60, 23);
-        else canvas_draw_frame(canvas, x, y, 60, 23);
+        if(sel) canvas_draw_box(canvas, x, y, w, h);
+        else canvas_draw_frame(canvas, x, y, w, h);
         if(sel) canvas_set_color(canvas, ColorWhite);
-        canvas_draw_icon(canvas, x + 3, y + 3, (i == 0) ? &I_wifi : &I_bluetooth);
-        canvas_draw_str(canvas, x + 20, y + 16, card_labels[i]);
+        canvas_draw_icon(canvas, x + 24, y + 16, (i == 0) ? &I_wifi : &I_bluetooth);
+        canvas_set_font(canvas, FontPrimary);
+        canvas_draw_str_aligned(
+            canvas, x + w / 2, y + 36, AlignCenter, AlignTop, card_labels[i]);
+        canvas_set_font(canvas, FontSecondary);
         if(sel) canvas_set_color(canvas, ColorBlack);
     }
 }
