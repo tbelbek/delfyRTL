@@ -4541,7 +4541,12 @@ static void app_free(delfyRTL* app) {
     furi_timer_free(app->karmaTimer);
     furi_timer_free(app->scriptTimer);
     uart_helper_free(app->uart_helper);
-    furi_message_queue_free(app->uart_lines);
+    // The line queue is deliberately NOT freed here: view_dispatcher_free() below drains queued
+    // events ("Some events whre not processed") and can still run the 1 ms tick registered on it,
+    // which reads app->uart_lines. Freeing it first is a NULL dereference on exit - which is
+    // exactly what the device reported ("Flipper crashed and was rebooted / NULL pointer
+    // dereference"). One queue per run is a leak the process takes with it.
+    // furi_message_queue_free(app->uart_lines);
 
     view_dispatcher_remove_view(app->view_dispatcher, mainMenuView);
     view_dispatcher_remove_view(app->view_dispatcher, scannedWifisView);
