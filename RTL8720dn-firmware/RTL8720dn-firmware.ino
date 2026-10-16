@@ -462,6 +462,32 @@ void setup() {
 String ssid="";
 uint32_t current_num = 0;
 
+// --- F5: macro recording ---------------------------------------------------------------
+// The board sees every command the app sends, in order, so it can record them itself. The app
+// later fetches the list (RECFETCH) and saves it as a runnable F1 script, which means a macro is
+// produced just by using the app normally. Housekeeping traffic (polls, handshakes, the
+// recorder's own commands) is filtered out so the script only contains real actions.
+#define REC_MAX 20
+#define REC_LINE_LEN 48
+static bool rec_on = false;
+static char rec_lines[REC_MAX][REC_LINE_LEN];
+static int rec_n = 0;
+
+static void rec_note(const String& cmd) {
+  if(!rec_on || rec_n >= REC_MAX) return;
+  String c = cmd;
+  c.replace("\n", "");
+  if(c.length() == 0 || c.length() >= REC_LINE_LEN - 1) return;
+  if(c.startsWith("REC")) return;          // the recorder's own commands
+  if(c.startsWith("HELLO") || c.startsWith("PING")) return;
+  if(c.startsWith("KARMALIST") || c.startsWith("TRAPSTAT") || c.startsWith("PORTALHASH")) return;
+  strncpy(rec_lines[rec_n], c.c_str(), REC_LINE_LEN - 1);
+  rec_lines[rec_n][REC_LINE_LEN - 1] = '\0';
+  rec_n++;
+  Serial1.print("RECN:");
+  Serial1.println(rec_n);                  // live count, so the app can show progress
+}
+
 // --- Promisc spike (GATE test): does the BW16 driver actually deliver data/EAPOL
 // frames to the promisc callback, or only mgmt? If data+EAPOL flow, handshake/PMKID/
 // station-enum ports are feasible; if not, they're off the table. RTW_PROMISC_ENABLE
@@ -1259,6 +1285,7 @@ void loop() {
   while (Serial1.available()) { readString += (char)Serial1.read(); }
   while (Serial.available())   { readString += (char)Serial.read(); }
   if(readString.length() > 0 && readString.charAt(readString.length() - 1) == '\n'){
+    rec_note(readString);   // F5: capture actions for macro recording (filtered inside)
     if(readString.substring(0,4)=="SCAN"){
       if(apActive)
         destroyAP();
@@ -1860,6 +1887,27 @@ void loop() {
       for(int i=0;i<secs;i++) delay(1000);
       wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
       probe_stream(ch);
+    }else if(readString.substring(0,8)=="RECFETCH"){
+      // F5: dump the recorded actions as REC:<line>, then RECDONE:<n> so the app can save them.
+      for(int i = 0; i < rec_n; i++) {
+        String r = String("REC:");
+        r += rec_lines[i];
+        Serial.println(r); Serial1.println(r);
+      }
+      String d = "RECDONE:" + String((unsigned)rec_n);
+      Serial.println(d); Serial1.println(d);
+    }else if(readString.substring(0,8)=="RECCLEAR"){
+      rec_n = 0;
+      Serial.println("RECCLEAR:ok"); Serial1.println("RECCLEAR:ok");
+    }else if(readString.substring(0,3)=="REC" && readString.charAt(3)==' '){
+      // F5: REC <0|1> - record the commands the app sends. The charAt guard keeps RECFETCH and
+      // RECCLEAR out of here (a bare "REC" prefix would otherwise swallow them).
+      int s1 = readString.indexOf(' ');
+      int on = (s1 > 0) ? readString.substring(s1+1, readString.length()-1).toInt() : 1;
+      rec_on = (on != 0);
+      if(rec_on) rec_n = 0;      // a fresh recording always starts clean
+      String r = String("RECCTL:") + (rec_on ? "on" : "off") + " n=" + String((unsigned)rec_n);
+      Serial.println(r); Serial1.println(r);
     }else if(readString.substring(0,8)=="TRAPSTAT"){
       // C1: read-only status (a bare "TRAP" means "trap on", so a query needs its own name).
       String r = String("TRAPSTAT:") + (trap_on ? "on" : "off") + " ch=" + String(karma_chan) +

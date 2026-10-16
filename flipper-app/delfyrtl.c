@@ -71,6 +71,7 @@ typedef enum {
     karmaScene,
     scriptListScene,
     scriptRunScene,
+    recordScene,
 
     DelfyRTLSceneCount
 } delfyRTLScene;
@@ -347,11 +348,16 @@ typedef enum {
 #define DELFY_EVT_KARMA 0x2006
 #define DELFY_EVT_KARMA_POLL 0x2007
 #define DELFY_EVT_SCRIPT_TICK 0x2008
+#define DELFY_EVT_REC_REFRESH 0x2009
 // B1: raw payload of the last KARMALIST reply ("<n>|ssid|ssid|..."), rendered by the KARMA scene.
 static char karma_list[192];
 // C1: same scene drives both modes - plain KARMA (answer probes) and Trap (clone the network for
 // real with a softAP + portal). The hub items set this before entering.
 static bool karma_trap = false;
+// Installed once on the widget view; the scenes toggle this flag instead of swapping the callback
+// in and out. Installing/clearing the callback while the view is dispatching its own input (scene
+// on_enter/on_exit run inside that dispatch) crashed the Flipper.
+static bool karma_active = false;
 static char trap_state[40];   // last "ap=..." reported by the board (Trap mode)
 static char karma_saved[192]; // last SSID list written to SD (so we only write on change)
 static int karma_chan_sel = 0;// Trap/KARMA channel picked with UP/DOWN on that screen
@@ -1751,6 +1757,7 @@ static void wifi_hub_cb(void* context, uint32_t index) {
     case 11: karma_trap = false; scene_manager_next_scene(app->scene_manager, karmaScene); break;
     case 12: karma_trap = true;  scene_manager_next_scene(app->scene_manager, karmaScene); break;
     case 13: scene_manager_next_scene(app->scene_manager, scriptListScene); break;
+    case 14: scene_manager_next_scene(app->scene_manager, recordScene); break;
     }
 }
 // Re-ask the board for its IDENT while we have not heard back yet. The board answers HELLO
@@ -1799,6 +1806,7 @@ void wifi_hub_scene_on_enter(void* context) {
         submenu_add_item(app->submenu, "Trap (KARMA+portal)", 12, wifi_hub_cb, app);
     }
     submenu_add_item(app->submenu, "Run script", 13, wifi_hub_cb, app);
+    submenu_add_item(app->submenu, "Macro (record)", 14, wifi_hub_cb, app);
     view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
 }
 bool wifi_hub_scene_on_event(void* context, SceneManagerEvent event) {
@@ -2586,7 +2594,7 @@ static void karma_render(delfyRTL* app) {
 // through a custom event so it happens between frames instead.
 static bool karma_input_callback(InputEvent* event, void* context) {
     delfyRTL* app = context;
-    if(!app || event->type != InputTypeShort) return false;
+    if(!app || !karma_active || event->type != InputTypeShort) return false;
     if(event->key == InputKeyUp || event->key == InputKeyDown) {
         // Channel (both modes): changing it re-arms the responder, so any clone that was up is
         // gone - that is why trap_state is cleared here.
@@ -2628,8 +2636,8 @@ void karma_scene_on_enter(void* context) {
     if(karma_trap) {
         // Make sure the board holds the chosen portal before any clone starts.
         delfy_send_portal_sel(app);
-        view_set_input_callback(widget_get_view(app->widget), karma_input_callback);
     }
+    karma_active = true;
     karma_render(app);
     uart_helper_send(app->uart_helper, "KARMALIST\n", 10);
     furi_timer_start(app->karmaTimer, 1500);
@@ -2651,9 +2659,8 @@ bool karma_scene_on_event(void* context, SceneManagerEvent event) {
 
 void karma_scene_on_exit(void* context) {
     delfyRTL* app = context;
+    karma_active = false;
     furi_timer_stop(app->karmaTimer);
-    // The widget view is shared with the beacon screens, so drop our key handler again.
-    view_set_input_callback(widget_get_view(app->widget), NULL);
     // Trap also owns the softAP, so TRAP 0 tears that down too.
     uart_helper_send(app->uart_helper, karma_trap ? "TRAP 0\n" : "KARMA 0\n", karma_trap ? 7 : 8);
 }
@@ -2665,7 +2672,7 @@ void karma_scene_on_exit(void* context) {
 // (see delfyRTL_custom_callback), otherwise they would cover the runner screen.
 #define SCRIPT_DIR "/ext/delfy/scripts"
 #define SCRIPT_FILES_MAX 8
-#define SCRIPT_LINES_MAX 12
+#define SCRIPT_LINES_MAX 20
 #define SCRIPT_LINE_LEN 64
 static char script_names[SCRIPT_FILES_MAX][48];
 static int script_file_count = 0;
@@ -2866,6 +2873,120 @@ void script_run_scene_on_exit(void* context) {
     delfyRTL* app = context;
     (void)app;
     script_running = false;
+}
+
+// --- F5: macro recording -----------------------------------------------------------------
+// The board records the commands it receives (it sees them all, in order); this screen starts and
+// stops that recording and saves the fetched list as an F1 script - so a macro is produced simply
+// by using the app normally.
+#define REC_SCRIPT_MAX 20
+static char rec_script[REC_SCRIPT_MAX][48];
+static int rec_script_n = 0;
+static bool rec_active = false;
+static char rec_status[48];
+
+static void rec_save(delfyRTL* app) {
+    if(rec_script_n == 0) {
+        snprintf(rec_status, sizeof(rec_status), "nothing recorded");
+        return;
+    }
+    DateTime dt;
+    furi_hal_rtc_get_datetime(&dt);
+    char path[96];
+    snprintf(
+        path,
+        sizeof(path),
+        SCRIPT_DIR "/macro_%04d%02d%02d_%02d%02d%02d.txt",
+        dt.year,
+        dt.month,
+        dt.day,
+        dt.hour,
+        dt.minute,
+        dt.second);
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    storage_common_mkdir(st, SCRIPT_DIR);
+    File* f = storage_file_alloc(st);
+    bool ok = false;
+    if(storage_file_open(f, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        char hdr[96];
+        int n = snprintf(
+            hdr,
+            sizeof(hdr),
+            "# macro %04d-%02d-%02d %02d:%02d:%02d\n",
+            dt.year,
+            dt.month,
+            dt.day,
+            dt.hour,
+            dt.minute,
+            dt.second);
+        storage_file_write(f, hdr, (size_t)n);
+        for(int i = 0; i < rec_script_n; i++) {
+            storage_file_write(f, rec_script[i], strlen(rec_script[i]));
+            storage_file_write(f, "\n", 1);
+        }
+        storage_file_close(f);
+        ok = true;
+    }
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+    snprintf(rec_status, sizeof(rec_status), ok ? "saved %d lines" : "save failed", rec_script_n);
+    snprintf(message, sizeof(message), "%s (%d)", ok ? "Macro saved" : "Save failed", rec_script_n);
+    snprintf(popupHeader, sizeof(popupHeader), "Macro");
+    // rec_save() runs inside uart_process_line (UART worker thread), so pushing a scene directly
+    // is not safe - post it and let the dispatcher do it on the GUI thread.
+    view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+}
+
+static void rec_scene_build(delfyRTL* app);
+
+static void rec_item_cb(void* context, uint32_t index) {
+    delfyRTL* app = context;
+    if(index == 0) {   // toggle record
+        rec_active = !rec_active;
+        rec_script_n = 0;
+        rec_status[0] = '\0';
+        uart_helper_send(app->uart_helper, rec_active ? "REC 1\n" : "REC 0\n", 6);
+    } else if(index == 1) {   // fetch what the board holds
+        uart_helper_send(app->uart_helper, "RECFETCH\n", 9);
+    }
+    // Do NOT rebuild the submenu here: resetting the view from inside its own callback leaves the
+    // submenu walking a freed model and crashes the Flipper on the next key. Post an event instead
+    // and rebuild between frames (same class of bug as the widget-input crash).
+    view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_REC_REFRESH);
+}
+
+static void rec_scene_build(delfyRTL* app) {
+    submenu_reset(app->submenu);
+    char hdr[48];
+    if(rec_active) snprintf(hdr, sizeof(hdr), "Macro: RECORDING");
+    else if(rec_status[0]) snprintf(hdr, sizeof(hdr), "Macro: %.32s", rec_status);
+    else snprintf(hdr, sizeof(hdr), "Macro");
+    submenu_set_header(app->submenu, hdr);
+    submenu_add_item(
+        app->submenu, rec_active ? "Stop recording" : "Start recording", 0, rec_item_cb, app);
+    submenu_add_item(app->submenu, "Fetch & save script", 1, rec_item_cb, app);
+    view_dispatcher_switch_to_view(app->view_dispatcher, scannedWifisView);
+}
+
+void record_scene_on_enter(void* context) {
+    delfyRTL* app = context;
+    rec_scene_build(app);
+}
+
+bool record_scene_on_event(void* context, SceneManagerEvent event) {
+    delfyRTL* app = context;
+    if(event.type == SceneManagerEventTypeCustom && event.event == DELFY_EVT_REC_REFRESH) {
+        rec_scene_build(app);
+        return true;
+    }
+    return false;
+}
+
+void record_scene_on_exit(void* context) {
+    delfyRTL* app = context;
+    // Leaving the screen keeps the recording running (that is the point - go use the app), except
+    // when nothing is being recorded and there is nothing to keep.
+    if(!rec_active && rec_script_n == 0) uart_helper_send(app->uart_helper, "REC 0\n", 6);
 }
 
 void help_scene_on_enter(void* context) {
@@ -3531,7 +3652,7 @@ void (*const delfyRTL_scene_on_enter_handlers[])(void*) = {
     wifi_hub_scene_on_enter,
     ble_hub_scene_on_enter,
     ble_adv_lib_scene_on_enter,
-    portal_list_scene_on_enter, settings_scene_on_enter, session_scene_on_enter, gatt_scene_on_enter, blespam_scene_on_enter, tracker_scene_on_enter, browse_scene_on_enter, karma_scene_on_enter, script_list_scene_on_enter, script_run_scene_on_enter};
+    portal_list_scene_on_enter, settings_scene_on_enter, session_scene_on_enter, gatt_scene_on_enter, blespam_scene_on_enter, tracker_scene_on_enter, browse_scene_on_enter, karma_scene_on_enter, script_list_scene_on_enter, script_run_scene_on_enter, record_scene_on_enter};
 
 bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     main_menu_scene_on_event,
@@ -3556,7 +3677,7 @@ bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     wifi_hub_scene_on_event,
     ble_hub_scene_on_event,
     ble_adv_lib_scene_on_event,
-    portal_list_scene_on_event, settings_scene_on_event, session_scene_on_event, gatt_scene_on_event, blespam_scene_on_event, tracker_scene_on_event, browse_scene_on_event, karma_scene_on_event, script_list_scene_on_event, script_run_scene_on_event};
+    portal_list_scene_on_event, settings_scene_on_event, session_scene_on_event, gatt_scene_on_event, blespam_scene_on_event, tracker_scene_on_event, browse_scene_on_event, karma_scene_on_event, script_list_scene_on_event, script_run_scene_on_event, record_scene_on_event};
 
 void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     main_menu_scene_on_exit,
@@ -3581,7 +3702,7 @@ void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     wifi_hub_scene_on_exit,
     ble_hub_scene_on_exit,
     ble_adv_lib_scene_on_exit,
-    portal_list_scene_on_exit, settings_scene_on_exit, session_scene_on_exit, gatt_scene_on_exit, blespam_scene_on_exit, tracker_scene_on_exit, browse_scene_on_exit, karma_scene_on_exit, script_list_scene_on_exit, script_run_scene_on_exit};
+    portal_list_scene_on_exit, settings_scene_on_exit, session_scene_on_exit, gatt_scene_on_exit, blespam_scene_on_exit, tracker_scene_on_exit, browse_scene_on_exit, karma_scene_on_exit, script_list_scene_on_exit, script_run_scene_on_exit, record_scene_on_exit};
 
 static const SceneManagerHandlers delfyRTL_scene_manager_handlers = {
     .on_enter_handlers = delfyRTL_scene_on_enter_handlers,
@@ -3803,6 +3924,17 @@ void uart_process_line(FuriString* line, void* context) {
         snprintf(message, sizeof(message), "Sent %s probes", furi_string_get_cstr(line) + 11);
         snprintf(popupHeader, sizeof(popupHeader), "Probe flood");
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+    } else if(strncmp(furi_string_get_cstr(line), "RECDONE:", 8) == 0) {
+        // F5: the board finished dumping the recording - save it as a runnable script.
+        rec_save(app);
+    } else if(strncmp(furi_string_get_cstr(line), "REC:", 4) == 0) {
+        if(rec_script_n < REC_SCRIPT_MAX) {
+            snprintf(rec_script[rec_script_n], sizeof(rec_script[0]), "%s", furi_string_get_cstr(line) + 4);
+            rec_script_n++;
+        }
+    } else if(strncmp(furi_string_get_cstr(line), "RECCTL:", 7) == 0 ||
+              strncmp(furi_string_get_cstr(line), "RECN:", 5) == 0) {
+        // F5: recorder acks / live count - nothing to do until the list is fetched
     } else if(strncmp(furi_string_get_cstr(line), "KARMALIST:", 10) == 0) {
         // B1: "<n>|ssid|ssid|..." - the KARMA scene renders this live, and the list is persisted
         // to the run's session folder (once per change, not once per poll).
@@ -4081,6 +4213,9 @@ static delfyRTL* app_alloc() {
     // their context and dereferencing it hard-crashes the Flipper - which is exactly what
     // happened the first time LEFT/RIGHT was pressed on the Trap screen.
     view_set_context(widget_get_view(app->widget), app);
+    // Input handler for the KARMA/Trap screen, installed once and gated by a flag (see the note
+    // on karma_active: swapping it per scene crashes the Flipper).
+    view_set_input_callback(widget_get_view(app->widget), karma_input_callback);
     view_dispatcher_add_view(app->view_dispatcher, wifiInfoView, widget_get_view(app->widget));
     view_dispatcher_add_view(app->view_dispatcher, evilCredsView, widget_get_view(app->widget));
     view_dispatcher_add_view(app->view_dispatcher, beaconInfoView, widget_get_view(app->widget));
