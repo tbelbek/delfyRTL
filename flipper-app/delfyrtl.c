@@ -1309,7 +1309,12 @@ static void delfy_csa(delfyRTL* app) {
     }
     int newch = (ch <= 6) ? 11 : 1;   // move them as far across 2.4 GHz as the band allows
     char cmd[64];
+    // Two passes: the broadcast announcement (cheap, catches clients that listen to those) and a
+    // per-station unicast, which is what a real AP does and what most clients actually obey.
     snprintf(cmd, sizeof(cmd), "CSA %s %d %d 12\n", hex, ch, newch);
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    furi_delay_ms(120);
+    snprintf(cmd, sizeof(cmd), "CSASTAS %s %d %d\n", hex, ch, newch);
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
     { char b[48]; snprintf(b, sizeof(b), "ch %d -> %d", ch, newch); delfy_busy(app, "CSA", b); }
 }
@@ -3938,6 +3943,11 @@ void uart_process_line(FuriString* line, void* context) {
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "PROBE:", 6) == 0) {
         recon_append(furi_string_get_cstr(line) + 6);
+    } else if(strncmp(furi_string_get_cstr(line), "CSASTAS:", 8) == 0) {
+        // B2b: per-station unicast announcements
+        snprintf(popupHeader, sizeof(popupHeader), "CSA unicast");
+        snprintf(message, sizeof(message), "Sent to %s stations", furi_string_get_cstr(line) + 8);
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
     } else if(strncmp(furi_string_get_cstr(line), "CSA:", 4) == 0) {
         // B2: what the board actually sent
         snprintf(popupHeader, sizeof(popupHeader), "CSA");

