@@ -121,6 +121,12 @@ void build_portal_urls(const char* ssid){
 }
 //int allChannels[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
 extern u8 rtw_get_band_type(void);
+// De rTV: wifi_get_ch_from_channel_set() is declared in wifi_conf.h but is NOT in this build's
+// archive (undefined reference), so the channel-set query goes through the private ioctl instead.
+// These two are present, checked with strings on the linked libraries before building.
+extern int wifi_get_channel_plan(uint8_t *channel_plan);
+extern int wext_private_command_with_retval(const char* ifname, char* cmd, char* ret, int len);
+extern int wifi_change_channel_plan(uint8_t channel_plan);
 #define FRAMES_PER_DEAUTH 5
 
 // DFS (radar) 5GHz channels: RX-only, never TX deauth here (5Ghost does the same).
@@ -1286,16 +1292,18 @@ static void pmkid_clientless(int ch, const uint8_t* bssid, const char* ssid) {
 }
 
 // --- Raw-TX channel guard ---------------------------------------------------------------
-// Raw 802.11 TX only completes on 2.4 GHz. wext_set_channel() will happily *store* a 5 GHz channel
-// number (the CHAN diagnostic shows set=0, got=48), but the TX path then never completes and the
-// SDK spins forever inside it - the board goes silent with no reply, no reboot and no fault print.
-// That is the failure the note above tx_beacon_raw() describes; we reproduced it by pointing a
-// flood at a 5 GHz AP. A 5 GHz target must therefore be refused, not attempted: this used to be
-// reachable from the FAP (any 5 GHz AP in List Wifi), and it wedges the whole board.
+// The only real restriction is DFS: 52-140 are radar channels and must not be used for TX.
+//
+// An earlier version of this guard refused EVERY channel above 14, because pointing a flood at a
+// 5 GHz AP appeared to wedge the board. That conclusion was wrong. The wedge came from the old
+// "tune once, then send N frames" pattern: the tuning does not survive between raw frames, and the
+// SDK then spins forever inside its TX path (exactly the pitfall noted above tx_beacon_raw()).
+// Measured after moving the tune inside the loop: 64 beacons on channel 36 complete and the board
+// stays up, so 5 GHz raw TX works and 5 GHz targets are allowed.
 static bool tx_raw_chan_ok(int ch, const char* who) {
-  if(ch >= 1 && ch <= 14) return true;
-  String r = String("ERROR: ") + who + " refused: raw TX is 2.4 GHz only (ch " + String(ch) +
-             " hangs the radio)";
+  if(ch >= 1 && ch <= 165 && !is_dfs_channel(ch)) return true;
+  String r = String("ERROR: ") + who + " refused: channel " + String(ch) +
+             (is_dfs_channel(ch) ? " is DFS (radar, RX only)" : " is out of range 1-165");
   Serial.println(r); Serial1.println(r);
   return false;
 }
@@ -2270,19 +2278,53 @@ void loop() {
       Serial.println(r); Serial1.println(r);
     }else if(readString.substring(0,7)=="CHANSET"){
       // Which channels does this build's channel set actually contain?
-      // wext_set_channel() accepts a 5 GHz number and wext_get_channel() reads it back, but a raw
-      // TX on a channel the set does not contain never completes - the SDK spins inside its TX path
-      // and the board goes silent. wifi_get_ch_from_channel_set() asks the driver directly (it
-      // prints "channel supported/not supported" itself), and wifi_get_channel_plan() says which
-      // plan is being consulted. Together they decide whether 5 GHz is a channel-plan problem or
-      // something further down. No TX here, so this is safe to run on any channel.
+      // wext_set_channel() accepts a 5 GHz number and wext_get_channel() reads it back, but a raw TX
+      // on a channel the set does not contain never completes - the SDK spins inside its TX path and
+      // the board goes silent. The SDK's own wifi_get_ch_from_channel_set() is not in this build's
+      // archive (link error), so the same private ioctl is issued directly; wifi_get_channel_plan()
+      // says which plan is being consulted. No TX here: safe on any channel.
       uint8_t plan = 0xFF;
       wifi_get_channel_plan(&plan);
       int ch = readString.substring(8).toInt();
       if(ch < 1 || ch > 196) ch = 1;
-      int in_set = wifi_get_ch_from_channel_set((uint8_t)ch);
+      char q[24];
+      snprintf(q, sizeof(q), "get_ch_from_set %x", ch);   // the SDK formats this in hex
+      int in_set = wext_private_command_with_retval(WLAN0_NAME, q, q, sizeof(q));
       String r = String("CHANSET:req=") + String(ch) + " plan=0x" + String((unsigned)plan, HEX) +
-                 " in_set=" + String(in_set) + " band=" + String(wifi_get_band_type());
+                 " in_set=" + String(in_set) + " idx=" + String(q) +
+                 " band=" + String(wifi_get_band_type());
+      Serial.println(r); Serial1.println(r);
+    }else if(readString.substring(0,8)=="CHANPLAN"){
+      // CHANPLAN <n> -> wifi_change_channel_plan() (driver call, present in the archive) then read
+      // the plan back. No TX: this is how we try to make a 5 GHz channel belong to the set.
+      int want = readString.substring(9).toInt();
+      uint8_t before = 0xFF, after = 0xFF;
+      wifi_get_channel_plan(&before);
+      int rc = wifi_change_channel_plan((uint8_t)want);
+      delay(50);
+      wifi_get_channel_plan(&after);
+      String r = String("CHANPLAN:want=0x") + String((unsigned)want, HEX) + " rc=" + String(rc) +
+                 " before=0x" + String((unsigned)before, HEX) + " after=0x" + String((unsigned)after, HEX);
+      Serial.println(r); Serial1.println(r);
+    }else if(readString.substring(0,8)=="TX5PROBE"){
+      // Deliberate 5 GHz experiment, deliberately NOT behind tx_raw_chan_ok(): the whole point is to
+      // find out whether a raw TX on a 5 GHz channel can ever complete. It sends ONE beacon. If the
+      // line below comes back, 5 GHz raw TX works. If the board goes silent, it does not - and that
+      // silence is the result (recover with a flash, which also resets the board).
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int ch = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1).toInt() : 36;
+      int cnt = (s2 > 0) ? readString.substring(s2+1, readString.length()-1).toInt() : 1;
+      if(ch < 36 || ch > 165) ch = 36;
+      if(cnt < 1 || cnt > 200) cnt = 1;
+      if(apActive) destroyAP();
+      uint8_t src[6] = {0x00,0xE0,0x4C,0x11,0x22,0x33};
+      for(int i = 0; i < cnt; i++) {
+        wext_set_channel(WLAN0_NAME, ch);   // tune immediately before every frame, as the floods do
+        tx_beacon_raw(src, TX_BCAST, "DELFY5P", 0x80, ch);
+        if((i & 15) == 15) delay(2);
+      }
+      String r = String("TX5PROBE:ok ch=") + String(ch) + " n=" + String(cnt);
       Serial.println(r); Serial1.println(r);
     }else if(readString.substring(0,4)=="CHAN"){
       // F3 diag: CHAN <n> -> tune the radio and report what it actually did.
