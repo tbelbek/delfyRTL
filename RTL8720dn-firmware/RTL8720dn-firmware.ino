@@ -2214,9 +2214,9 @@ void loop() {
       if(apActive) destroyAP();
       int setres = wext_set_channel(WLAN0_NAME, ch);
       delay(50);
-      int got = -1;
+      uint8_t got = 0;
       int getres = wext_get_channel(WLAN0_NAME, &got);
-      String r = String("CHAN:req=") + String(ch) + " got=" + String(got) +
+      String r = String("CHAN:req=") + String(ch) + " got=" + String((int)got) +
                  " set=" + String(setres) + " get=" + String(getres) +
                  " band=" + String(wifi_get_band_type());
       Serial.println(r); Serial1.println(r);
