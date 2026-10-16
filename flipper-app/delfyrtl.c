@@ -345,6 +345,10 @@ typedef enum {
 #define DELFY_EVT_KARMA_POLL 0x2007
 // B1: raw payload of the last KARMALIST reply ("<n>|ssid|ssid|..."), rendered by the KARMA scene.
 static char karma_list[192];
+// C1: same scene drives both modes - plain KARMA (answer probes) and Trap (clone the network for
+// real with a softAP + portal). The hub items set this before entering.
+static bool karma_trap = false;
+static char trap_state[40];   // last "ap=..." reported by the board (Trap mode)
 
 typedef enum {
     SsidAPInputSceneSaveEvent,
@@ -1738,7 +1742,8 @@ static void wifi_hub_cb(void* context, uint32_t index) {
     case 8: scene_manager_next_scene(app->scene_manager, settingsScene); break;
     case 9: scene_manager_next_scene(app->scene_manager, sessionScene); break;
     case 10: browse_reset = true; scene_manager_next_scene(app->scene_manager, browseScene); break;
-    case 11: scene_manager_next_scene(app->scene_manager, karmaScene); break;
+    case 11: karma_trap = false; scene_manager_next_scene(app->scene_manager, karmaScene); break;
+    case 12: karma_trap = true;  scene_manager_next_scene(app->scene_manager, karmaScene); break;
     }
 }
 // Re-ask the board for its IDENT while we have not heard back yet. The board answers HELLO
@@ -1782,8 +1787,10 @@ void wifi_hub_scene_on_enter(void* context) {
     submenu_add_item(app->submenu, "Settings", 8, wifi_hub_cb, app);
     submenu_add_item(app->submenu, "Session summary", 9, wifi_hub_cb, app);
     submenu_add_item(app->submenu, "Browse sessions", 10, wifi_hub_cb, app);
-    if(delfy_has_cap(app, 'R'))   // B1: firmware advertises the KARMA responder with "R"
+    if(delfy_has_cap(app, 'R')) {  // B1/C1: firmware advertises the KARMA responder with "R"
         submenu_add_item(app->submenu, "KARMA (responder)", 11, wifi_hub_cb, app);
+        submenu_add_item(app->submenu, "Trap (KARMA+portal)", 12, wifi_hub_cb, app);
+    }
     view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
 }
 bool wifi_hub_scene_on_event(void* context, SceneManagerEvent event) {
@@ -2512,23 +2519,29 @@ static void karma_timer_cb(void* context) {
 
 static void karma_render(delfyRTL* app) {
     widget_reset(app->widget);
-    widget_add_string_element(app->widget, 64, 2, AlignCenter, AlignTop, FontPrimary, "KARMA");
+    widget_add_string_element(
+        app->widget, 64, 2, AlignCenter, AlignTop, FontPrimary, karma_trap ? "TRAP" : "KARMA");
     int n = karma_list[0] ? atoi(karma_list) : 0;
     char hdr[40];
     snprintf(hdr, sizeof(hdr), "%d SSID%s answered", n, n == 1 ? "" : "s");
     widget_add_string_element(app->widget, 64, 14, AlignCenter, AlignTop, FontSecondary, hdr);
+    if(karma_trap && trap_state[0]) {
+        char ap[40];
+        snprintf(ap, sizeof(ap), "AP: %.24s", trap_state);
+        widget_add_string_element(app->widget, 64, 24, AlignCenter, AlignTop, FontSecondary, ap);
+    }
     char body[192];
     int o = 0;
     const char* q = strchr(karma_list, '|');
-    while(q && o < 150) {
+    while(q && o < 130) {
         const char* e = strchr(q + 1, '|');
         int l = e ? (int)(e - q - 1) : (int)strlen(q + 1);
         if(l > 0) o += snprintf(body + o, sizeof(body) - (size_t)o, "%.*s\n", l, q + 1);
         q = e;
     }
     if(o > 0) {
-        widget_add_string_multiline_element(app->widget, 64, 26, AlignCenter, AlignTop, FontSecondary, body);
-    } else {
+        widget_add_string_multiline_element(app->widget, 64, 34, AlignCenter, AlignTop, FontSecondary, body);
+    } else if(!(karma_trap && trap_state[0])) {
         widget_add_string_element(
             app->widget, 64, 30, AlignCenter, AlignTop, FontSecondary, "no probes seen yet");
     }
@@ -2539,8 +2552,9 @@ static void karma_render(delfyRTL* app) {
 void karma_scene_on_enter(void* context) {
     delfyRTL* app = context;
     karma_list[0] = '\0';
+    trap_state[0] = '\0';
     char cmd[32];
-    snprintf(cmd, sizeof(cmd), "KARMA 1 %d\n", delfy_def_ch());
+    snprintf(cmd, sizeof(cmd), karma_trap ? "TRAP 1 %d\n" : "KARMA 1 %d\n", delfy_def_ch());
     uart_helper_send(app->uart_helper, cmd, strlen(cmd));
     karma_render(app);
     uart_helper_send(app->uart_helper, "KARMALIST\n", 10);
@@ -2555,6 +2569,7 @@ bool karma_scene_on_event(void* context, SceneManagerEvent event) {
     }
     if(event.type == SceneManagerEventTypeCustom && event.event == DELFY_EVT_KARMA_POLL) {
         uart_helper_send(app->uart_helper, "KARMALIST\n", 10);
+        if(karma_trap) uart_helper_send(app->uart_helper, "TRAPSTAT\n", 9);
         return true;
     }
     return false;
@@ -2563,7 +2578,8 @@ bool karma_scene_on_event(void* context, SceneManagerEvent event) {
 void karma_scene_on_exit(void* context) {
     delfyRTL* app = context;
     furi_timer_stop(app->karmaTimer);
-    uart_helper_send(app->uart_helper, "KARMA 0\n", 8);
+    // Trap also owns the softAP, so TRAP 0 tears that down too.
+    uart_helper_send(app->uart_helper, karma_trap ? "TRAP 0\n" : "KARMA 0\n", karma_trap ? 7 : 8);
 }
 
 void help_scene_on_enter(void* context) {
@@ -3505,6 +3521,32 @@ void uart_process_line(FuriString* line, void* context) {
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_KARMA);
     } else if(strncmp(furi_string_get_cstr(line), "KARMA:", 6) == 0) {
         // on/off ack - the scene shows live state from the KARMALIST polls instead
+    } else if(strncmp(furi_string_get_cstr(line), "TRAPSTAT:", 9) == 0) {
+        // C1: "on ch=6 ap=<ssid> seen=N" - keep the Trap screen honest even if the one-shot
+        // TRAP event was missed (e.g. the app entered the screen after the AP was already up).
+        const char* ap = strstr(furi_string_get_cstr(line), "ap=");
+        if(ap) {
+            ap += 3;
+            if(*ap == '-') {
+                trap_state[0] = '\0';
+            } else {
+                const char* sp = strchr(ap, ' ');
+                int l = sp ? (int)(sp - ap) : (int)strlen(ap);
+                if(l > 0 && l < (int)sizeof(trap_state)) {
+                    snprintf(trap_state, sizeof(trap_state), "%.*s", l, ap);
+                }
+            }
+            view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_KARMA);
+        }
+    } else if(strncmp(furi_string_get_cstr(line), "TRAPCTL:", 8) == 0) {
+        // C1: Trap on/off ack
+    } else if(strncmp(furi_string_get_cstr(line), "TRAP:", 5) == 0) {
+        // C1: the board cloned a network for real - show which one on the Trap screen
+        snprintf(trap_state, sizeof(trap_state), "%s", furi_string_get_cstr(line) + 5);
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_KARMA);
+    } else if(strncmp(furi_string_get_cstr(line), "TRAPFAIL", 8) == 0) {
+        snprintf(trap_state, sizeof(trap_state), "(clone failed - still KARMA)");
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_KARMA);
     } else if(strncmp(furi_string_get_cstr(line), "PORTALHASH:", 11) == 0) {
         // Reply to our PORTALHASH request: len + FNV-1a of what the board actually holds.
         // (Parsed with strtol — sscanf is not in the firmware export table.)
