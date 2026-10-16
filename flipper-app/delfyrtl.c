@@ -3331,8 +3331,10 @@ static int busy_total_s = 0;
 //    keeps reporting APs while it scans, so app->wifiList can grow and reorder under the user's
 //    finger - and a list that shifts between the look and the OK is how you end up pointing a
 //    deauther at the wrong network.
-//  * the rows are ordered "APs first, actions last". UP does not move the cursor on the review
-//    unit (only DOWN does), so the whole flow has to be reachable with DOWN alone.
+//  * the rows are ordered "APs first, actions last", so the whole flow is reachable with DOWN
+//    alone. (The ordering was chosen because UP looked broken on the review unit. That was wrong:
+//    the screenshots were stale frames, and UP works - see tools/flip_see.py. The ordering is kept
+//    because it reads better: the list first, the actions after it.)
 // ---------------------------------------------------------------------------------------------
 #define BATCH_MAX 8
 
@@ -4338,7 +4340,11 @@ static void uart_enqueue_line(FuriString* line, void* context) {
 static void uart_gui_tick(void* context) {
     delfyRTL* app = context;
     FuriString* line;
-    if(furi_message_queue_get(app->uart_lines, &line, 0) == FuriStatusOk) {
+    // Several lines per tick. This callback runs on the dispatcher (GUI) thread, and with a 10 ms
+    // period eight lines per tick is 800 lines/s - far past anything the board emits, at a fraction
+    // of the overhead.
+    for(int i = 0; i < 8; i++) {
+        if(furi_message_queue_get(app->uart_lines, &line, 0) != FuriStatusOk) break;
         uart_process_line(line, app);
         furi_string_free(line);
     }
@@ -4924,8 +4930,13 @@ static delfyRTL* app_alloc() {
     furi_check(app->uart_lines);
     app->scan_waiting = false;
     app->scan_deadline = 0;
+    // 10 ms, not 1 ms: this callback runs on the dispatcher (GUI) thread, and there is no reason to
+    // spend that thread a thousand times a second polling a message queue. Eight lines per tick
+    // still keeps up with ~800 lines/s. (An earlier version of this comment blamed the 1 ms tick
+    // for dropped key presses. That was wrong: the "drops" were stale screenshot frames - the
+    // Flipper only streams a frame when the screen changes. See tools/flip_see.py.)
     view_dispatcher_set_tick_event_callback(
-        app->view_dispatcher, uart_gui_tick, furi_ms_to_ticks(1));
+        app->view_dispatcher, uart_gui_tick, furi_ms_to_ticks(10));
 
     app->uart_helper = uart_helper_alloc();
     uart_helper_set_baud_rate(app->uart_helper, DEVICE_BAUDRATE);

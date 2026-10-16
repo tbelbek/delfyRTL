@@ -47,21 +47,20 @@ def shot(name):
     return ok
 
 
-def keys(*ks, settle=1.0, batch=5):
-    """Send a key sequence in small batches, each in its own RPC session.
+def keys(*ks, settle=0.5):
+    """Send a key sequence in one drive call, as the runbook does.
 
-    Long bursts get lost: 25 DOWNs in one call dropped 4-5 of them on the review unit even at 1.0-1.2
-    seconds per key, while the same keys in batches of five all arrive. The device's input queue does
-    not keep up, so batching - not the settle - is what makes navigation reliable.
+    The device keeps up with 0.4-0.5 s per key. Batching was added here when key presses looked like
+    they were being dropped - they were not: `flipctl --shot` returns the last frame its window saw,
+    the Flipper only streams a frame when the screen changes, and a stale frame looks exactly like a
+    key that did nothing. In this tool that is harmless (the shots are for the record), but use
+    tools/flip_see.py whenever a screenshot decides what happens next.
     """
-    ks = list(ks)
-    for i in range(0, len(ks), batch):
-        args = [PY, os.path.join(HERE, "flipctl.py"), "drive", *ks[i : i + batch],
-                "--settle", str(settle)]
-        try:
-            subprocess.run(args, capture_output=True, text=True, timeout=90)
-        except subprocess.TimeoutExpired:
-            log("    drive TIMEOUT")
+    args = [PY, os.path.join(HERE, "flipctl.py"), "drive", *ks, "--settle", str(settle)]
+    try:
+        subprocess.run(args, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        log("    drive TIMEOUT")
 
 
 def nav_to_tools():
