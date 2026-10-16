@@ -3694,6 +3694,9 @@ void config_ap_scene_on_enter(void* context) {
     VariableItem* item;
     app->menuIndex = CreateAP;
     credentials[0] = '\0';
+    // Remember the row: this function is also the rebuild path of the security/channel change
+    // callbacks, so pinning the selection to 0 made the cursor jump to the top on every change.
+    uint8_t keep_row = variable_item_list_get_selected_item_index(app->variableList);
     variable_item_list_reset(app->variableList);
     // reset() frees the items but leaves model->position/window_position untouched, so a position
     // left over from a longer list survives. The enter callback is handed model->position, and
@@ -3748,7 +3751,9 @@ void config_ap_scene_on_enter(void* context) {
     item = variable_item_list_add(app->variableList, "Start", 1, NULL, NULL);
     variable_item_list_set_enter_callback(app->variableList, config_ap_change_call_back, app);
 
-    view_dispatcher_switch_to_view(app->view_dispatcher, configAPView);
+        // put the cursor back where it was (clamped to the rebuilt list)
+    variable_item_list_set_selected_item(app->variableList, keep_row);
+view_dispatcher_switch_to_view(app->view_dispatcher, configAPView);
 }
 
 bool config_ap_scene_on_event(void* context, SceneManagerEvent event) {
