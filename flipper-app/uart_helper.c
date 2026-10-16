@@ -49,6 +49,10 @@ typedef enum {
     WorkerEventExiting = 1 << 1, // bit flag 1 - worker thread is exiting
 } WorkerEventFlags;
 
+bool uart_helper_worker_is_stopping(void) {
+    return (furi_thread_flags_get() & WorkerEventExiting) != 0;
+}
+
 /** 
  * Invoked when a byte of data is received on the UART bus.  This function
  * adds the byte to the stream buffer and sets the WorkerEventDataWaiting flag.

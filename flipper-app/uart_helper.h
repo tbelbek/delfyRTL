@@ -78,3 +78,9 @@ void uart_helper_send_string(UartHelper* helper, FuriString* string);
  * Frees the UartHelper & enables log messages.
 */
 void uart_helper_free(UartHelper* helper);
+
+/**
+ * True while the UART worker is shutting down. Read (not cleared) from the worker's own line
+ * callback, so a full queue can never deadlock the shutdown.
+ */
+bool uart_helper_worker_is_stopping(void);

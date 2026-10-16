@@ -263,6 +263,12 @@ typedef struct delfyRTL {
     char* ssidAP;
     uint8_t ssidAPLength;
     UartHelper* uart_helper;
+    // Board lines are queued by the UART worker and drained on the dispatcher thread (see
+    // uart_enqueue_line / uart_gui_tick). The worker must never touch scene state: the list scene
+    // sorts wifiList in place, and the worker used to append to that same array mid-sort.
+    FuriMessageQueue* uart_lines;
+    bool scan_waiting;
+    uint32_t scan_deadline;
     APDetails wifiList[WIFI_MAX];
     int selectedWifi;
     int wifiCount;
@@ -820,18 +826,13 @@ void scan_networks_scene_on_enter(void* context) {
     busy_show(app);
     app->wifiCount = 0; // fixed-size list in BSS: just reset the count (no heap)
 
-    uart_helper_send(app->uart_helper, "SCAN\n", 5);
+    // Do not block the GUI here. The worker used to fill wifiList while this thread slept in
+    // furi_delay_ms - the race being removed. uart_gui_tick watches the same wait on the dispatcher
+    // thread and sends LIST when it expires (or earlier, when SCAN:OK arrives).
+    app->scan_waiting = true;
+    app->scan_deadline = furi_get_tick() + furi_ms_to_ticks((uint32_t)set_scan_wait * 1000U);
     scanFinish = false;
-    int times = 0;
-    while(scanFinish == false && times < set_scan_wait * 2) {
-        furi_delay_ms(500);
-        times++;
-    }
-
-    submenu_reset(app->submenu);
-    uart_helper_send(app->uart_helper, "LIST\n", 5);
-
-    scene_manager_previous_scene(app->scene_manager);
+    uart_helper_send(app->uart_helper, "SCAN\n", 5);
 }
 bool scan_networks_scene_on_event(void* context, SceneManagerEvent event) {
     FURI_LOG_D(TAG, __func__);
@@ -847,6 +848,7 @@ bool scan_networks_scene_on_event(void* context, SceneManagerEvent event) {
 void scan_networks_scene_on_exit(void* context) {
     FURI_LOG_D(TAG, __func__);
     delfyRTL* app = context;
+    app->scan_waiting = false;
     furi_timer_stop(app->busyTimer);
 }
 void list_networks_scene_on_enter(void* context) {
@@ -3934,6 +3936,43 @@ bool delfyRTL_back_event_callback(void* context) {
     return scene_manager_handle_back_event(app->scene_manager);
 }
 
+void uart_process_line(FuriString* line, void* context);
+
+// UART worker side: take a copy of the line and hand it to the dispatcher thread. Never touch scene
+// state from here. If the queue is full we retry, but keep checking the worker's exit flag so that
+// closing the app cannot deadlock on a queue nobody drains any more.
+static void uart_enqueue_line(FuriString* line, void* context) {
+    delfyRTL* app = context;
+    if(uart_helper_worker_is_stopping()) return;
+    FuriString* copy = furi_string_alloc_set(line);
+    for(;;) {
+        if(uart_helper_worker_is_stopping()) {
+            furi_string_free(copy);
+            return;
+        }
+        if(furi_message_queue_put(app->uart_lines, &copy, furi_ms_to_ticks(10)) == FuriStatusOk) {
+            return; // the queue owns copy now
+        }
+    }
+}
+
+// Dispatcher thread: drain what the worker queued, and finish the scan wait. One line per call so
+// that custom events posted by the line handlers are serviced in between.
+static void uart_gui_tick(void* context) {
+    delfyRTL* app = context;
+    FuriString* line;
+    if(furi_message_queue_get(app->uart_lines, &line, 0) == FuriStatusOk) {
+        uart_process_line(line, app);
+        furi_string_free(line);
+    }
+    if(app->scan_waiting && (scanFinish || (int32_t)(furi_get_tick() - app->scan_deadline) >= 0)) {
+        app->scan_waiting = false;
+        submenu_reset(app->submenu);
+        uart_helper_send(app->uart_helper, "LIST\n", 5);
+        scene_manager_previous_scene(app->scene_manager);
+    }
+}
+
 void uart_process_line(FuriString* line, void* context) {
     FURI_LOG_D(TAG, __func__);
     FURI_LOG_D(TAG, "%s", furi_string_get_cstr(line));
@@ -4466,10 +4505,17 @@ static delfyRTL* app_alloc() {
     app->karmaTimer = furi_timer_alloc(karma_timer_cb, FuriTimerTypePeriodic, app);
     app->scriptTimer = furi_timer_alloc(script_timer_cb, FuriTimerTypePeriodic, app);
 
+    app->uart_lines = furi_message_queue_alloc(64, sizeof(FuriString*));
+    furi_check(app->uart_lines);
+    app->scan_waiting = false;
+    app->scan_deadline = 0;
+    view_dispatcher_set_tick_event_callback(
+        app->view_dispatcher, uart_gui_tick, furi_ms_to_ticks(1));
+
     app->uart_helper = uart_helper_alloc();
     uart_helper_set_baud_rate(app->uart_helper, DEVICE_BAUDRATE);
     uart_helper_set_delimiter(app->uart_helper, LINE_DELIMITER, INCLUDE_LINE_DELIMITER);
-    uart_helper_set_callback(app->uart_helper, uart_process_line, app);
+    uart_helper_set_callback(app->uart_helper, uart_enqueue_line, app);
     uart_helper_send(app->uart_helper, "HELLO\n", 6); // A: ask the board to advertise caps
 
     app->timer = furi_timer_alloc(animation_timer_callback, FuriTimerTypePeriodic, app);
@@ -4495,6 +4541,7 @@ static void app_free(delfyRTL* app) {
     furi_timer_free(app->karmaTimer);
     furi_timer_free(app->scriptTimer);
     uart_helper_free(app->uart_helper);
+    furi_message_queue_free(app->uart_lines);
 
     view_dispatcher_remove_view(app->view_dispatcher, mainMenuView);
     view_dispatcher_remove_view(app->view_dispatcher, scannedWifisView);
