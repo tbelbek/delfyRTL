@@ -3578,50 +3578,55 @@ void channel_map_scene_on_exit(void* context) {
 
 // Card-grid main menu (2x2) with real vector glyphs for Wi-Fi and Bluetooth.
 static int card_sel = 0;
-#define CARD_COUNT 4
-static const char* card_labels[CARD_COUNT] = {"Wi-Fi", "BLE", "Help", "Exit"};
+// Two cards plus an "About" pill. Exit used to be a fourth card, but BACK already leaves the app
+// (the back handler stops the dispatcher when there is no previous scene), so the card was noise.
+// Help/about is a pill - a rounded button - instead of a card.
+#define CARD_COUNT 3
+static const char* card_labels[CARD_COUNT] = {"Wi-Fi", "BLE", "About"};
 
 static void card_menu_draw(Canvas* canvas, void* model) {
     UNUSED(model);
+    if(card_sel < 0 || card_sel >= CARD_COUNT) card_sel = 0;
     canvas_clear(canvas);
     canvas_set_font(canvas, FontSecondary);
     canvas_draw_str(canvas, 2, 9, "delfyRTL");
-    for(int i = 0; i < CARD_COUNT; i++) {
-        int col = i % 2, row = i / 2;
-        int x = 3 + col * 62, y = 12 + row * 25;
+    for(int i = 0; i < 2; i++) {                     // the two cards, side by side
+        int x = 3 + i * 62, y = 12;
         bool sel = (i == card_sel);
         if(sel) canvas_draw_box(canvas, x, y, 60, 23);
         else canvas_draw_frame(canvas, x, y, 60, 23);
         if(sel) canvas_set_color(canvas, ColorWhite);
-        if(i == 0) canvas_draw_icon(canvas, x + 3, y + 3, &I_wifi);
-        else if(i == 1) canvas_draw_icon(canvas, x + 3, y + 3, &I_bluetooth);
-        else canvas_draw_str(canvas, x + 8, y + 16, (i == 2) ? "?" : ">");
+        canvas_draw_icon(canvas, x + 3, y + 3, (i == 0) ? &I_wifi : &I_bluetooth);
         canvas_draw_str(canvas, x + 20, y + 16, card_labels[i]);
+        if(sel) canvas_set_color(canvas, ColorBlack);
+    }
+    {                                                // the About pill
+        const int px = 28, py = 40, pw = 72, ph = 18;
+        bool sel = (card_sel == 2);
+        if(sel) canvas_draw_rbox(canvas, px, py, pw, ph, 4);
+        else canvas_draw_rframe(canvas, px, py, pw, ph, 4);
+        if(sel) canvas_set_color(canvas, ColorWhite);
+        canvas_draw_str_aligned(
+            canvas, px + pw / 2, py + 5, AlignCenter, AlignTop, card_labels[2]);
         if(sel) canvas_set_color(canvas, ColorBlack);
     }
 }
 static bool card_menu_input(InputEvent* event, void* context) {
     delfyRTL* app = context;
     if(event->type != InputTypeShort && event->type != InputTypeRepeat) return false;
-    int col = card_sel % 2, row = card_sel / 2;
-    if(event->key == InputKeyLeft || event->key == InputKeyRight) {
-        col = (col + 1) % 2;
-    } else if(event->key == InputKeyUp || event->key == InputKeyDown) {
-        row = (row + 1) % 2;
+    if(event->key == InputKeyLeft || event->key == InputKeyRight || event->key == InputKeyUp ||
+       event->key == InputKeyDown) {
+        // one row of three: Wifi, BLE, About
+        if(event->key == InputKeyLeft) card_sel = (card_sel + CARD_COUNT - 1) % CARD_COUNT;
+        else card_sel = (card_sel + 1) % CARD_COUNT;
     } else if(event->key == InputKeyOk) {
         if(card_sel == 0) scene_manager_next_scene(app->scene_manager, wifiHubScene);
         else if(card_sel == 1) scene_manager_next_scene(app->scene_manager, bleHubScene);
-        else if(card_sel == 2) scene_manager_next_scene(app->scene_manager, helpScene);
-        else {
-            uart_helper_send(app->uart_helper, "STOP\n", 5);
-            view_dispatcher_stop(app->view_dispatcher);
-        }
-        return true;
+        else scene_manager_next_scene(app->scene_manager, helpScene);
     } else {
         return false;
     }
-    card_sel = row * 2 + col;
-    view_commit_model(app->cardView, true); // emit a refresh so the highlight moves
+    view_commit_model(app->cardView, true);          // refresh so the highlight moves
     return true;
 }
 
@@ -4384,7 +4389,13 @@ static delfyRTL* app_alloc() {
     // now also receives input (C1 portal picker). Without a context those callbacks get NULL as
     // their context and dereferencing it hard-crashes the Flipper - which is exactly what
     // happened the first time LEFT/RIGHT was pressed on the Trap screen.
-    view_set_context(widget_get_view(app->widget), app);
+    // Do NOT point the widget's view context at the app. widget_alloc() already set it to the
+    // Widget* and the widget's own input handler casts it back to Widget* to reach widget->view.
+    // Pointing it at app made that read app->scene_manager as a View*, so any key delivered to the
+    // widget faulted the device - before the button callback ran. Drawing was unaffected (the draw
+    // callback gets the model), which is why the AP info screen rendered perfectly and then reset
+    // the Flipper a moment later, when the rest of the OK press (short/release) was routed to it.
+    view_set_context(widget_get_view(app->widget), app->widget);
     // NOTE: do NOT view_set_input_callback() on the widget view here. That replaces the widget's
     // own button handling for every screen that shares this view - which silently broke the AP
     // info screen's Edit/Deauth/Evil buttons, and Edit is how the Tools menu is reached.
