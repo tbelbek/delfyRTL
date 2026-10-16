@@ -73,6 +73,7 @@ typedef enum {
     scriptRunScene,
     recordScene,
     pickApScene,
+    batchScene,
 
     DelfyRTLSceneCount
 } delfyRTLScene;
@@ -359,6 +360,8 @@ typedef enum {
 #define DELFY_EVT_KARMA_POLL 0x2007
 #define DELFY_EVT_SCRIPT_TICK 0x2008
 #define DELFY_EVT_REC_REFRESH 0x2009
+#define DELFY_EVT_BATCH_REFRESH 0x200A
+#define DELFY_EVT_BATCH_RUN 0x200B
 // Info screen buttons (Edit / Deauth / Evil). They are posted as custom events instead of being
 // handled in the widget button callback: on the installed firmware the GUI is an event loop and
 // handle_input() binds a key to the view that is current when the key is *processed*, so switching
@@ -442,12 +445,15 @@ static void hs_put_le32(uint8_t* p, uint32_t v) {
     p[3] = (v >> 24) & 0xFF;
 }
 
-static void hs_write_pcap(uint16_t* out_frames) {
+// The path is a parameter now: a single capture still lands in /ext/delfy/hs.pcap, while the
+// E3 batch writes one pcap per AP into the session directory (otherwise each AP would
+// overwrite the previous one).
+static void hs_write_pcap(const char* path, uint16_t* out_frames) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
     storage_common_mkdir(storage, "/ext/delfy");
     File* file = storage_file_alloc(storage);
     uint16_t written = 0;
-    if(storage_file_open(file, "/ext/delfy/hs.pcap", FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+    if(storage_file_open(file, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
         uint8_t hdr[24] = {0};
         hs_put_le32(hdr + 0, 0xA1B2C3D4); // pcap magic (LE -> d4 c3 b2 a1)
         hs_put_le32(hdr + 4, 0x00040002); // version major=2 (u16), minor=4 (u16)
@@ -1846,6 +1852,7 @@ static void wifi_hub_cb(void* context, uint32_t index) {
     case 13: scene_manager_next_scene(app->scene_manager, scriptListScene); break;
     case 14: scene_manager_next_scene(app->scene_manager, recordScene); break;
     case 15: scene_manager_next_scene(app->scene_manager, toolsMenuScene); break;
+    case 16: scene_manager_next_scene(app->scene_manager, batchScene); break;
     }
 }
 // Re-ask the board for its IDENT while we have not heard back yet. The board answers HELLO
@@ -1881,6 +1888,7 @@ void wifi_hub_scene_on_enter(void* context) {
     // info screen currently resets the device on this firmware (see the DELFY_EVT_INFO_* note),
     // so the whole menu was unreachable. Give it a first-class entry here.
     submenu_add_item(app->submenu, "Tools (capture / recon)", 15, wifi_hub_cb, app);
+    submenu_add_item(app->submenu, "Batch grab (multi-AP)", 16, wifi_hub_cb, app);
     submenu_add_item(app->submenu, "Channel Map", 2, wifi_hub_cb, app);
     submenu_add_item(app->submenu, "Create AP", 3, wifi_hub_cb, app);
     submenu_add_item(app->submenu, "Send Beacon", 4, wifi_hub_cb, app);
@@ -3205,6 +3213,252 @@ static void busy_view_draw(Canvas* canvas, void* model) {
 static volatile uint32_t busy_ticks = 0;
 static int busy_total_s = 0;
 
+// ---------------------------------------------------------------------------------------------
+// E3: batch grab. The batch screen marks APs and the runner walks them one at a time: one HSGRAB
+// per AP, armed only after the board reported HSDONE for the previous one, so two captures never
+// fight over the radio.
+//
+// Two deliberate choices came out of testing this on the device:
+//  * marks are keyed by BSSID and the AP list is SNAPSHOTTED when the scene is entered. The board
+//    keeps reporting APs while it scans, so app->wifiList can grow and reorder under the user's
+//    finger - and a list that shifts between the look and the OK is how you end up pointing a
+//    deauther at the wrong network.
+//  * the rows are ordered "APs first, actions last". UP does not move the cursor on the review
+//    unit (only DOWN does), so the whole flow has to be reachable with DOWN alone.
+// ---------------------------------------------------------------------------------------------
+#define BATCH_MAX 8
+
+typedef struct {
+    int ch;
+    char bssid[13]; // 12 hex, no colons - the exact spelling HSGRAB wants
+    char ssid[17];
+} BatchTarget;
+
+static APDetails batch_aps[BATCH_MAX]; // frozen copy of wifiList for this visit
+static int batch_n = 0;
+static BatchTarget batch_targets[BATCH_MAX];
+static uint8_t batch_count = 0;
+static uint8_t batch_cursor = 0; // submenu POSITION, so the highlight survives a rebuild
+static bool batch_active = false;
+static uint8_t batch_seq = 0;
+static uint8_t batch_good = 0;
+static char batch_report[512];
+
+static void batch_step(delfyRTL* app);
+static void batch_start(delfyRTL* app);
+
+// "AA:BB:CC:DD:EE:FF" -> "AABBCCDDEEFF"; anything that is not exactly 12 hex comes back empty.
+static void batch_hex(const char* mac, char* out /* >= 13 */) {
+    int j = 0;
+    out[0] = '\0';
+    for(int i = 0; mac[i] && j < 12; i++)
+        if(mac[i] != ':') out[j++] = mac[i];
+    out[j] = '\0';
+    if(j != 12) out[0] = '\0';
+}
+
+// Row -> position map, all centred on the snapshot:
+//   0 .. batch_n-1   the APs
+//   batch_n          "Clear marks"
+//   batch_n + 1      "Run batch (n AP)"
+static bool batch_row_is_marked(int row) {
+    if(row < 0 || row >= batch_n) return false;
+    char hex[13];
+    batch_hex(batch_aps[row].APbssid, hex);
+    if(hex[0] == '\0') return false;
+    for(uint8_t i = 0; i < batch_count; i++)
+        if(strncmp(batch_targets[i].bssid, hex, 12) == 0) return true;
+    return false;
+}
+
+static void batch_toggle(int row) {
+    if(row < 0 || row >= batch_n) return;
+    char hex[13];
+    batch_hex(batch_aps[row].APbssid, hex);
+    if(hex[0] == '\0') return; // unpadded/malformed MAC - HSGRAB would reject it anyway
+    for(uint8_t i = 0; i < batch_count; i++) {
+        if(strncmp(batch_targets[i].bssid, hex, 12) == 0) { // un-mark
+            for(uint8_t k = i; k + 1 < batch_count; k++) batch_targets[k] = batch_targets[k + 1];
+            batch_count--;
+            return;
+        }
+    }
+    if(batch_count >= BATCH_MAX) return;
+    BatchTarget* t = &batch_targets[batch_count];
+    t->ch = batch_aps[row].chanel;
+    snprintf(t->bssid, sizeof(t->bssid), "%s", hex);
+    snprintf(t->ssid, sizeof(t->ssid), "%.16s", batch_aps[row].APssid);
+    batch_count++;
+}
+
+// Every bit of view work is deferred: the item callback only mutates state and posts an event,
+// and the submenu is rebuilt in batch_scene_on_event. Rebuilding a view from inside its own
+// callback is what crashed the macro menu (see the F5 note in the roadmap).
+static void batch_item_cb(void* context, uint32_t index) {
+    delfyRTL* app = context;
+    if(index == (uint32_t)batch_n + 1) { // Run
+        batch_cursor = (uint8_t)index;
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_BATCH_RUN);
+        return;
+    }
+    if(index == (uint32_t)batch_n) { // Clear marks
+        batch_count = 0;
+        batch_cursor = (uint8_t)index;
+        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_BATCH_REFRESH);
+        return;
+    }
+    batch_cursor = (uint8_t)index;
+    batch_toggle((int)index);
+    view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_BATCH_REFRESH);
+}
+
+// Rows only; batch_scene_on_enter owns the reset and the view switch.
+static void batch_fill(delfyRTL* app) {
+    for(int i = 0; i < batch_n; i++) {
+        char temp[48];
+        snprintf(
+            temp,
+            sizeof(temp),
+            "%s%s|%.11s %d",
+            batch_row_is_marked(i) ? "[x] " : "[ ] ",
+            (batch_aps[i].chanel > 14) ? "5G" : "2G",
+            batch_aps[i].APssid,
+            batch_aps[i].rssi);
+        submenu_add_item(app->submenu, temp, (uint32_t)i, batch_item_cb, app);
+    }
+    if(batch_n == 0) {
+        submenu_add_item(app->submenu, "(no APs - run Scan Wifi)", 0, NULL, app);
+    } else {
+        submenu_add_item(app->submenu, "Clear marks", (uint32_t)batch_n, batch_item_cb, app);
+        char t[40];
+        snprintf(t, sizeof(t), "Run batch (%u AP)", (unsigned)batch_count);
+        submenu_add_item(app->submenu, t, (uint32_t)batch_n + 1, batch_item_cb, app);
+    }
+    if(batch_cursor > batch_n + 1) batch_cursor = 0;
+    submenu_set_selected_item(app->submenu, batch_cursor);
+}
+
+void batch_scene_on_enter(void* context) {
+    delfyRTL* app = context;
+    // Freeze the list for this visit (see the block comment above).
+    batch_n = app->wifiCount;
+    if(batch_n > BATCH_MAX) batch_n = BATCH_MAX;
+    if(batch_n < 0) batch_n = 0;
+    for(int i = 0; i < batch_n; i++) batch_aps[i] = app->wifiList[i];
+    submenu_reset(app->submenu);
+    submenu_set_header(app->submenu, "Batch grab");
+    batch_fill(app);
+    view_dispatcher_switch_to_view(app->view_dispatcher, scannedWifisView);
+}
+
+bool batch_scene_on_event(void* context, SceneManagerEvent event) {
+    delfyRTL* app = context;
+    if(event.type == SceneManagerEventTypeCustom) {
+        if(event.event == DELFY_EVT_BATCH_REFRESH) {
+            submenu_reset(app->submenu);
+            submenu_set_header(app->submenu, "Batch grab");
+            batch_fill(app);
+            return true;
+        }
+        if(event.event == DELFY_EVT_BATCH_RUN) {
+            if(batch_count == 0) {
+                snprintf(popupHeader, sizeof(popupHeader), "Batch");
+                snprintf(message, sizeof(message), "Mark some APs first");
+                scene_manager_next_scene(app->scene_manager, popupScene);
+            } else {
+                batch_start(app);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+void batch_scene_on_exit(void* context) {
+    UNUSED(context);
+}
+
+static void batch_note(int frames) {
+    size_t used = strlen(batch_report);
+    if(used + 48 >= sizeof(batch_report)) return;
+    const BatchTarget* t = &batch_targets[batch_seq];
+    snprintf(
+        batch_report + used,
+        sizeof(batch_report) - used,
+        "[%u] %.16s ch %d %s -> %d EAPOL\n",
+        (unsigned)(batch_seq + 1),
+        t->ssid,
+        t->ch,
+        t->bssid,
+        frames);
+}
+
+// why != NULL -> the queue stopped early and that line is the message instead of the tally.
+static void batch_finish(delfyRTL* app, const char* why) {
+    batch_active = false;
+    if(batch_report[0]) delfy_save_scan("batch", batch_report);
+    if(why) {
+        snprintf(popupHeader, sizeof(popupHeader), "Batch stopped");
+        snprintf(message, sizeof(message), "%s", why);
+    } else {
+        snprintf(popupHeader, sizeof(popupHeader), "Batch done");
+        snprintf(
+            message,
+            sizeof(message),
+            "%u/%u AP had EAPOL\nsessions/%s",
+            (unsigned)batch_good,
+            (unsigned)batch_count,
+            delfy_session_id);
+    }
+    scene_manager_previous_scene(app->scene_manager); // drop the busy screen first
+    scene_manager_next_scene(app->scene_manager, popupScene);
+}
+
+static void batch_step(delfyRTL* app) {
+    if(!batch_active) return;
+    if(batch_seq >= batch_count) {
+        batch_finish(app, NULL);
+        return;
+    }
+    const BatchTarget* t = &batch_targets[batch_seq];
+    hs_count = 0;
+    hs_channel = t->ch;
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "HSGRAB %d %s 20\n", t->ch, t->bssid);
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    busy_ticks = 0; // a fresh watchdog window per AP, not one shared budget for the whole queue
+    // The screen doubles as the safety display: this is the AP that is about to be worked on.
+    snprintf(
+        popupHeader,
+        sizeof(popupHeader),
+        "Batch %u/%u",
+        (unsigned)(batch_seq + 1),
+        (unsigned)batch_count);
+    snprintf(message, sizeof(message), "%.16s ch %d", t->ssid, t->ch);
+}
+
+static void batch_start(delfyRTL* app) {
+    batch_active = true;
+    batch_seq = 0;
+    batch_good = 0;
+    batch_report[0] = '\0';
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    storage_common_mkdir(st, "/ext/delfy");
+    storage_common_mkdir(st, "/ext/delfy/sessions");
+    char dir[96];
+    snprintf(dir, sizeof(dir), "/ext/delfy/sessions/%s", delfy_session_id);
+    storage_common_mkdir(st, dir);
+    furi_record_close(RECORD_STORAGE);
+    snprintf(popupHeader, sizeof(popupHeader), "Batch grab");
+    snprintf(message, sizeof(message), "%u APs", (unsigned)batch_count);
+    busy_total_s = 0;
+    busy_active = true;
+    scene_manager_next_scene(app->scene_manager, busyScene);
+    batch_step(app);
+}
+
+
+
 static void busy_timer_cb(void* context) {
     // Commit the model straight from the timer thread -- the same pattern the (working)
     // RickRoll widget animation uses. Going through view_dispatcher_send_custom_event
@@ -3258,6 +3512,13 @@ bool busy_scene_on_event(void* context, SceneManagerEvent event) {
         // spinning forever.
         furi_timer_stop(app->busyTimer);
         busy_active = false;
+        if(batch_active) {
+            // E3: an AP that never answered must not stall the queue. Keep the pcaps already on
+            // the SD, close the batch out and say that one went quiet.
+            batch_seq = batch_count;   // stop the queue here; a late HSDONE is then ignored
+            batch_finish(app, "an AP never answered");
+            return true;
+        }
         snprintf(message, sizeof(message), "Timed out - no board reply");
         snprintf(popupHeader, sizeof(popupHeader), "Timeout");
         scene_manager_previous_scene(app->scene_manager);
@@ -3832,7 +4093,7 @@ void (*const delfyRTL_scene_on_enter_handlers[])(void*) = {
     wifi_hub_scene_on_enter,
     ble_hub_scene_on_enter,
     ble_adv_lib_scene_on_enter,
-    portal_list_scene_on_enter, settings_scene_on_enter, session_scene_on_enter, gatt_scene_on_enter, blespam_scene_on_enter, tracker_scene_on_enter, browse_scene_on_enter, karma_scene_on_enter, script_list_scene_on_enter, script_run_scene_on_enter, record_scene_on_enter, pick_ap_scene_on_enter};
+    portal_list_scene_on_enter, settings_scene_on_enter, session_scene_on_enter, gatt_scene_on_enter, blespam_scene_on_enter, tracker_scene_on_enter, browse_scene_on_enter, karma_scene_on_enter, script_list_scene_on_enter, script_run_scene_on_enter, record_scene_on_enter, pick_ap_scene_on_enter, batch_scene_on_enter};
 
 bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     main_menu_scene_on_event,
@@ -3857,7 +4118,7 @@ bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     wifi_hub_scene_on_event,
     ble_hub_scene_on_event,
     ble_adv_lib_scene_on_event,
-    portal_list_scene_on_event, settings_scene_on_event, session_scene_on_event, gatt_scene_on_event, blespam_scene_on_event, tracker_scene_on_event, browse_scene_on_event, karma_scene_on_event, script_list_scene_on_event, script_run_scene_on_event, record_scene_on_event, pick_ap_scene_on_event};
+    portal_list_scene_on_event, settings_scene_on_event, session_scene_on_event, gatt_scene_on_event, blespam_scene_on_event, tracker_scene_on_event, browse_scene_on_event, karma_scene_on_event, script_list_scene_on_event, script_run_scene_on_event, record_scene_on_event, pick_ap_scene_on_event, batch_scene_on_event};
 
 void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     main_menu_scene_on_exit,
@@ -3882,7 +4143,7 @@ void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     wifi_hub_scene_on_exit,
     ble_hub_scene_on_exit,
     ble_adv_lib_scene_on_exit,
-    portal_list_scene_on_exit, settings_scene_on_exit, session_scene_on_exit, gatt_scene_on_exit, blespam_scene_on_exit, tracker_scene_on_exit, browse_scene_on_exit, karma_scene_on_exit, script_list_scene_on_exit, script_run_scene_on_exit, record_scene_on_exit, pick_ap_scene_on_exit};
+    portal_list_scene_on_exit, settings_scene_on_exit, session_scene_on_exit, gatt_scene_on_exit, blespam_scene_on_exit, tracker_scene_on_exit, browse_scene_on_exit, karma_scene_on_exit, script_list_scene_on_exit, script_run_scene_on_exit, record_scene_on_exit, pick_ap_scene_on_exit, batch_scene_on_exit};
 
 static const SceneManagerHandlers delfyRTL_scene_manager_handlers = {
     .on_enter_handlers = delfyRTL_scene_on_enter_handlers,
@@ -4047,9 +4308,17 @@ void uart_process_line(FuriString* line, void* context) {
         token = strtok(NULL, "|");
         if(!token) return;
 
-        snprintf(message, sizeof(message), "%s", token);
-        snprintf(popupHeader, sizeof(popupHeader), "ERROR");
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+        if(batch_active) {
+            // E3: a rejected HSGRAB (unreachable/unparseable target) must not abort the queue -
+            // record the miss and move straight on to the next AP.
+            batch_note(0);
+            batch_seq++;
+            batch_step(app);
+        } else {
+            snprintf(message, sizeof(message), "%s", token);
+            snprintf(popupHeader, sizeof(popupHeader), "ERROR");
+            view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+        }
     } else if(strncmp(furi_string_get_cstr(line), "HSCAP:", 6) == 0) {
         // Board header before a HSFRAME dump: "HSCAP: ch=N count=N".
         hs_count = 0;
@@ -4070,19 +4339,36 @@ void uart_process_line(FuriString* line, void* context) {
         }
     } else if(strncmp(furi_string_get_cstr(line), "HSDONE:", 7) == 0) {
         uint16_t written = 0;
-        hs_write_pcap(&written);
-        if(audit_mode) audit_write_json("handshake", (int)written);
-        char qual[48];
-        hs_quality(qual, sizeof(qual));
-        snprintf(
-            message,
-            sizeof(message),
-            "%u EAPOL: %s\nch %d -> /ext/delfy/hs.pcap",
-            (unsigned)written,
-            qual,
-            hs_channel);
-        snprintf(popupHeader, sizeof(popupHeader), "Capture done");
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+        if(batch_active) {
+            // E3: this AP is finished - give it its own pcap and arm the next one. No popup: the
+            // busy screen stays up and doubles as the progress display.
+            char path[128];
+            snprintf(
+                path,
+                sizeof(path),
+                "/ext/delfy/sessions/%s/batch_%u.pcap",
+                delfy_session_id,
+                (unsigned)(batch_seq + 1));
+            hs_write_pcap(path, &written);
+            if(written) batch_good++;
+            batch_note((int)written);
+            batch_seq++;
+            batch_step(app);
+        } else {
+            hs_write_pcap("/ext/delfy/hs.pcap", &written);
+            if(audit_mode) audit_write_json("handshake", (int)written);
+            char qual[48];
+            hs_quality(qual, sizeof(qual));
+            snprintf(
+                message,
+                sizeof(message),
+                "%u EAPOL: %s\nch %d -> /ext/delfy/hs.pcap",
+                (unsigned)written,
+                qual,
+                hs_channel);
+            snprintf(popupHeader, sizeof(popupHeader), "Capture done");
+            view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+        }
     } else if(strncmp(furi_string_get_cstr(line), "PMFDONE:", 8) == 0) {
         snprintf(recon_title, sizeof(recon_title), "PMF / WPA3");
         const char* s = strstr(furi_string_get_cstr(line), "aps=");
