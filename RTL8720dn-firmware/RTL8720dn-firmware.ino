@@ -2216,9 +2216,15 @@ void loop() {
       delay(50);
       uint8_t got = 0;
       int getres = wext_get_channel(WLAN0_NAME, &got);
+      // NOTE: do not read "cap=" as the current band. wifi_get_band_type() combines the channel
+      // plan with the chip's capability check and never looks at the tuned channel, so a constant
+      // value is expected. 2 = WL_BAND_2_4G_5G_BOTH (dual-band capable), 0 = 2.4G only, 1 = 5G
+      // only, 3 = the channel plan and the chip disagree. Real band switching happens lower down
+      // in the driver (set_channel_bwmode -> phy_switch_wireless_band_8721d), so the only proof
+      // that 5 GHz actually transmits is a receiver - see tools/mac_wifiscan.swift.
       String r = String("CHAN:req=") + String(ch) + " got=" + String((int)got) +
                  " set=" + String(setres) + " get=" + String(getres) +
-                 " band=" + String(wifi_get_band_type());
+                 " cap=" + String(wifi_get_band_type());
       Serial.println(r); Serial1.println(r);
     }else if(readString.substring(0,8)=="TXBEACON"){
       // DIAG (B6 fix): TXBEACON <typehex> <count> [ssid] -> raw beacon frames with a settable
