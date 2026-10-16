@@ -697,6 +697,11 @@ static cli_t cli_list[CLI_MAX];
 static volatile uint8_t cli_n = 0;
 static volatile bool cli_on = false;
 static uint32_t cli_base = 0;      // millis() at the window start; times are stored in seconds
+// A2 RSSI: settled 2026-10-16 - the promisc callback buffer is the bare frame with its 4-byte FCS
+// still attached and NO rx_info appended, so there is nothing to read an RSSI from. Measured over
+// 107 frames on channel 7: the last four bytes (the FCS) spanned mn 00 12 00 00 .. mx F0 FC FD EE,
+// i.e. nearly the whole byte range. A real RSSI sits in a narrow band and never jumps like that.
+// Per-device RSSI therefore needs another mechanism; per-AP RSSI already comes from SCAN.
 
 static void cli_add(const uint8_t* mac) {
   uint16_t now = (uint16_t)((millis() - cli_base) / 1000UL);

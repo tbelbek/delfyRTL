@@ -72,6 +72,7 @@ typedef enum {
     scriptListScene,
     scriptRunScene,
     recordScene,
+    pickApScene,
 
     DelfyRTLSceneCount
 } delfyRTLScene;
@@ -339,6 +340,7 @@ typedef enum {
 #define TOOL_IDS     15
 #define TOOL_CSA     16
 #define TOOL_TRACK   17
+#define TOOL_PICKAP  20
 
 // Deferred GUI events posted from the UART worker thread (GUI must run on the GUI thread).
 #define DELFY_EVT_RECON 0x2000
@@ -996,10 +998,16 @@ void info_wifi_scene_on_enter(void* context) {
     delfyRTL* app = context;
 
     widget_reset(app->widget);
-    // Handed to the widget, so it has to outlive this call: the widget's draw callback reads it
-    // after we return, and a stack buffer here is dead by then. Kept static on purpose.
-    static char infoWifi[100];
-    snprintf(infoWifi, sizeof(infoWifi), "No wifi");
+    // These are handed to the widget, whose draw callback reads them after we return, so they have
+    // to outlive the call - static on purpose. Split into single lines: the KARMA and script screens
+    // draw that way and render fine, while one multiline block with AlignBottom is the only thing
+    // this screen did differently - and it resets the device on this firmware.
+    static char infoL1[24];   // SSID (or "No wifi")
+    static char infoL2[48];   // security
+    static char infoL3[32];   // ch / RSSI
+    static char infoL4[24];   // MAC
+    snprintf(infoL1, sizeof(infoL1), "No wifi");
+    infoL2[0] = '\0'; infoL3[0] = '\0'; infoL4[0] = '\0';
     if(app->selectedWifi >= 0 && app->selectedWifi < app->wifiCount) {
         char* security;
         switch(app->wifiList[app->selectedWifi].security) {
@@ -1059,15 +1067,15 @@ void info_wifi_scene_on_enter(void* context) {
         char ssidshort[22];   // keep the SSID on one line: a wrapped line pushes the
         strncpy(ssidshort, app->wifiList[app->selectedWifi].APssid, sizeof(ssidshort) - 1);
         ssidshort[sizeof(ssidshort) - 1] = '\0';   // whole block off the top of the screen
+        snprintf(infoL1, sizeof(infoL1), "%s", ssidshort);
+        snprintf(infoL2, sizeof(infoL2), "%s", secbuf);
         snprintf(
-            infoWifi,
-            99,
-            "%s\n%s\nch %d  RSSI %d\nMAC %s",
-            ssidshort,
-            secbuf,
+            infoL3,
+            sizeof(infoL3),
+            "ch %d  RSSI %d",
             app->wifiList[app->selectedWifi].chanel,
-            app->wifiList[app->selectedWifi].rssi,
-            app->wifiList[app->selectedWifi].APbssid);
+            app->wifiList[app->selectedWifi].rssi);
+        snprintf(infoL4, sizeof(infoL4), "MAC %s", app->wifiList[app->selectedWifi].APbssid);
 
         // Always show the action buttons. They used to be gated on a non-"<empty>" SSID,
         // which left a hidden AP's info screen with no <Edit button -> you could not reach
@@ -1083,8 +1091,10 @@ void info_wifi_scene_on_enter(void* context) {
         widget_add_button_element(app->widget, GuiButtonTypeRight, "Evil", info_wifi_button_press, app);
         widget_add_button_element(app->widget, GuiButtonTypeLeft, "Edit", info_wifi_button_press, app);
     }
-    widget_add_string_multiline_element(
-        app->widget, 64, 45, AlignCenter, AlignBottom, FontSecondary, infoWifi);
+    widget_add_string_element(app->widget, 64, 1, AlignCenter, AlignTop, FontSecondary, infoL1);
+    widget_add_string_element(app->widget, 64, 13, AlignCenter, AlignTop, FontSecondary, infoL2);
+    widget_add_string_element(app->widget, 64, 25, AlignCenter, AlignTop, FontSecondary, infoL3);
+    widget_add_string_element(app->widget, 64, 37, AlignCenter, AlignTop, FontSecondary, infoL4);
 
     view_dispatcher_switch_to_view(app->view_dispatcher, wifiInfoView);
     char cadena[26] = "";
@@ -1953,6 +1963,7 @@ static void tools_item_callback(void* context, uint32_t index) {
     case TOOL_IDS: delfy_start_ids(app); break;
     case TOOL_CSA: delfy_csa(app); break;
     case TOOL_TRACK: delfy_track(app); break;
+    case TOOL_PICKAP: scene_manager_next_scene(app->scene_manager, pickApScene); break;
     case TOOL_PMKID: delfy_start_pmkid(app, false); break;
     case TOOL_PKGRAB: delfy_start_pmkid(app, true); break;
     case TOOL_PKCLIENT: delfy_start_pmkid_clientless(app); break;
@@ -1977,6 +1988,22 @@ void tools_menu_scene_on_enter(void* context) {
     if(app->fw_version[0]) snprintf(hdr, sizeof(hdr), "Tools  fw%s", app->fw_version);
     else snprintf(hdr, sizeof(hdr), "Tools");
     submenu_set_header(app->submenu, hdr);
+    // Target first, and stable regardless of the caps below: every attack item needs
+    // app->selectedWifi, which used to come only from the AP info screen's Edit button.
+    {
+        char tgt[44];
+        if(app->wifiCount > 0 && app->selectedWifi >= 0 && app->selectedWifi < app->wifiCount) {
+            snprintf(
+                tgt,
+                sizeof(tgt),
+                "Target: %.12s (ch %d)",
+                app->wifiList[app->selectedWifi].APssid,
+                app->wifiList[app->selectedWifi].chanel);
+        } else {
+            snprintf(tgt, sizeof(tgt), "Target: none (scan first)");
+        }
+        submenu_add_item(app->submenu, tgt, TOOL_PICKAP, tools_item_callback, app);
+    }
     // Gate by the board's advertised caps; unknown fw (no IDENT) -> permissive.
     if(delfy_has_cap(app, 'H')) {
         submenu_add_item(app->submenu, "Capture HS (passive)", TOOL_CAPTURE, tools_item_callback, app);
@@ -2012,6 +2039,49 @@ bool tools_menu_scene_on_event(void* context, SceneManagerEvent event) {
 }
 
 void tools_menu_scene_on_exit(void* context) {
+    UNUSED(context);
+}
+
+// Target AP picker for the capture/recon tools. The AP info screen resets this device on the
+// installed firmware (see the note on DELFY_EVT_INFO_*), and Edit there was the only way to give
+// the tools a target - so they were unusable. This is a plain submenu (the kind of screen that is
+// stable here) and it sets the same app->selectedWifi the info screen would have set.
+#define PICK_AP_MAX 24
+static void pick_ap_cb(void* context, uint32_t index) {
+    delfyRTL* app = context;
+    if(app->wifiCount > 0 && index < (uint32_t)app->wifiCount) app->selectedWifi = (int)index;
+    scene_manager_previous_scene(app->scene_manager);
+}
+
+void pick_ap_scene_on_enter(void* context) {
+    delfyRTL* app = context;
+    submenu_reset(app->submenu);
+    submenu_set_header(app->submenu, "Target AP");
+    int n = app->wifiCount;
+    if(n > PICK_AP_MAX) n = PICK_AP_MAX;
+    if(n == 0) {
+        submenu_add_item(app->submenu, "(none - run Scan Wifi)", 0, pick_ap_cb, app);
+    }
+    for(int i = 0; i < n; i++) {
+        char temp[48];
+        snprintf(
+            temp,
+            sizeof(temp),
+            "%s%s|%.12s %d",
+            app->wifiList[i].deauth ? "D|" : "",
+            (app->wifiList[i].chanel > 14) ? "5G" : "2G",
+            app->wifiList[i].APssid,
+            app->wifiList[i].rssi);
+        submenu_add_item(app->submenu, temp, (uint32_t)i, pick_ap_cb, app);
+    }
+    view_dispatcher_switch_to_view(app->view_dispatcher, scannedWifisView);
+}
+bool pick_ap_scene_on_event(void* context, SceneManagerEvent event) {
+    UNUSED(context);
+    UNUSED(event);
+    return false;
+}
+void pick_ap_scene_on_exit(void* context) {
     UNUSED(context);
 }
 
@@ -3737,7 +3807,7 @@ void (*const delfyRTL_scene_on_enter_handlers[])(void*) = {
     wifi_hub_scene_on_enter,
     ble_hub_scene_on_enter,
     ble_adv_lib_scene_on_enter,
-    portal_list_scene_on_enter, settings_scene_on_enter, session_scene_on_enter, gatt_scene_on_enter, blespam_scene_on_enter, tracker_scene_on_enter, browse_scene_on_enter, karma_scene_on_enter, script_list_scene_on_enter, script_run_scene_on_enter, record_scene_on_enter};
+    portal_list_scene_on_enter, settings_scene_on_enter, session_scene_on_enter, gatt_scene_on_enter, blespam_scene_on_enter, tracker_scene_on_enter, browse_scene_on_enter, karma_scene_on_enter, script_list_scene_on_enter, script_run_scene_on_enter, record_scene_on_enter, pick_ap_scene_on_enter};
 
 bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     main_menu_scene_on_event,
@@ -3762,7 +3832,7 @@ bool (*const delfyRTL_scene_on_event_handlers[])(void*, SceneManagerEvent) = {
     wifi_hub_scene_on_event,
     ble_hub_scene_on_event,
     ble_adv_lib_scene_on_event,
-    portal_list_scene_on_event, settings_scene_on_event, session_scene_on_event, gatt_scene_on_event, blespam_scene_on_event, tracker_scene_on_event, browse_scene_on_event, karma_scene_on_event, script_list_scene_on_event, script_run_scene_on_event, record_scene_on_event};
+    portal_list_scene_on_event, settings_scene_on_event, session_scene_on_event, gatt_scene_on_event, blespam_scene_on_event, tracker_scene_on_event, browse_scene_on_event, karma_scene_on_event, script_list_scene_on_event, script_run_scene_on_event, record_scene_on_event, pick_ap_scene_on_event};
 
 void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     main_menu_scene_on_exit,
@@ -3787,7 +3857,7 @@ void (*const delfyRTL_scene_on_exit_handlers[])(void*) = {
     wifi_hub_scene_on_exit,
     ble_hub_scene_on_exit,
     ble_adv_lib_scene_on_exit,
-    portal_list_scene_on_exit, settings_scene_on_exit, session_scene_on_exit, gatt_scene_on_exit, blespam_scene_on_exit, tracker_scene_on_exit, browse_scene_on_exit, karma_scene_on_exit, script_list_scene_on_exit, script_run_scene_on_exit, record_scene_on_exit};
+    portal_list_scene_on_exit, settings_scene_on_exit, session_scene_on_exit, gatt_scene_on_exit, blespam_scene_on_exit, tracker_scene_on_exit, browse_scene_on_exit, karma_scene_on_exit, script_list_scene_on_exit, script_run_scene_on_exit, record_scene_on_exit, pick_ap_scene_on_exit};
 
 static const SceneManagerHandlers delfyRTL_scene_manager_handlers = {
     .on_enter_handlers = delfyRTL_scene_on_enter_handlers,
