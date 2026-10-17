@@ -101,6 +101,12 @@ static int32_t uart_helper_worker(void* context) {
         if((events & WorkerEventExiting) == WorkerEventExiting) break;
 
         if(events & WorkerEventDataWaiting) {
+            // Clear BEFORE draining, not after. With the flag cleared afterwards, a byte that
+            // arrives in the window between the final empty receive and the clear sets the flag and
+            // we then wipe it, so that wakeup is lost until some later byte happens to arrive.
+            // Cleared first, the same byte leaves the flag set for the next wait, which returns
+            // immediately and drains it - no notification can be swallowed.
+            furi_thread_flags_clear(WorkerEventDataWaiting);
             size_t length_read = 0;
             do {
                 // Re-check here too: a chatty board can keep the stream non-empty, and the drain
@@ -170,8 +176,6 @@ static int32_t uart_helper_worker(void* context) {
                 }
                 // Keep reading until we have read all of the data from the stream buffer.
             } while(length_read > 0);
-
-            furi_thread_flags_clear(WorkerEventDataWaiting);
         }
         // Loop until the WorkerEventExiting flag is seen (checked at the top).
     } while(true);
@@ -310,13 +314,14 @@ void uart_helper_free(UartHelper* helper) {
     // Free the worker_thread.
     furi_thread_free(helper->worker_thread);
 
-    furi_hal_serial_control_release(helper->serial_handle);
-    // If the UART was initialized by the application, deinitialize it, otherwise re-enable the console.
+    // Deinit BEFORE releasing: furi_hal_serial_control_release() deinitializes the port itself on
+    // this firmware and re-arms it for whoever owns it next, so calling deinit after the release
+    // tears down a port we no longer own (and can take it away from the other owner).
     if(helper->uart_init_by_app) {
         furi_hal_serial_deinit(helper->serial_handle);
-    } else {
-        // furi_hal_console_enable();
     }
+    furi_hal_serial_control_release(helper->serial_handle);
+    // else: the console owned it; furi_hal_console_enable() is left commented out on purpose.
 
     // Free the rx_stream and ring_buffer.
     furi_stream_buffer_free(helper->rx_stream);
