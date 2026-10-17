@@ -21,7 +21,8 @@ import sys
 from collections import Counter
 
 FN = re.compile(r"^(?:static\s+)?(?:void|bool|int|uint32_t)\s+([A-Za-z_][\w]*)\s*\(")
-TOUCH = re.compile(r"(submenu_reset|widget_reset|view_dispatcher_switch_to_view)\s*\(")
+TOUCH = re.compile(
+    r"(submenu_reset|widget_reset|widget_add_\w+|with_view_model|view_dispatcher_switch_to_view)\s*\(")
 SCENE = re.compile(r"(scene_manager_next_scene|scene_manager_previous_scene)\s*\(")
 # Indirect view rebuild: a scene on_enter() that starts with variable_item_list_reset()/etc. Calling
 # one of these from a change callback frees the list the callback is dispatching from - the bug class
@@ -32,9 +33,12 @@ REBUILD = re.compile(r"([A-Za-z_][\w]*)_scene_on_enter\s*\(")
 EVT_DEF = re.compile(r"^\s*#define\s+(DELFY_EVT_\w+)\s+(0x[0-9A-Fa-f]+)\b")
 
 # Functions that legitimately touch a view outside a scene transition.
+# animation_timer_callback USED to be listed here: it built the RickRoll frame from the timer
+# thread, mutating the shared widget. It now posts DELFY_EVT_ANIM_TICK and the frame is built in
+# beacon_info_scene_on_event, so it is deliberately no longer exempt - a timer callback that
+# touches a view again will fail this check.
 KNOWN_OK = {
     "delfyRTL_custom_callback",   # GUI thread, between frames (view dispatcher callback)
-    "animation_timer_callback",   # pre-existing RickRoll animation (timer thread), verified on hw
 }
 
 

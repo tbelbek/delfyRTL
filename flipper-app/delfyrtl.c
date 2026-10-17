@@ -429,6 +429,9 @@ typedef enum {
 // framework then walks items that were just freed. Post instead; each scene's on_event rebuilds
 // between frames. Shared by both scenes: only the active one receives it.
 #define DELFY_EVT_REBUILD_VIL 0x2011
+// Animation frame for the RickRoll screen. The frame used to be built by the animation timer's
+// callback on the TIMER thread, mutating the shared widget while the GUI could be drawing it.
+#define DELFY_EVT_ANIM_TICK 0x2012
 // B1: raw payload of the last KARMALIST reply ("<n>|ssid|ssid|..."), rendered by the KARMA scene.
 static char karma_list[192];
 // C1: same scene drives both modes - plain KARMA (answer probes) and Trap (clone the network for
@@ -2845,8 +2848,40 @@ void beacon_info_scene_on_enter(void* context) {
 }
 
 bool beacon_info_scene_on_event(void* context, SceneManagerEvent event) {
-    UNUSED(context);
-    UNUSED(event);
+    delfyRTL* app = context;
+    if(event.type == SceneManagerEventTypeCustom && event.event == DELFY_EVT_ANIM_TICK) {
+        // RickRoll frame, moved here from animation_timer_callback (timer thread -> GUI thread).
+        // Reached only while this is the current scene, so the timer's old "did anyone navigate
+        // away?" problem is gone by construction.
+        if(app->rickIndex % 4 == 0) {
+            widget_reset(app->widget);
+            widget_add_string_element(
+                app->widget, 90, 10, AlignCenter, AlignTop, FontPrimary, "RickRoll");
+            if(app->rickIndex >= 8) {
+                widget_add_string_multiline_element(
+                    app->widget,
+                    128,
+                    30,
+                    AlignRight,
+                    AlignCenter,
+                    FontSecondary,
+                    "Never gonna\ngive you up");
+            }
+            if(app->rickIndex >= 16) {
+                widget_add_string_multiline_element(
+                    app->widget,
+                    64,
+                    53,
+                    AlignLeft,
+                    AlignCenter,
+                    FontSecondary,
+                    "Never gonna\nlet you down");
+            }
+        }
+        app->rickIndex = (app->rickIndex + 1) % 24;
+        widget_add_icon_element(app->widget, 0, 0, rick[app->rickIndex]);
+        return true;
+    }
     return false;
 }
 
@@ -3631,21 +3666,14 @@ static void batch_start(delfyRTL* app) {
 
 
 static void busy_timer_cb(void* context) {
-    // Commit the model straight from the timer thread -- the same pattern the (working)
-    // RickRoll widget animation uses. Going through view_dispatcher_send_custom_event
-    // left the phase stuck, so the spinner never rotated.
+    // Timer thread: NO view work here. The model update moved to busy_scene_on_event's
+    // DELFY_EVT_BUSY_TICK case, which runs on the GUI thread - the mechanism script and KARMA
+    // already use. The old code committed the model from this thread with
+    // with_view_model(..., true), which runs the view's update path off the GUI thread; the
+    // comment that justified it ("going through the dispatcher left the phase stuck") was written
+    // when the dispatcher queue could still block, which it no longer can.
     delfyRTL* app = context;
-    with_view_model(
-        app->busyView,
-        BusyModel* m,
-        {
-            m->phase++;
-            if(busy_total_s > 0) {   // E2: live countdown for timed operations
-                int rem = busy_total_s - (int)(busy_ticks * 120 / 1000);
-                m->remain_s = (rem > 0) ? (int8_t)rem : 0;
-            }
-        },
-        true);
+    post_event(app, DELFY_EVT_BUSY_TICK);
     // Watchdog: the board may never answer (wedged AP/capture). Without this the spinner
     // spun forever with no way out besides BACK. ~36 s at 120 ms/tick -> "Timeout" popup.
     if(++busy_ticks >= 300) {
@@ -3675,7 +3703,21 @@ void busy_scene_on_enter(void* context) {
 bool busy_scene_on_event(void* context, SceneManagerEvent event) {
     delfyRTL* app = context;
     if(event.type == SceneManagerEventTypeCustom && event.event == DELFY_EVT_BUSY_TICK) {
-        with_view_model(app->busyView, BusyModel* m, { m->phase++; }, true);
+        // Runs on the GUI thread (the event ring is drained by the UART tick). The countdown came
+        // with it: the timer used to compute remain_s while committing the model from its own
+        // thread. Reached only while this is the current scene, so a stale tick after navigating
+        // away cannot repaint a screen the user already left.
+        with_view_model(
+            app->busyView,
+            BusyModel* m,
+            {
+                m->phase++;
+                if(busy_total_s > 0) {   // E2: live countdown for timed operations
+                    int rem = busy_total_s - (int)(busy_ticks * 120 / 1000);
+                    m->remain_s = (rem > 0) ? (int8_t)rem : 0;
+                }
+            },
+            true);
         return true;
     }
     if(event.type == SceneManagerEventTypeCustom && event.event == DELFY_EVT_BUSY_TIMEOUT) {
@@ -4835,36 +4877,9 @@ void uart_process_line(FuriString* line, void* context) {
 
 static void animation_timer_callback(void* context) {
     delfyRTL* app = context;
-    if(app->rickIndex % 4 == 0) {
-        widget_reset(app->widget);
-        widget_add_string_element(
-            app->widget, 90, 10, AlignCenter, AlignTop, FontPrimary, "RickRoll");
-        if(app->rickIndex >= 8) {
-            widget_add_string_multiline_element(
-                app->widget,
-                128,
-                30,
-                AlignRight,
-                AlignCenter,
-                FontSecondary,
-                "Never gonna\ngive you up");
-        }
-        if(app->rickIndex >= 16) {
-            widget_add_string_multiline_element(
-                app->widget,
-                64,
-                53,
-                AlignLeft,
-                AlignCenter,
-                FontSecondary,
-                "Never gonna\nlet you down");
-        }
-    }
-    app->rickIndex = (app->rickIndex + 1) % 24;
-
-    widget_add_icon_element(app->widget, 0, 0, rick[app->rickIndex]);
-
-    //furi_timer_start(app->timer, 300);
+    // Timer thread: post only. The frame is built in beacon_info_scene_on_event's
+    // DELFY_EVT_ANIM_TICK case, on the GUI thread.
+    post_event(app, DELFY_EVT_ANIM_TICK);
 }
 
 static delfyRTL* app_alloc() {
