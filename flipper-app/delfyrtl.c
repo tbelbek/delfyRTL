@@ -1522,7 +1522,13 @@ static void delfy_start_audit(delfyRTL* app) {
 }
 
 // A: capability check from the board's IDENT. Unknown/old fw -> permissive.
-static bool delfy_has_cap(delfyRTL* app, char cap) {    if(app->fw_caps[0] == '\0') return true;
+static bool delfy_has_cap(delfyRTL* app, char cap) {
+    // An UNKNOWN board must not be treated as capable. This used to return true when the caps
+    // string was empty, so a board that had not even answered HELLO presented every
+    // capability-gated tool - and pressing one of those rows did nothing or failed confusingly.
+    // Deny instead; the hub and the Tools header say "no board" so the user knows why the rows
+    // are missing.
+    if(app->fw_caps[0] == '\0') return false;
     return strchr(app->fw_caps, cap) != NULL;
 }
 
@@ -2265,7 +2271,10 @@ void tools_menu_scene_on_enter(void* context) {
     // to see what you are pointed at at all times. The band marker is there because the same SSID
     // shows up twice on a dual-band network. The fw version still lives in the session summary.
     char hdr[32];
-    if(app->wifiCount > 0 && app->selectedWifi >= 0 && app->selectedWifi < app->wifiCount) {
+    if(app->fw_caps[0] == '\0') {
+        // No board (or one that has not answered): the capability-gated rows are gone, so say why.
+        snprintf(hdr, sizeof(hdr), "Tools: no board");
+    } else if(app->wifiCount > 0 && app->selectedWifi >= 0 && app->selectedWifi < app->wifiCount) {
         snprintf(
             hdr,
             sizeof(hdr),
