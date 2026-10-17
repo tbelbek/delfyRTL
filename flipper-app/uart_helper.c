@@ -88,12 +88,25 @@ static int32_t uart_helper_worker(void* context) {
     uint32_t events;
 
     do {
+        // FuriFlagNoClear is essential for shutdown: without it the wait CONSUMES the flags it
+        // returns, so an Exiting that lands while we are inside the drain below can be cleared by
+        // the next wait and never be observed - furi_thread_join() would then wait forever. With
+        // NoClear the Exiting flag stays set until the thread is gone, so the check can never miss
+        // it, and we clear DataWaiting ourselves once the stream is actually drained.
         events = furi_thread_flags_wait(
-            WorkerEventDataWaiting | WorkerEventExiting, FuriFlagWaitAny, FuriWaitForever);
+            WorkerEventDataWaiting | WorkerEventExiting,
+            FuriFlagWaitAny | FuriFlagNoClear,
+            FuriWaitForever);
+
+        if((events & WorkerEventExiting) == WorkerEventExiting) break;
 
         if(events & WorkerEventDataWaiting) {
             size_t length_read = 0;
             do {
+                // Re-check here too: a chatty board can keep the stream non-empty, and the drain
+                // loop must not be able to hold the exit up.
+                if(uart_helper_worker_is_stopping()) break;
+
                 // We will read out of the stream into this temporary read_buffer in chunks
                 // of up to 32 bytes.  A tricker implementation would be to read directly
                 // into our ring_buffer, avoiding the extra copy.
@@ -144,8 +157,11 @@ static int32_t uart_helper_worker(void* context) {
                                 // pointer to the next byte after the delimiter.
                                 ring_buffer_extract_line(helper->ring_buffer, index, line);
 
-                                // Invoke the callback to process the line.
-                                if(helper->process_line) {
+                                // Invoke the callback to process the line. Both must be published
+                                // (set_callback writes context before process_line) so a line that
+                                // lands mid-install is dropped instead of calling a callback with
+                                // an uninitialised context.
+                                if(helper->process_line && helper->context) {
                                     helper->process_line(line, helper->context);
                                 }
                             }
@@ -154,9 +170,11 @@ static int32_t uart_helper_worker(void* context) {
                 }
                 // Keep reading until we have read all of the data from the stream buffer.
             } while(length_read > 0);
+
+            furi_thread_flags_clear(WorkerEventDataWaiting);
         }
-        // Keep processing data until the WorkerEventExiting flag is set.
-    } while((events & WorkerEventExiting) != WorkerEventExiting);
+        // Loop until the WorkerEventExiting flag is seen (checked at the top).
+    } while(true);
 
     furi_string_free(line);
 
@@ -189,7 +207,10 @@ UartHelper* uart_helper_alloc() {
     }
 
     // process_line callback gets invoked when a line is read.  By default the callback is not set.
+    // context MUST be initialised too: the worker tests both before calling, and malloc leaves it
+    // indeterminate otherwise.
     helper->process_line = NULL;
+    helper->context = NULL;
 
     // Set the baud rate for the UART
     furi_hal_serial_set_br(helper->serial_handle, uart_baud);
@@ -222,9 +243,11 @@ void uart_helper_set_delimiter(UartHelper* helper, char delimiter, bool include_
 }
 
 void uart_helper_set_callback(UartHelper* helper, ProcessLine process_line, void* context) {
-    // Set the process_line callback and context.
-    helper->process_line = process_line;
+    // Publish the context BEFORE the callback: the worker tests both, and if it saw a non-NULL
+    // process_line while context was still NULL it would drop the line (the old order did exactly
+    // that for any line that arrived during install).
     helper->context = context;
+    helper->process_line = process_line;
 }
 
 void uart_helper_set_baud_rate(UartHelper* helper, uint32_t baud_rate) {
@@ -271,6 +294,13 @@ void uart_helper_send_string(UartHelper* helper, FuriString* string) {
 }
 
 void uart_helper_free(UartHelper* helper) {
+    // STOP THE RX FIRST. This is the important line: the async-RX callback
+    // (uart_helper_received_byte_callback) is invoked from the serial ISR and touches BOTH
+    // helper->rx_stream and helper->worker_thread. Leaving it registered while we free the worker,
+    // the stream buffer and then `helper` itself is a use-after-free that any single incoming byte
+    // after this point can trigger. Nothing below this line may run while RX is live.
+    furi_hal_serial_async_rx_stop(helper->serial_handle);
+
     // Signal that we want the worker to exit.  It may be doing other work.
     furi_thread_flags_set(furi_thread_get_id(helper->worker_thread), WorkerEventExiting);
 

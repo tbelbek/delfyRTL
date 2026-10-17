@@ -147,7 +147,10 @@ size_t ring_buffer_find_delim(RingBuffer* rb) {
 
 void ring_buffer_extract_line(RingBuffer* rb, size_t delim_index, FuriString* line) {
     if(furi_mutex_acquire(rb->mutex, FuriWaitForever) == FuriStatusOk) {
-        if(delim_index > rb->ring_buffer_read) {
+        // NOTE `>=`, not `>`: when the delimiter sits exactly at the read pointer the line is
+        // EMPTY (two delimiters back to back). The old `>` sent that case to the wraparound
+        // branch, which copies ring_buffer_size - read bytes of stale buffer into the line.
+        if(delim_index >= rb->ring_buffer_read) {
             // line is in one chunk
             furi_string_set_strn(
                 line,

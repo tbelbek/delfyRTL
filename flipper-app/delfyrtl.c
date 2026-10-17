@@ -371,13 +371,22 @@ typedef enum {
 // the view (or resetting the widget) from inside that handler faults the Flipper. Pressing Edit
 // used to reach the attack config by luck; it does not on this build - it hard-resets the device.
 // Posted events are handled between frames, which is safe (same fix as the KARMA screen).
-#define DELFY_EVT_INFO_EDIT 0x200A
-#define DELFY_EVT_INFO_DEAUTH 0x200B
+// IDs must be UNIQUE per scene-message: these two used to share 0x200A / 0x200B with
+// DELFY_EVT_BATCH_REFRESH / DELFY_EVT_BATCH_RUN above, so a batch event still queued when the
+// user navigated to the Info screen was decoded as "Info Edit" and opened the text input.
+#define DELFY_EVT_INFO_EDIT 0x200F
+#define DELFY_EVT_INFO_DEAUTH 0x2010
 #define DELFY_EVT_INFO_EVIL 0x200C
 // AP config: the list's enter callback used to set the text input up and switch to it inline.
 // Same "view work inside a view callback" shape as DELFY_EVT_INFO_* - defer it to the scene.
 #define DELFY_EVT_AP_EDIT_NAME 0x200D
 #define DELFY_EVT_AP_EDIT_PASSWORD 0x200E
+// Rebuild the variable-item list of the CURRENT config scene (AP config / attack config).
+// The security, channel and MAC-type change callbacks used to call *_scene_on_enter() directly,
+// which runs variable_item_list_reset() on the very list that is dispatching the callback - the
+// framework then walks items that were just freed. Post instead; each scene's on_event rebuilds
+// between frames. Shared by both scenes: only the active one receives it.
+#define DELFY_EVT_REBUILD_VIL 0x2011
 // B1: raw payload of the last KARMALIST reply ("<n>|ssid|ssid|..."), rendered by the KARMA scene.
 static char karma_list[192];
 // C1: same scene drives both modes - plain KARMA (answer probes) and Trap (clone the network for
@@ -1227,11 +1236,11 @@ void mac_type_change_call_back(VariableItem* item) {
         parse_mac(app->customMac, app->byte_input_store);
     }
 
-    if(app->menuIndex == ListWifis) {
-        config_attack_scene_on_enter(app);
-    } else if(app->menuIndex == CreateAP) {
-        config_ap_scene_on_enter(app);
-    }
+    // Do NOT rebuild the list from inside this callback. Both config scenes rebuild by calling
+    // config_*_scene_on_enter(), which starts with variable_item_list_reset() - i.e. it frees the
+    // items of the list whose change callback we are inside right now. Post the rebuild and let the
+    // scene's on_event do it between frames (the same rule the Info screen buttons follow).
+    view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_REBUILD_VIL);
 }
 
 static void delfy_start_capture(delfyRTL* app, bool grab) {
@@ -2617,8 +2626,13 @@ void config_attack_scene_on_enter(void* context) {
     variable_item_list_set_enter_callback(app->variableList, config_attack_change_call_back, app);
 }
 bool config_attack_scene_on_event(void* context, SceneManagerEvent event) {
-    UNUSED(context);
-    UNUSED(event);
+    delfyRTL* app = context;
+    if(event.type == SceneManagerEventTypeCustom && event.event == DELFY_EVT_REBUILD_VIL) {
+        // Same deferred rebuild as config_ap_scene_on_event: mac_type_change_call_back posts this
+        // instead of calling config_attack_scene_on_enter() while its own list is dispatching.
+        config_attack_scene_on_enter(app);
+        return true;
+    }
     return false;
 }
 void config_attack_scene_on_exit(void* context) {
@@ -3149,7 +3163,12 @@ bool script_run_scene_on_event(void* context, SceneManagerEvent event) {
 
 void script_run_scene_on_exit(void* context) {
     delfyRTL* app = context;
-    (void)app;
+    // Stop the timer, do not just clear the flag. Left running, this periodic timer keeps posting
+    // DELFY_EVT_SCRIPT_TICK into the dispatcher for the rest of the session (every post is a
+    // view_dispatcher_send_custom_event, which BLOCKS once the event queue is full), and the stray
+    // tick lands on whatever scene is current. Every other scene timer is stopped on exit; this one
+    // was missed.
+    furi_timer_stop(app->scriptTimer);
     script_running = false;
 }
 
@@ -4016,7 +4035,9 @@ void security_change_callback(VariableItem* item) {
     delfyRTL* app = variable_item_get_context(item);
     variable_item_set_current_value_text(item, securityType[index]);
     app->securityAP = index;
-    config_ap_scene_on_enter(app);
+    // Post, never call config_ap_scene_on_enter() here: it resets the list we are dispatching from
+    // (the password row appears/disappears with the security type).
+    view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_REBUILD_VIL);
 }
 
 void channel_change_callback(VariableItem* item) {
@@ -4025,7 +4046,7 @@ void channel_change_callback(VariableItem* item) {
     delfyRTL* app = variable_item_get_context(item);
     //variable_item_set_current_value_text(item, securityType[index]);
     app->channelAP = index;
-    config_ap_scene_on_enter(app);
+    view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_REBUILD_VIL);
 }
 
 void config_ap_change_call_back(void* context, uint32_t index) {
@@ -4163,6 +4184,12 @@ bool config_ap_scene_on_event(void* context, SceneManagerEvent event) {
                 app->passwordAPLength,
                 true);
             view_dispatcher_switch_to_view(app->view_dispatcher, apPasswordTextInputView);
+            return true;
+        case DELFY_EVT_REBUILD_VIL:
+            // Deferred rebuild requested by security_change_callback / channel_change_callback /
+            // mac_type_change_call_back. Safe here: this runs between frames, not inside the list's
+            // own input dispatch. on_enter keeps the currently selected row.
+            config_ap_scene_on_enter(app);
             return true;
         case SsidAPInputSceneSaveEvent:
             FURI_LOG_D(TAG, "ssidAPLenght %d", strlen(app->ssidAP));
@@ -4967,12 +4994,19 @@ static void app_free(delfyRTL* app) {
     furi_timer_free(app->karmaTimer);
     furi_timer_free(app->scriptTimer);
     uart_helper_free(app->uart_helper);
-    // The line queue is deliberately NOT freed here: view_dispatcher_free() below drains queued
-    // events ("Some events whre not processed") and can still run the 1 ms tick registered on it,
-    // which reads app->uart_lines. Freeing it first is a NULL dereference on exit - which is
-    // exactly what the device reported ("Flipper crashed and was rebooted / NULL pointer
-    // dereference"). One queue per run is a leak the process takes with it.
-    // furi_message_queue_free(app->uart_lines);
+    // Now the queue can go - and it MUST, or every app run leaks the 64-slot ring plus every
+    // FuriString still parked in it. The old comment here claimed the opposite; checked against the
+    // firmware source, view_dispatcher_free() does NOT drain events or run the tick - it removes
+    // the view port, frees its own input/event queues and the dispatcher. The tick is armed once
+    // inside view_dispatcher_run() and stops firing when the loop returns, which is before app_free
+    // is reached, and uart_helper_free() above has already joined the only producer. So detach the
+    // tick anyway (cheap, makes the intent explicit), drop what is inside, then free the queue.
+    view_dispatcher_set_tick_event_callback(app->view_dispatcher, NULL, 0);
+    FuriString* leftover;
+    while(furi_message_queue_get(app->uart_lines, &leftover, 0) == FuriStatusOk) {
+        furi_string_free(leftover);
+    }
+    furi_message_queue_free(app->uart_lines);
 
     view_dispatcher_remove_view(app->view_dispatcher, mainMenuView);
     view_dispatcher_remove_view(app->view_dispatcher, scannedWifisView);
