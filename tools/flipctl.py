@@ -171,6 +171,10 @@ def grab(s, timeout=1.5):
     return last
 
 
+# The open device socket, so the watchdog can close the session before it kills the process.
+_SOCK = None
+
+
 def close_session(s):
     """Stop the screen stream and the RPC session before closing the port.
     Without this the device keeps the stream (and buffers) alive -> leaks RAM and a
@@ -202,7 +206,18 @@ def main():
     # forever and leaves the RPC session orphaned, bricking the CLI until reboot.
     if hasattr(signal, "SIGALRM"):
         def _bail(_sig, _frm):
-            print("timeout"); sys.stdout.flush(); import os; os._exit(2)
+            print("timeout"); sys.stdout.flush()
+            # Close the RPC session BEFORE dying. os._exit() skips the normal close path, and a
+            # session left open keeps the screen stream (and its buffers) alive on the device - the
+            # exact leak the runbook warns about ("leaks RAM and a later preload fails with 'Not
+            # enough memory'"). Every watchdog timeout used to leak one, and this project's
+            # intermittent out-of-memory crashes began during a day of hundreds of these calls.
+            try:
+                if _SOCK is not None:
+                    close_session(_SOCK)
+            except Exception:
+                pass
+            import os; os._exit(2)
         signal.signal(signal.SIGALRM, _bail)
         signal.alarm(20)
     settle = 0.25
@@ -212,7 +227,9 @@ def main():
     if "--shot" in args:
         shot = args[args.index("--shot") + 1]
 
+    global _SOCK
     s = connect()
+    _SOCK = s
     cmd = args[0]
     try:
         if cmd == "shot":
