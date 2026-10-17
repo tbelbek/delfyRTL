@@ -489,6 +489,12 @@ int scanNetworks(int miliseconds) {
   }
 }
 String readString;
+// Per-source line buffers (see loop()). USB is the out-of-band control channel, Serial1 is the
+// Flipper. Keeping them apart stops a partial line from one UART from merging with a line from the
+// other, which could hand a command to the wrong branch of the chain below.
+String cmdUsb;
+String cmdFlip;
+#define CMD_LINE_MAX 512     // no real command comes close; caps a runaway unterminated line
 
 void setup() {
   pinMode(LED_R, OUTPUT);
@@ -498,6 +504,8 @@ void setup() {
   Serial.begin(BAUD);
   Serial1.begin(BAUD);
   readString.reserve(50);
+  cmdUsb.reserve(50);
+  cmdFlip.reserve(50);
   DEBUG_SER_PRINT("Iniciando\n");
   
   WiFi.enableConcurrent();
@@ -1614,12 +1622,30 @@ static void ble_stream() {
 }
 
 void loop() {
-  // Drain both UARTs fast (no per-char delay) so long chunked lines aren't dropped; we
-  // only process once a full '\n'-terminated command is in.
-  while (Serial1.available()) { readString += (char)Serial1.read(); }
-  while (Serial.available())   { readString += (char)Serial.read(); }
-  if(readString.length() > 0 && readString.charAt(readString.length() - 1) == '\n'){
-    rec_note(readString);   // F5: capture actions for macro recording (filtered inside)
+  // Drain each UART fast (no per-char delay) so long chunked lines aren't dropped, into its OWN
+  // buffer.
+  while (Serial1.available()) { cmdFlip += (char)Serial1.read(); }
+  while (Serial.available())   { cmdUsb  += (char)Serial.read(); }
+  // Process EVERY complete line, in order, from both sources (USB first: the out-of-band control
+  // channel). The old code ran the chain only when the whole accumulated buffer ended in '\n' and
+  // then cleared all of it, so two commands delivered in the same loop() pass silently lost the
+  // second one - which is also why the FAP had to sleep 200 ms between state commands (see
+  // info_wifi_scene_on_enter) and why a CHANNEL could appear to be ignored. Each line is handed to
+  // the chain WITH its trailing '\n', which is exactly what its length()-1 parsers expect, so the
+  // chain itself is unchanged.
+  for(int src = 0; src < 2; src++) {
+    String& buf = (src == 0) ? cmdUsb : cmdFlip;
+    while(true) {
+      int nl = buf.indexOf('\n');
+      if(nl < 0) break;
+      if(nl > CMD_LINE_MAX) { buf.remove(0, nl + 1); continue; }  // absurd line: drop it whole
+      // Copy the line out, then drop exactly those bytes from the buffer. remove() replaces the
+      // old substring-and-reassign dance: it needs no second String for the remainder (which was
+      // an unchecked allocation that could silently lose the rest of the buffer) and it does not
+      // re-copy the shrinking suffix once per line.
+      readString = buf.substring(0, nl + 1);   // one line, trailing '\n' included
+      buf.remove(0, nl + 1);
+      rec_note(readString);   // F5: capture actions for macro recording (filtered inside)
     if(readString.substring(0,4)=="SCAN"){
       if(apActive)
         destroyAP();
@@ -1629,9 +1655,15 @@ void loop() {
       rickroll=false;
       ssid="";
 
-      while (scanNetworks(5000)){
+      // BOUNDED retry. This used to loop until a scan SUCCEEDED (scanNetworks() returns 1 on
+      // failure), so a wedged radio - or a scan attempted while the softAP is up - meant the board
+      // never returned to loop(): no commands, no TX, and nothing but a power cycle to recover.
+      // Try twice, then answer anyway and let the host see an empty/partial list.
+      int scan_tries = 0;
+      while (scanNetworks(5000) && ++scan_tries < 2) {
         delay(1000);
       }
+      if(scan_tries >= 2) DEBUG_SER_PRINT("SCAN: gave up after 2 tries");
       Serial1.print("SCAN:OK\n");
       Serial.print("SCAN:OK\n");
       
@@ -2821,10 +2853,12 @@ void loop() {
         Serial.println("PKGRAB: armed"); Serial1.println("PKGRAB: armed");
       }
     }
-    readString="";
-
+      readString="";
+    }
+    // A partial line that never ends in '\n' would otherwise sit in this buffer forever.
+    if(buf.length() > CMD_LINE_MAX) buf = "";
   }
-  
+
   // P1: channel hop tick
   if (hopping) {
     static uint32_t last_hop = 0;
