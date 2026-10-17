@@ -324,7 +324,10 @@ static FuriMutex* post_mutex = NULL;
 #include <furi/core/memmgr.h>
 #include <furi/core/memmgr_heap.h>
 
-#define DIAG_N 256
+// 64 records, not 256: this ring is static (.bss), and the FAP's whole budget is small - a 256-slot
+// ring is 8 KB, which together with the 6 KB stack is most of the ~20 KB the device has free. The
+// instrument must not become the problem it is meant to find.
+#define DIAG_N 64
 typedef struct {
     uint32_t seq;
     uint32_t tick;
