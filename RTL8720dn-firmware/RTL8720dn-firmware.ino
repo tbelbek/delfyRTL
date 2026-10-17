@@ -314,13 +314,16 @@ void destroyAP(){
   stop_DHCP_Server();     // dhcp_pcb = NULL -> next start_DHCP_Server() retargets + rebinds
   serveBegined = false;   // -> next createAP() re-opens the HTTP listen socket
   delay(500);
-  WiFiClient client = server.available();
-  while(client.connected()){
-    DEBUG_SER_PRINT("PArando cliente");
-    DEBUG_SER_PRINT(client);
+  // Close the clients we know about, but do NOT hammer accept(): every call on an idle socket makes
+  // the SDK print "[ERROR] Accept connection failed", and this loop called it with no bound at all
+  // (and printed the WiFiClient object itself). Poll a few times with a short pause, then move on -
+  // the listen socket is re-opened by the next createAP() anyway.
+  for(int i = 0; i < 8; i++) {
+    WiFiClient client = server.available();
+    if(!client || !client.connected()) break;
     client.flush();
     client.stop();
-    client = server.available();
+    delay(50);
   }
   apActive=false;
   delay(500);
@@ -501,7 +504,12 @@ String readString;
 // other, which could hand a command to the wrong branch of the chain below.
 String cmdUsb;
 String cmdFlip;
-#define CMD_LINE_MAX 512     // no real command comes close; caps a runaway unterminated line
+// Caps a runaway unterminated line. 2048, not 512: the portal upload sends its HTML as HEX in
+// "PORTALHTML <hex>" lines of 256 bytes -> 512 hex chars plus the 11-char command word plus the
+// newline is 524 bytes, so a 512 limit silently dropped every full chunk and broke the custom
+// portal. Caught in review, not on hardware - a reminder that a size limit needs its largest real
+// caller checked, not just "no command is that long".
+#define CMD_LINE_MAX 2048
 
 void setup() {
   pinMode(LED_R, OUTPUT);
