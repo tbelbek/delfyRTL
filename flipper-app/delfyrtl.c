@@ -677,15 +677,37 @@ static void hs_quality(char* out, size_t cap) {
 }
 
 // E: write a small audit summary next to the capture.
+// Minimal JSON string escaping: quote and backslash get escaped, control characters become \uXXXX.
+// Truncates rather than overflowing. The audit file is meant to be machine-readable, and SSIDs are
+// attacker-chosen strings - an AP named  \" or with a backslash used to produce invalid JSON.
+static void json_escape(const char* in, char* out, size_t cap) {
+    size_t o = 0;
+    if(cap == 0) return;
+    for(const char* p = in; p && *p && o + 7 < cap; p++) {
+        unsigned char c = (unsigned char)*p;
+        if(c == '"' || c == '\\') {
+            out[o++] = '\\';
+            out[o++] = (char)c;
+        } else if(c < 0x20) {
+            o += (size_t)snprintf(out + o, cap - o, "\\u%04x", c);
+        } else {
+            out[o++] = (char)c;
+        }
+    }
+    out[o] = '\0';
+}
+
 static void audit_write_json(const char* kind, int frames) {    Storage* st = furi_record_open(RECORD_STORAGE);
     storage_common_mkdir(st, "/ext/delfy");
     furi_record_close(RECORD_STORAGE);
+    char esc_ssid[96];
+    json_escape(audit_ssid, esc_ssid, sizeof(esc_ssid));
     char buf[256];
     int n = snprintf(
         buf,
         sizeof(buf),
         "{\"ssid\":\"%s\",\"bssid\":\"%s\",\"channel\":%d,\"security\":%d,\"kind\":\"%s\",\"frames\":%d}\n",
-        audit_ssid,
+        esc_ssid,
         audit_bssid,
         audit_ch,
         audit_sec,
