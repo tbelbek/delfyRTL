@@ -403,6 +403,7 @@ static volatile uint32_t storage_fail_seq = 0;
 // when the queue is full, so nothing ever blocks here.
 static bool storage_submit(const char* path, char* data, size_t len, bool append) {
     if(!storage_mutex || !storage_run || !data) return false;
+    diag(13, (uint32_t)len, append ? 1u : 0u);       // snapshot size offered to the worker
     bool ok = false;
     furi_mutex_acquire(storage_mutex, FuriWaitForever);
     uint8_t next = (uint8_t)((storage_head + 1) % STORAGE_Q);
@@ -471,6 +472,7 @@ static int32_t storage_worker(void* context) {
         if(!have) {
             continue;
         }
+        diag(16, (uint32_t)job.len, 0);              // job dequeued for writing
         Storage* st = furi_record_open(RECORD_STORAGE);
         File* f = storage_file_alloc(st);
         FS_OpenMode om = job.append ? FSOM_OPEN_APPEND : FSOM_CREATE_ALWAYS;
@@ -707,6 +709,7 @@ static void hs_write_pcap(const char* path, uint16_t* out_frames) {
         if(hs_lens[i] == 0) continue;
         total += 16 + hs_lens[i];
     }
+    diag(14, (uint32_t)total, 0);                    // pcap snapshot requested
     char* snap = malloc(total);
     if(snap) {
         size_t off = 0;
@@ -908,6 +911,7 @@ static void delfy_save_scan(const char* kind, const char* body) {
     // write from the GUI thread, from inside the UART line handler.
     size_t blen = (body && body[0]) ? strlen(body) : 0;
     size_t total = (size_t)n + blen;
+    diag(14, (uint32_t)total, 1);                    // scan-list snapshot requested
     char* snap = malloc(total);
     if(snap) {
         memcpy(snap, hdr, (size_t)n);
@@ -4772,6 +4776,7 @@ void uart_process_line(FuriString* line, void* context);
 static void uart_enqueue_line(FuriString* line, void* context) {
     delfyRTL* app = context;
     if(uart_helper_worker_is_stopping()) return;
+    diag(11, (uint32_t)furi_string_size(line), 0);   // about to copy a line into the queue
     FuriString* copy = furi_string_alloc_set(line);
     for(;;) {
         if(uart_helper_worker_is_stopping()) {
@@ -4876,6 +4881,7 @@ static void uart_gui_tick(void* context) {
 }
 
 void uart_process_line(FuriString* line, void* context) {
+    diag(17, (uint32_t)furi_string_size(line), 0);   // input line size
     FURI_LOG_D(TAG, __func__);
     FURI_LOG_D(TAG, "%s", furi_string_get_cstr(line));
     delfyRTL* app = context;
