@@ -1,6 +1,7 @@
 #include "vector"
 #include "wifi_conf.h"
 #include "wifi_cust_tx.h"
+#include "wifi_drv.h"   // arduino_wifi_mode_check (Arduino's private mode cache)
 #include "wifi_drv.h"
 #include "debug.h"
 #include "WiFi.h"
@@ -197,6 +198,32 @@ bool serveBegined =false;
 
 void createAP(char* ssid, char* channel, char* password){
   int mode;
+  // The driver cannot sniff and run a softAP at once: with a promiscuous callback still registered
+  // (any of the scan/handshake/tracker/IDS features leaves one behind) apbegin() fails with
+  // "ioctl[RTKIOCSIWFREQ] error / Operation failed!" and the AP never comes up - which is exactly
+  // the softAP bug we chased. The KARMA path already did this stop before calling createAP; doing it
+  // here means no caller can forget it again.
+  wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
+  // The AP must come up in AP mode, and that is the whole softAP bug we chased. apbegin() only does
+  // arduino_wifi_mode_check |= 0x10, so it never clears the sticky STA/concurrent bit left by any
+  // earlier scanning; wifiDriverInit() then picks RTW_MODE_STA_AP and the channel set inside
+  // apActivate() fails with "ioctl[RTKIOCSIWFREQ] error / Operation failed!". Note the trap: setting
+  // the channel directly on the running interface succeeds *while in STA mode* - success there says
+  // nothing about the AP-mode path, which is why three attempts at promisc/mode/pre-setting all
+  // missed. Assign (do not OR) the mode, sync Arduino's private cache, then force a checked restart.
+  {
+    int want = atoi(channel);
+    if(want < 1 || want > 165) want = 6;
+    snprintf(ap_channel, sizeof(ap_channel), "%d", want);   // keep the request authoritative
+    arduino_wifi_mode_check = 0x10;                          // discard the concurrent/STA bits
+    // (WiFiClass::init() is private in this core; apbegin -> WiFiDrv::wifiDriverInit() does
+    //  the driver/lwIP bring-up, and the mode cache is what we just wrote above.)
+    if(wifi_off() < 0) DEBUG_SER_PRINT("wifi_off failed");
+    delay(50);
+    if(wifi_on(RTW_MODE_AP) < 0) DEBUG_SER_PRINT("wifi_on(AP) failed");
+    delay(150);
+    wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
+  }
   const char* ifname = WLAN0_NAME;
   wext_get_mode(ifname, &mode);
 
