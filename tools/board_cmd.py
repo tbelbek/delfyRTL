@@ -7,6 +7,13 @@ The firmware's loop() also reads USB Serial, so this doubles as an out-of-band c
 channel (e.g. "STOP" to tear the AP down when the FAP is hung).
 
 Usage:  python3 board_cmd.py "STOP"     [--wait 2.0] [--read 3000]
+
+TRAP (cost a whole false diagnosis): the flag *values* used to leak into the command.
+The old parser only dropped args that started with "--", so
+    board_cmd.py "APSTART DELFYAP" --wait 14 --read 8000
+sent "APSTART DELFYAP 14 8000" and the firmware created an AP with the SSID
+"DELFYAP 14 8000" - the AP was beaconing all along, we just scanned the wrong name and
+concluded "the AP never comes up". Consume each flag's value explicitly (below).
 """
 import sys
 import time
@@ -15,16 +22,36 @@ import serial
 
 PORT = "/dev/cu.usbserial-20220"
 
+# Flags whose *next* argument is their value and must never reach the board.
+VALUE_FLAGS = {"--wait": float, "--read": int}
+
+
+def parse_args(argv):
+    """Split argv into (command, wait, read), consuming flag values explicitly."""
+    cmd_parts = []
+    wait = 2.0
+    read = 4000
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        conv = VALUE_FLAGS.get(a)
+        if conv is not None:
+            if i + 1 >= len(argv):
+                raise SystemExit(f"board_cmd: {a} needs a value")
+            v = conv(argv[i + 1])
+            if a == "--wait":
+                wait = v
+            else:
+                read = v
+            i += 2
+            continue
+        cmd_parts.append(a)
+        i += 1
+    return " ".join(cmd_parts), wait, read
+
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    wait = 2.0
-    if "--wait" in sys.argv:
-        wait = float(sys.argv[sys.argv.index("--wait") + 1])
-    read = 4000
-    if "--read" in sys.argv:
-        read = int(sys.argv[sys.argv.index("--read") + 1])
-    cmd = " ".join(args)
+    cmd, wait, read = parse_args(sys.argv[1:])
 
     s = serial.Serial(PORT, 115200, timeout=0.3)
     try:
