@@ -4191,14 +4191,14 @@ static void channel_map_draw(Canvas* canvas, void* model) {
 
     if(s->total24 > 0 && s->total5 > 0) {
         char f24[20], f5[16];
-        snprintf(f24, sizeof(f24), "Best 2.4G: %d", s->best24);
-        snprintf(f5, sizeof(f5), "5G: %d", s->best5);
+        snprintf(f24, sizeof(f24), "2.4G fewest: %d", s->best24);
+        snprintf(f5, sizeof(f5), "5G fewest: %d", s->best5);
         canvas_draw_str(canvas, 2, 63, f24);
         canvas_draw_str(canvas, 126 - canvas_string_width(canvas, f5), 63, f5);
     } else {
         char foot[28];
-        if(s->total24 > 0) snprintf(foot, sizeof(foot), "Best 2.4G channel %d", s->best24);
-        else snprintf(foot, sizeof(foot), "Best 5G channel %d", s->best5);
+        if(s->total24 > 0) snprintf(foot, sizeof(foot), "2.4G fewest APs: %d", s->best24);
+        else snprintf(foot, sizeof(foot), "5G fewest APs: %d", s->best5);
         canvas_draw_str(canvas, 2, 63, foot);
     }
 }
@@ -4571,6 +4571,19 @@ static const SceneManagerHandlers delfyRTL_scene_manager_handlers = {
     .scene_num = DelfyRTLSceneCount,
 };
 
+// Reuse asynchronous result scenes instead of accumulating navigation history. scene_manager_next_scene
+// has NO depth limit in this firmware, so a result/error arriving repeatedly (each posting
+// DELFY_EVT_RECON / POPUP / CREDS) pushed a new scene every time and grew memory without bound.
+// If the destination is already current, refresh it in place; else return to an existing instance of
+// it; only push when there is none.
+static void delfy_show_result(delfyRTL* app, uint32_t scene_id) {
+    if(scene_manager_get_current_scene(app->scene_manager) == scene_id) {
+        delfyRTL_scene_on_enter_handlers[scene_id](app);
+    } else if(!scene_manager_search_and_switch_to_previous_scene(app->scene_manager, scene_id)) {
+        scene_manager_next_scene(app->scene_manager, scene_id);
+    }
+}
+
 static bool delfyRTL_custom_callback(void* context, uint32_t custom_event) {
     FURI_LOG_D(TAG, __func__);
     furi_assert(context);
@@ -4583,13 +4596,13 @@ static bool delfyRTL_custom_callback(void* context, uint32_t custom_event) {
     if(custom_event == DELFY_EVT_RECON) {
         if(script_running) return true;   // F1: keep result views off the script runner
         if(busy_active) scene_manager_previous_scene(app->scene_manager);
-        scene_manager_next_scene(app->scene_manager, pmfScene);
+        delfy_show_result(app, pmfScene);
         return true;
     }
     if(custom_event == DELFY_EVT_POPUP) {
         if(script_running) return true;   // F1: ditto for the per-command popups
         if(busy_active) scene_manager_previous_scene(app->scene_manager);
-        scene_manager_next_scene(app->scene_manager, popupScene);
+        delfy_show_result(app, popupScene);
         return true;
     }
     if(custom_event == DELFY_EVT_CREDS) {
@@ -4600,7 +4613,7 @@ static bool delfyRTL_custom_callback(void* context, uint32_t custom_event) {
             furi_hal_vibro_on(false);
         }
         if(!creds_scene_shown) {
-            scene_manager_next_scene(app->scene_manager, evilCredsScene);
+            delfy_show_result(app, evilCredsScene);
         } else {
             // Already on the captured-data screen: refresh the text in place. Pushing the
             // scene again on every credential re-entered it (on_exit ran each time).
