@@ -602,17 +602,27 @@ static void hs_put_le32(uint8_t* p, uint32_t v) {
 static void hs_write_pcap(const char* path, uint16_t* out_frames) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
     storage_common_mkdir(storage, "/ext/delfy");
-    File* file = storage_file_alloc(storage);
+    furi_record_close(RECORD_STORAGE);
     uint16_t written = 0;
-    if(storage_file_open(file, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        uint8_t hdr[24] = {0};
-        hs_put_le32(hdr + 0, 0xA1B2C3D4); // pcap magic (LE -> d4 c3 b2 a1)
-        hs_put_le32(hdr + 4, 0x00040002); // version major=2 (u16), minor=4 (u16)
-        hs_put_le32(hdr + 8, 0); // thiszone
-        hs_put_le32(hdr + 12, 0); // sigfigs
-        hs_put_le32(hdr + 16, 65535); // snaplen
-        hs_put_le32(hdr + 20, 105); // LINKTYPE_IEEE802_11 (802.11, no FCS)
-        storage_file_write(file, hdr, sizeof(hdr));
+    uint8_t hdr[24] = {0};
+    hs_put_le32(hdr + 0, 0xA1B2C3D4); // pcap magic (LE -> d4 c3 b2 a1)
+    hs_put_le32(hdr + 4, 0x00040002); // version major=2 (u16), minor=4 (u16)
+    hs_put_le32(hdr + 8, 0); // thiszone
+    hs_put_le32(hdr + 12, 0); // sigfigs
+    hs_put_le32(hdr + 16, 65535); // snaplen
+    hs_put_le32(hdr + 20, 105); // LINKTYPE_IEEE802_11 (802.11, no FCS)
+    // Size the record up front and serialise the whole pcap into one snapshot: the worker does the
+    // I/O, so the GUI thread never touches the card for what is often the largest file we write.
+    size_t total = sizeof(hdr);
+    for(uint16_t i = 0; i < hs_count && i < HS_MAX_FRAMES; i++) {
+        if(hs_lens[i] == 0) continue;
+        total += 16 + hs_lens[i];
+    }
+    char* snap = malloc(total);
+    if(snap) {
+        size_t off = 0;
+        memcpy(snap + off, hdr, sizeof(hdr));
+        off += sizeof(hdr);
         for(uint16_t i = 0; i < hs_count && i < HS_MAX_FRAMES; i++) {
             if(hs_lens[i] == 0) continue;
             uint8_t rec[16];
@@ -621,14 +631,16 @@ static void hs_write_pcap(const char* path, uint16_t* out_frames) {
             hs_put_le32(rec + 4, (ts % 1000) * 1000);
             hs_put_le32(rec + 8, hs_lens[i]);
             hs_put_le32(rec + 12, hs_lens[i]);
-            storage_file_write(file, rec, sizeof(rec));
-            storage_file_write(file, hs_frames[i], hs_lens[i]);
+            memcpy(snap + off, rec, sizeof(rec));
+            off += sizeof(rec);
+            memcpy(snap + off, hs_frames[i], hs_lens[i]);
+            off += hs_lens[i];
             written++;
         }
-        storage_file_close(file);
+        // out_frames reports what was QUEUED; the worker logs the real outcome (short write vs
+        // saved) separately - see storage_status.
+        if(!storage_submit(path, snap, off, false)) free(snap);
     }
-    storage_file_free(file);
-    furi_record_close(RECORD_STORAGE);
     if(out_frames) *out_frames = written;
 }
 
@@ -667,26 +679,26 @@ static void hs_quality(char* out, size_t cap) {
 // E: write a small audit summary next to the capture.
 static void audit_write_json(const char* kind, int frames) {    Storage* st = furi_record_open(RECORD_STORAGE);
     storage_common_mkdir(st, "/ext/delfy");
-    File* f = storage_file_alloc(st);
-    if(storage_file_open(f, "/ext/delfy/audit.json", FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        char buf[256];
-        int n = snprintf(
-            buf,
-            sizeof(buf),
-            "{\"ssid\":\"%s\",\"bssid\":\"%s\",\"channel\":%d,\"security\":%d,\"kind\":\"%s\",\"frames\":%d}\n",
-            audit_ssid,
-            audit_bssid,
-            audit_ch,
-            audit_sec,
-            kind,
-            frames);
-        if(n < 0) n = 0;
-        if(n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
-        storage_file_write(f, buf, n);
-        storage_file_close(f);
-    }
-    storage_file_free(f);
     furi_record_close(RECORD_STORAGE);
+    char buf[256];
+    int n = snprintf(
+        buf,
+        sizeof(buf),
+        "{\"ssid\":\"%s\",\"bssid\":\"%s\",\"channel\":%d,\"security\":%d,\"kind\":\"%s\",\"frames\":%d}\n",
+        audit_ssid,
+        audit_bssid,
+        audit_ch,
+        audit_sec,
+        kind,
+        frames);
+    if(n < 0) n = 0;
+    if(n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
+    // Hand the record to the storage worker (same shape as the other converted writers).
+    char* snap = malloc((size_t)n);
+    if(snap) {
+        memcpy(snap, buf, (size_t)n);
+        if(!storage_submit("/ext/delfy/audit.json", snap, (size_t)n, false)) free(snap);
+    }
     audit_mode = false;
 }
 
@@ -695,13 +707,13 @@ static void write_wpa_file(void) {
     if(wpa_lines[0] == '\0') return;
     Storage* st = furi_record_open(RECORD_STORAGE);
     storage_common_mkdir(st, "/ext/delfy");
-    File* f = storage_file_alloc(st);
-    if(storage_file_open(f, "/ext/delfy/pmkid.22000", FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        storage_file_write(f, wpa_lines, strlen(wpa_lines));
-        storage_file_close(f);
-    }
-    storage_file_free(f);
     furi_record_close(RECORD_STORAGE);
+    size_t len = strlen(wpa_lines);
+    char* snap = malloc(len);
+    if(snap) {
+        memcpy(snap, wpa_lines, len);
+        if(!storage_submit("/ext/delfy/pmkid.22000", snap, len, false)) free(snap);
+    }
 }
 
 // Captured captive-portal creds -> /ext/delfy/creds.txt (append, timestamped), so they
@@ -710,21 +722,23 @@ static void creds_append_sd(const char* line) {
     if(!line || line[0] == '\0') return;
     Storage* st = furi_record_open(RECORD_STORAGE);
     storage_common_mkdir(st, "/ext/delfy");
-    File* f = storage_file_alloc(st);
-    if(storage_file_open(f, "/ext/delfy/creds.txt", FSAM_WRITE, FSOM_OPEN_APPEND)) {
-        DateTime dt;
-        furi_hal_rtc_get_datetime(&dt);
-        char stamp[48];
-        int n = snprintf(
-            stamp, sizeof(stamp), "[%04d-%02d-%02d %02d:%02d:%02d] ",
-            dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second);
-        storage_file_write(f, stamp, (size_t)n);
-        storage_file_write(f, line, strlen(line));
-        storage_file_write(f, "\n", 1);
-        storage_file_close(f);
-    }
-    storage_file_free(f);
     furi_record_close(RECORD_STORAGE);
+    DateTime dt;
+    furi_hal_rtc_get_datetime(&dt);
+    char stamp[48];
+    int n = snprintf(
+        stamp, sizeof(stamp), "[%04d-%02d-%02d %02d:%02d:%02d] ",
+        dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second);
+    size_t llen = strlen(line);
+    size_t total = (size_t)n + llen + 1;
+    char* snap = malloc(total);
+    if(snap) {
+        memcpy(snap, stamp, (size_t)n);
+        memcpy(snap + n, line, llen);
+        snap[n + llen] = '\n';
+        // append=true -> the worker opens with FSOM_OPEN_APPEND, preserving the old semantics.
+        if(!storage_submit("/ext/delfy/creds.txt", snap, total, true)) free(snap);
+    }
 }
 
 static void listed_wifis_item_callback(void* context, uint32_t index);
