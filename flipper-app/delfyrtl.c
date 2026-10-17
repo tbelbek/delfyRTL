@@ -432,6 +432,9 @@ typedef enum {
 // Animation frame for the RickRoll screen. The frame used to be built by the animation timer's
 // callback on the TIMER thread, mutating the shared widget while the GUI could be drawing it.
 #define DELFY_EVT_ANIM_TICK 0x2012
+// "Start AP" from the Create-AP list. The action used to run inline in the list's enter callback
+// (state commands + a scene switch, with four 150 ms sleeps between them).
+#define DELFY_EVT_AP_START 0x2013
 // B1: raw payload of the last KARMALIST reply ("<n>|ssid|ssid|..."), rendered by the KARMA scene.
 static char karma_list[192];
 // C1: same scene drives both modes - plain KARMA (answer probes) and Trap (clone the network for
@@ -1168,16 +1171,18 @@ void info_wifi_scene_on_enter(void* context) {
     view_dispatcher_switch_to_view(app->view_dispatcher, wifiInfoView);
     char cadena[26] = "";
 
+    // These three state commands used to be paced with furi_delay_ms(200) each - 600 ms of frozen
+    // input on a screen the user opens constantly. The pacing existed because the board ran its
+    // command chain only when its whole line buffer ended in '\n' and then cleared it, so two
+    // commands in one loop() pass lost the second one. The board now processes every complete line
+    // (firmware item #7), so they can go back to back.
     snprintf(cadena, 25, "APMAC %s\n", app->customMac);
     uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-    furi_delay_ms(200);
 
     snprintf(cadena, 13, "REASON %d\n", app->deauthReason);
     uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-    furi_delay_ms(200);
 
     delfy_send_portal_sel(app);
-    furi_delay_ms(200);
 }
 bool info_wifi_scene_on_event(void* context, SceneManagerEvent event) {
     delfyRTL* app = context;
@@ -4137,7 +4142,6 @@ void config_ap_change_call_back(void* context, uint32_t index) {
     FURI_LOG_D(TAG, __func__);
     FURI_LOG_D(TAG, "%p %ld", context, index);
     delfyRTL* app = context;
-    char cadena[100] = "";
     if((int)index == app->ap_idx_name) {
         // This is the variable item list's ENTER callback, so anything that touches views here runs
         // inside the list's own dispatch. Post the transition instead; config_ap_scene_on_event
@@ -4148,22 +4152,11 @@ void config_ap_change_call_back(void* context, uint32_t index) {
     } else if((int)index == app->ap_idx_load) {
         scene_manager_next_scene(app->scene_manager, portalListScene); // pick .html from /ext/delfy/portals
     } else if((int)index == app->ap_idx_start) {
-        if(app->securityAP == 1) {
-            snprintf(cadena, 74, "PASSWORD %s\n", app->passwordAP);
-            uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-            furi_delay_ms(150);
-        }
-        snprintf(cadena, 25, "APMAC %s\n", app->customMac);
-        uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-        furi_delay_ms(150);
-        snprintf(cadena, 25, "CHANNEL %s\n", channelList[app->channelAP]);
-        uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-        furi_delay_ms(150);
-        delfy_send_portal_sel(app);
-        furi_delay_ms(150);
-        snprintf(cadena, 48, "APSTART %s\n", app->ssidAP);
-        uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-        scene_manager_next_scene(app->scene_manager, evilCredsScene);
+        // Everything here used to run inline: four state commands each followed by
+        // furi_delay_ms(150) and then a scene switch - ~600 ms of frozen input, from inside the
+        // variable-item list's own enter callback. Post it; config_ap_scene_on_event does the work
+        // between frames (and the sleeps are gone: the board processes every line now).
+        post_event(app, DELFY_EVT_AP_START);
     }
 }
 
@@ -4275,6 +4268,25 @@ bool config_ap_scene_on_event(void* context, SceneManagerEvent event) {
             // own input dispatch. on_enter keeps the currently selected row.
             config_ap_scene_on_enter(app);
             return true;
+        case DELFY_EVT_AP_START: {
+            // Moved here from config_ap_change_call_back (the list's enter callback). Runs between
+            // frames, and the per-command sleeps are gone - the board's loop() now processes every
+            // complete line, so back-to-back state commands all take effect.
+            char buf[80];
+            if(app->securityAP == 1) {
+                snprintf(buf, sizeof(buf), "PASSWORD %s\n", app->passwordAP);
+                uart_helper_send(app->uart_helper, buf, strlen(buf));
+            }
+            snprintf(buf, sizeof(buf), "APMAC %s\n", app->customMac);
+            uart_helper_send(app->uart_helper, buf, strlen(buf));
+            snprintf(buf, sizeof(buf), "CHANNEL %s\n", channelList[app->channelAP]);
+            uart_helper_send(app->uart_helper, buf, strlen(buf));
+            delfy_send_portal_sel(app);
+            snprintf(buf, sizeof(buf), "APSTART %s\n", app->ssidAP);
+            uart_helper_send(app->uart_helper, buf, strlen(buf));
+            scene_manager_next_scene(app->scene_manager, evilCredsScene);
+            return true;
+        }
         case SsidAPInputSceneSaveEvent:
             FURI_LOG_D(TAG, "ssidAPLenght %d", strlen(app->ssidAP));
 
