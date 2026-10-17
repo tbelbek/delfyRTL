@@ -39,8 +39,12 @@ PORT = "/dev/cu.usbserial-20220"
 # up in its own pass (see TRAP 3), short enough to keep a multi-command setup quick.
 REFRESH_GAP_S = 0.35
 
+# --gap overrides the per-command gap. Needed when a command needs time to take effect inside the
+# SAME session - e.g. APSTART, which must be up before a following STOP/SCAN can be meaningful.
+# The port cannot be closed in between: closing it resets the board (see TRAP 2).
+
 # Flags whose *next* argument is their value and must never reach the board.
-VALUE_FLAGS = {"--wait": float, "--read": int}
+VALUE_FLAGS = {"--wait": float, "--read": int, "--gap": float}
 
 
 def parse_args(argv):
@@ -54,6 +58,7 @@ def parse_args(argv):
     cmd_parts = []
     wait = 2.0
     read = 4000
+    gap = REFRESH_GAP_S
     seq = False
     i = 0
     while i < len(argv):
@@ -65,6 +70,8 @@ def parse_args(argv):
             v = conv(argv[i + 1])
             if a == "--wait":
                 wait = v
+            elif a == "--gap":
+                gap = v
             else:
                 read = v
             i += 2
@@ -75,11 +82,11 @@ def parse_args(argv):
             continue
         cmd_parts.append(a)
         i += 1
-    return (cmd_parts if seq else [" ".join(cmd_parts)]), wait, read
+    return (cmd_parts if seq else [" ".join(cmd_parts)]), wait, read, gap
 
 
 def main():
-    cmds, wait, read = parse_args(sys.argv[1:])
+    cmds, wait, read, gap = parse_args(sys.argv[1:])
 
     s = serial.Serial(PORT, 115200, timeout=0.3)
     try:
@@ -93,7 +100,7 @@ def main():
         if n:
             # One command per loop() pass: two lines delivered together are collapsed into the
             # first one by the firmware's chain (TRAP 3) and the second is lost.
-            time.sleep(REFRESH_GAP_S)
+            time.sleep(gap)
         s.write((cmd + "\n").encode())
     time.sleep(wait)
     sys.stdout.write(s.read(read).decode("utf-8", "replace"))
