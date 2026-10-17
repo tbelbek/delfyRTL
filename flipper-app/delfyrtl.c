@@ -315,8 +315,50 @@ static volatile uint8_t post_head = 0;
 static volatile uint8_t post_tail = 0;
 static FuriMutex* post_mutex = NULL;
 
+// --- Diagnostics (architect design, pass 1) ---------------------------------------------------
+// A preallocated binary ring of fixed-size records: diag() never allocates and never does storage
+// I/O, so it is safe from the GUI thread, a timer and the storage worker alike. The storage worker
+// flushes it (batched, with a periodic sync) to /ext/delfy/diag.bin, so a crash+reboot - which wipes
+// the RAM log - still leaves the last records on the card. Heap figures come from the firmware's own
+// counters, which is what turns "it crashed" into "the heap was already falling".
+#include <furi/core/memmgr.h>
+#include <furi/core/memmgr_heap.h>
+
+#define DIAG_N 256
+typedef struct {
+    uint32_t seq;
+    uint32_t tick;
+    uint32_t kind;      // 1 tick sample, 2 post_event, 3 take_event, 4 dispatch, 5 show_result
+    uint32_t a;
+    uint32_t b;
+    uint32_t free_now;
+    uint32_t boot_min;
+    uint32_t largest;
+} DiagRec;
+static DiagRec diag_ring[DIAG_N];
+static volatile uint32_t diag_head = 0;      // next slot to write
+static volatile uint32_t diag_flushed = 0;   // next slot to persist
+static volatile uint32_t diag_seq = 0;
+static volatile uint32_t diag_dropped = 0;
+
+static void diag(uint32_t kind, uint32_t a, uint32_t b) {
+    uint32_t h = diag_head;
+    if(h - diag_flushed >= DIAG_N) diag_dropped++;   // ring full: oldest record is overwritten
+    DiagRec* r = &diag_ring[h % DIAG_N];
+    r->seq = ++diag_seq;
+    r->tick = furi_get_tick();
+    r->kind = kind;
+    r->a = a;
+    r->b = b;
+    r->free_now = (uint32_t)memmgr_get_free_heap();
+    r->boot_min = (uint32_t)memmgr_get_minimum_free_heap();
+    r->largest = (uint32_t)memmgr_heap_get_max_free_block();
+    diag_head = h + 1;                                // publish last
+}
+
 // Safe from any thread. Holds the mutex for a handful of instructions; never waits on the GUI.
 static void post_event(delfyRTL* app, uint32_t ev) {
+    diag(2, ev, 0);
     UNUSED(app);                     // kept so call sites read the same as the dispatcher API
     if(!post_mutex) return;          // allocated first in app_alloc, freed last in app_free
     furi_mutex_acquire(post_mutex, FuriWaitForever);
@@ -392,6 +434,41 @@ static int32_t storage_worker(void* context) {
         furi_mutex_release(storage_mutex);
         if(!have) {
             furi_delay_ms(20);
+        }
+        // Persist diagnostics: batched, synced, and never from the caller's thread. A crash+reboot
+        // wipes the RAM log, so the last records must already be on the card.
+        {
+            static uint32_t last_diag = 0;
+            uint32_t nowt = furi_get_tick();
+            uint32_t pending = diag_head - diag_flushed;
+            if(pending > 0 &&
+               ((uint32_t)(nowt - last_diag) >= furi_ms_to_ticks(250) || pending >= 64)) {
+                last_diag = nowt;
+                Storage* dst = furi_record_open(RECORD_STORAGE);
+                File* df = storage_file_alloc(dst);
+                if(storage_file_open(df, "/ext/delfy/diag.txt", FSAM_WRITE, FSOM_OPEN_APPEND)) {
+                    // One fixed-width TEXT line per record: numeric IDs, written with snprintf into a
+                    // stack buffer, so still no allocation on any thread - and readable straight off
+                    // the card with the CLI, which mangles binary. Same fields as the binary record.
+                    char line[96];
+                    while(diag_flushed != diag_head) {
+                        DiagRec* r = &diag_ring[diag_flushed % DIAG_N];
+                        int n = snprintf(
+                            line, sizeof(line), "%lu %lu %lu %lu %lu %lu %lu %lu\n",
+                            (unsigned long)r->seq, (unsigned long)r->tick, (unsigned long)r->kind,
+                            (unsigned long)r->a, (unsigned long)r->b, (unsigned long)r->free_now,
+                            (unsigned long)r->boot_min, (unsigned long)r->largest);
+                        storage_file_write(df, line, (size_t)n);
+                        diag_flushed++;
+                    }
+                    storage_file_sync(df);
+                    storage_file_close(df);
+                }
+                storage_file_free(df);
+                furi_record_close(RECORD_STORAGE);
+            }
+        }
+        if(!have) {
             continue;
         }
         Storage* st = furi_record_open(RECORD_STORAGE);
@@ -1373,15 +1450,12 @@ bool info_wifi_scene_on_event(void* context, SceneManagerEvent event) {
         uart_helper_send(app->uart_helper, cadena, strlen(cadena));
         return true;
     case DELFY_EVT_INFO_EVIL:
-        FURI_LOG_D(TAG, "%s evil", __func__);
-        if(app->selectedWifi < 0 || app->selectedWifi >= app->wifiCount) return true;
-        credentials[0] = '\0';
-        // idAP again - see the DEAUTH case: selectedWifi is a position in the RSSI-sorted list.
-        snprintf(cadena, sizeof(cadena), "EVIL %d\n", app->wifiList[app->selectedWifi].idAP);
-        info_wifi_scene_on_enter(app);
-        FURI_LOG_D(TAG, "%s", cadena);
-        uart_helper_send(app->uart_helper, cadena, strlen(cadena));
-        scene_manager_next_scene(app->scene_manager, evilCredsScene);
+        // CONTAINMENT (architect directive): do not send EVIL or open the credentials scene. The
+        // board-side path can stall loop() (synchronous createAP, then an unbounded HTTP client
+        // loop), which leaves the board unresponsive. Local result only.
+        snprintf(message, sizeof(message), "%s", "Evil disabled");
+        snprintf(popupHeader, sizeof(popupHeader), "%s", "Unavailable");
+        post_event(app, DELFY_EVT_POPUP);
         return true;
     case DELFY_EVT_INFO_EDIT:
         FURI_LOG_D(TAG, "%s edit", __func__);
@@ -4577,6 +4651,7 @@ static const SceneManagerHandlers delfyRTL_scene_manager_handlers = {
 // If the destination is already current, refresh it in place; else return to an existing instance of
 // it; only push when there is none.
 static void delfy_show_result(delfyRTL* app, uint32_t scene_id) {
+    diag(5, scene_id, 0);
     if(scene_manager_get_current_scene(app->scene_manager) == scene_id) {
         delfyRTL_scene_on_enter_handlers[scene_id](app);
     } else if(!scene_manager_search_and_switch_to_previous_scene(app->scene_manager, scene_id)) {
@@ -4673,7 +4748,19 @@ static void uart_gui_tick(void* context) {
         // ONE call. An earlier attempt did "callback first, fall back if it returns false", which
         // runs an unconsumed scene event twice (and possibly against a different current scene once
         // the first call has moved it).
+        diag(4, ev, 0);
         (void)delfyRTL_custom_callback(app, ev);
+    }
+    // One heap/queue sample per second: the leak detector. memmgr_get_minimum_free_heap() is a
+    // minimum since BOOT, so a falling free_now together with a falling boot_min proves memory is
+    // being retained rather than merely being busy.
+    {
+        static uint32_t last_sample = 0;
+        uint32_t nowt = furi_get_tick();
+        if((uint32_t)(nowt - last_sample) >= furi_ms_to_ticks(1000)) {
+            last_sample = nowt;
+            diag(1, 0, 0);
+        }
     }
     // Re-identify an unidentified board. The app learns the capability string once, from the reply
     // to HELLO at startup - so if the board happened to be silent right then (mid-boot, or held in
