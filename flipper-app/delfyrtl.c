@@ -352,7 +352,10 @@ static char storage_status[64] = "";   // last outcome, for a status screen
 // Set by the worker on any failure (short write / cannot open). The GUI tick turns it into a popup:
 // a failed save used to be completely silent, so the screen showed "saved" (or a frame count) while
 // nothing had reached the card.
-static volatile bool storage_failed = false;
+// Bumped once per FAILED write. The tick shows a popup when the number changes, so a failure that
+// repeats on every keypress cannot push a scene on every tick - scene_manager_next_scene() grows the
+// navigation history without a fixed depth limit, which is what produced "out of memory".
+static volatile uint32_t storage_fail_seq = 0;
 
 // Called from any thread. Takes ownership of data on success; returns false (and the caller frees)
 // when the queue is full, so nothing ever blocks here.
@@ -400,7 +403,7 @@ static int32_t storage_worker(void* context) {
                 // Short write: the card may be full. Say so instead of pretending it saved.
                 snprintf(storage_status, sizeof(storage_status), "SD full? %u/%u bytes",
                          (unsigned)w, (unsigned)job.len);
-                storage_failed = true;
+                storage_fail_seq++;
                 FURI_LOG_E(TAG, "storage short write %s %u/%u", job.path, (unsigned)w,
                            (unsigned)job.len);
             } else {
@@ -410,7 +413,7 @@ static int32_t storage_worker(void* context) {
             storage_file_close(f);
         } else {
             snprintf(storage_status, sizeof(storage_status), "no SD / open failed");
-            storage_failed = true;
+            storage_fail_seq++;
             FURI_LOG_E(TAG, "storage open failed %s", job.path);
         }
         storage_file_free(f);
@@ -4632,12 +4635,16 @@ static void uart_gui_tick(void* context) {
     uint32_t ev;
     for(int i = 0; i < 16; i++) {
         if(!take_event(&ev)) break;
-        scene_manager_handle_custom_event(app->scene_manager, ev);
+        // Route through the dispatcher's custom-event callback: it owns the outcomes shared by every
+        // screen (result view, popup scene, credentials + vibration) and it ends with
+        // "return scene_manager_handle_custom_event(...)", so a scene event still reaches the current
+        // scene. Calling scene_manager directly - as the ring did since item #1 - bypassed all of
+        // that and silently killed every popup and the results view.
+        // ONE call. An earlier attempt did "callback first, fall back if it returns false", which
+        // runs an unconsumed scene event twice (and possibly against a different current scene once
+        // the first call has moved it).
+        (void)delfyRTL_custom_callback(app, ev);
     }
-    // OPEN (round 28): calling the dispatcher's custom-event callback here - which is what owns the
-    // shared outcomes (result view, popup scene, creds + vibration) - crashed the device with
-    // "out of memory". Until that is understood, the ring deliberately does NOT reach the global
-    // handler, so popups and the results view are KNOWN BROKEN (regression from item #1).
     // Re-identify an unidentified board. The app learns the capability string once, from the reply
     // to HELLO at startup - so if the board happened to be silent right then (mid-boot, or held in
     // ROM download mode by a test), fw_caps stayed empty for the rest of the session and, since
@@ -4651,9 +4658,16 @@ static void uart_gui_tick(void* context) {
             uart_helper_send(app->uart_helper, "HELLO\n", 6);
         }
     }
-    // A failed save is recorded in storage_status / storage_failed by the worker (see below). It is
-    // NOT turned into a popup here yet: raising it goes through DELFY_EVT_POPUP, which needs the
-    // global handler that is currently disabled for the reason noted above.
+    // A failed save is worth interrupting for - the alternative was silence, so the user believed
+    // the artifact was on the card. Consumed ONCE per failure via the sequence number, never once
+    // per tick: each popup pushes a scene, and the scene history has no depth limit.
+    static uint32_t storage_seen = 0;
+    if(storage_fail_seq != storage_seen) {
+        storage_seen = storage_fail_seq;
+        snprintf(message, sizeof(message), "%s", storage_status);
+        snprintf(popupHeader, sizeof(popupHeader), "SD problem");
+        post_event(app, DELFY_EVT_POPUP);
+    }
     FuriString* line;
     // Several lines per tick. This callback runs on the dispatcher (GUI) thread, and with a 10 ms
     // period eight lines per tick is 800 lines/s - far past anything the board emits, at a fraction
