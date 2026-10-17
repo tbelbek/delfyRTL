@@ -197,7 +197,7 @@ bool serveBegined =false;
 
 
 void createAP(char* ssid, char* channel, char* password){
-  int mode;
+  int mode = -1;
   // The driver cannot sniff and run a softAP at once: with a promiscuous callback still registered
   // (any of the scan/handshake/tracker/IDS features leaves one behind) apbegin() fails with
   // "ioctl[RTKIOCSIWFREQ] error / Operation failed!" and the AP never comes up - which is exactly
@@ -227,12 +227,14 @@ void createAP(char* ssid, char* channel, char* password){
     wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
   }
   const char* ifname = WLAN0_NAME;
+  mode = -1;   // sentinel: a failed read must not reprint the other interface's value
   wext_get_mode(ifname, &mode);
 
   Serial.print("WLAN 0 ");
   Serial.println(mode);
 
   ifname = WLAN1_NAME;
+  mode = -1;   // sentinel: a failed read must not reprint the other interface's value
   wext_get_mode(ifname, &mode);
   Serial.print("WLAN 1 ");
   Serial.println(mode);
@@ -283,12 +285,14 @@ void createAP(char* ssid, char* channel, char* password){
   }
   apActive = true;
   ifname = WLAN0_NAME;
+  mode = -1;   // sentinel: a failed read must not reprint the other interface's value
   wext_get_mode(ifname, &mode);
 
   Serial.print("WLAN 0 ");
   Serial.println(mode);
 
   ifname = WLAN1_NAME;
+  mode = -1;   // sentinel: a failed read must not reprint the other interface's value
   wext_get_mode(ifname, &mode);
   Serial.print("WLAN 1 ");
   Serial.println(mode);
@@ -1757,7 +1761,18 @@ void loop() {
       
     
     }else if(readString.substring(0,7)=="CHANNEL"){
-    readString.substring(8,readString.length()-1).toCharArray(ap_channel,4);
+      // Parse with indexOf + trim, the way the commands that provably work here (CAPTURE, HSGRAB,
+      // PORTALHTML) do. The old fixed-offset substring(8, length-1) never set ap_channel in the
+      // field: createAP() then fell back to its default 6 on every start, so "Create AP" silently
+      // ignored the chosen channel and every AP came up on 6.
+      int sp = readString.indexOf(' ');
+      String v = (sp > 0) ? readString.substring(sp + 1) : String("");
+      v.trim();
+      v.toCharArray(ap_channel, sizeof(ap_channel));
+      // Echo what actually arrived: this is the only way to tell an unparsed value from a branch
+      // that was never reached (a stray '\\r' or a mangled command shows up here immediately).
+      String dbg = "CHANNEL raw=[" + readString + "] set=[" + ap_channel + "]";
+      Serial.println(dbg); Serial1.println(dbg);
 
 
     }else if(readString.substring(0,5)=="APMAC"){
