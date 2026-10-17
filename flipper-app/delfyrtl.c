@@ -327,6 +327,93 @@ static void post_event(delfyRTL* app, uint32_t ev) {
     furi_mutex_release(post_mutex);
 }
 
+// --- Storage worker (prioritised plan, item #5) ----------------------------------------------
+// The UART line handler runs on the GUI thread and used to write captures, credential records,
+// scan results and audit/PMKID files to the SD card SYNCHRONOUSLY, from inside the tick - stalling
+// input for the duration of the write, and letting the board's 127-byte UART ring overflow while
+// it kept talking. Writers now serialise an immutable snapshot and hand it over; one worker thread
+// does the I/O. A full queue drops the job and says so rather than blocking the GUI thread, and
+// shutdown drains the queue instead of waiting on it.
+#define STORAGE_Q 8
+typedef struct {
+    char path[160];
+    char* data;      // owned by the queue, then by the worker
+    size_t len;
+    bool append;
+} StorageJob;
+static StorageJob storage_q[STORAGE_Q];
+static volatile uint8_t storage_head = 0;
+static volatile uint8_t storage_tail = 0;
+static FuriMutex* storage_mutex = NULL;
+static FuriThread* storage_thread = NULL;
+static volatile bool storage_run = false;
+static volatile uint16_t storage_dropped = 0;
+static char storage_status[64] = "";   // last outcome, for a status screen
+
+// Called from any thread. Takes ownership of data on success; returns false (and the caller frees)
+// when the queue is full, so nothing ever blocks here.
+static bool storage_submit(const char* path, char* data, size_t len, bool append) {
+    if(!storage_mutex || !storage_run || !data) return false;
+    bool ok = false;
+    furi_mutex_acquire(storage_mutex, FuriWaitForever);
+    uint8_t next = (uint8_t)((storage_head + 1) % STORAGE_Q);
+    if(next != storage_tail) {
+        snprintf(storage_q[storage_head].path, sizeof(storage_q[0].path), "%s", path);
+        storage_q[storage_head].data = data;
+        storage_q[storage_head].len = len;
+        storage_q[storage_head].append = append;
+        storage_head = next;
+        ok = true;
+    } else {
+        storage_dropped++;
+    }
+    furi_mutex_release(storage_mutex);
+    return ok;
+}
+
+static int32_t storage_worker(void* context) {
+    UNUSED(context);
+    while(storage_run) {
+        StorageJob job = {0};
+        bool have = false;
+        furi_mutex_acquire(storage_mutex, FuriWaitForever);
+        if(storage_tail != storage_head) {
+            job = storage_q[storage_tail];
+            storage_tail = (uint8_t)((storage_tail + 1) % STORAGE_Q);
+            have = true;
+        }
+        furi_mutex_release(storage_mutex);
+        if(!have) {
+            furi_delay_ms(20);
+            continue;
+        }
+        Storage* st = furi_record_open(RECORD_STORAGE);
+        File* f = storage_file_alloc(st);
+        FS_OpenMode om = job.append ? FSOM_OPEN_APPEND : FSOM_CREATE_ALWAYS;
+        if(storage_file_open(f, job.path, FSAM_WRITE, om)) {
+            size_t w = storage_file_write(f, job.data, job.len);
+            if(w != job.len) {
+                // Short write: the card may be full. Say so instead of pretending it saved.
+                snprintf(storage_status, sizeof(storage_status), "short write %u/%u",
+                         (unsigned)w, (unsigned)job.len);
+                FURI_LOG_E(TAG, "storage short write %s %u/%u", job.path, (unsigned)w,
+                           (unsigned)job.len);
+            } else {
+                snprintf(storage_status, sizeof(storage_status), "saved %.12s",
+                         strrchr(job.path, '/') ? strrchr(job.path, '/') + 1 : job.path);
+            }
+            storage_file_close(f);
+        } else {
+            snprintf(storage_status, sizeof(storage_status), "no SD / open failed");
+            FURI_LOG_E(TAG, "storage open failed %s", job.path);
+        }
+        storage_file_free(f);
+        furi_record_close(RECORD_STORAGE);
+        free(job.data);
+    }
+    return 0;
+}
+
 // GUI thread only (the tick). False when nothing is pending.
 static bool take_event(uint32_t* ev) {
     if(!post_mutex) return false;
@@ -658,25 +745,28 @@ static void delfy_save_scan(const char* kind, const char* body) {
     furi_hal_rtc_get_datetime(&dt);
     char path[160];
     snprintf(path, sizeof(path), "%s/%s.txt", dir, kind);
-    File* f = storage_file_alloc(st);
-    if(storage_file_open(f, path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        char hdr[96];
-        int n = snprintf(
-            hdr,
-            sizeof(hdr),
-            "# %04d-%02d-%02d %02d:%02d:%02d  %s\n",
-            dt.year,
-            dt.month,
-            dt.day,
-            dt.hour,
-            dt.minute,
-            dt.second,
-            kind);
-        storage_file_write(f, hdr, (size_t)n);
-        if(body && body[0]) storage_file_write(f, body, strlen(body));
-        storage_file_close(f);
+    char hdr[96];
+    int n = snprintf(
+        hdr,
+        sizeof(hdr),
+        "# %04d-%02d-%02d %02d:%02d:%02d  %s\n",
+        dt.year,
+        dt.month,
+        dt.day,
+        dt.hour,
+        dt.minute,
+        dt.second,
+        kind);
+    // Serialise the whole record and hand it to the storage worker. This used to be a synchronous
+    // write from the GUI thread, from inside the UART line handler.
+    size_t blen = (body && body[0]) ? strlen(body) : 0;
+    size_t total = (size_t)n + blen;
+    char* snap = malloc(total);
+    if(snap) {
+        memcpy(snap, hdr, (size_t)n);
+        if(blen) memcpy(snap + n, body, blen);
+        if(!storage_submit(path, snap, total, false)) free(snap);   // queue full -> drop, no block
     }
-    storage_file_free(f);
     furi_record_close(RECORD_STORAGE);
 }
 
@@ -2283,24 +2373,28 @@ void config_attack_change_call_back(void* context, uint32_t index) {
 // --- E4: app settings, persisted to /ext/delfy/settings.txt ---------------------
 // (globals live up top so scenes/helpers defined earlier can use them)
 static void delfy_settings_save(void) {
+    // The directory has to exist before the worker runs - it does not create directories - and
+    // mkdir is cheap and idempotent, so it stays here. The write itself goes to the storage
+    // worker: this is called from the settings list's change callbacks on the GUI thread, and it
+    // used to write the card synchronously on every key press.
     Storage* st = furi_record_open(RECORD_STORAGE);
     storage_common_mkdir(st, "/ext/delfy");
-    File* f = storage_file_alloc(st);
-    if(storage_file_open(f, "/ext/delfy/settings.txt", FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        char buf[128];
-        int n = snprintf(
-            buf,
-            sizeof(buf),
-            "channel=%s\nscan_wait=%d\nvibro=%d\nsave=%d\n",
-            set_channels[set_channel_idx],
-            set_scan_wait,
-            set_vibro ? 1 : 0,
-            set_save ? 1 : 0);
-        storage_file_write(f, buf, (size_t)n);
-        storage_file_close(f);
-    }
-    storage_file_free(f);
     furi_record_close(RECORD_STORAGE);
+
+    char buf[128];
+    int n = snprintf(
+        buf,
+        sizeof(buf),
+        "channel=%s\nscan_wait=%d\nvibro=%d\nsave=%d\n",
+        set_channels[set_channel_idx],
+        set_scan_wait,
+        set_vibro ? 1 : 0,
+        set_save ? 1 : 0);
+    char* snap = malloc((size_t)n);
+    if(snap) {
+        memcpy(snap, buf, (size_t)n);
+        if(!storage_submit("/ext/delfy/settings.txt", snap, (size_t)n, false)) free(snap);
+    }
 }
 
 static void delfy_settings_load(void) {
@@ -4902,6 +4996,17 @@ static delfyRTL* app_alloc() {
     post_tail = 0;
     post_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     furi_check(post_mutex);
+    // Storage worker first, so any line that arrives once the UART worker starts already has
+    // somewhere to hand its snapshot.
+    storage_head = 0;
+    storage_tail = 0;
+    storage_dropped = 0;
+    storage_status[0] = '\0';
+    storage_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    furi_check(storage_mutex);
+    storage_run = true;
+    storage_thread = furi_thread_alloc_ex("DelfyStorage", 2048, storage_worker, NULL);
+    furi_thread_start(storage_thread);
     delfyRTL* app = malloc(sizeof(delfyRTL));
     app->ssidAPLength = 32;
     //app->ssidAPLength = 0;
@@ -5093,6 +5198,22 @@ static void app_free(delfyRTL* app) {
     furi_message_queue_free(app->uart_lines);
     // Last, now that every producer is gone (all timers stopped above, the UART worker joined in
     // uart_helper_free, and the dispatcher's tick can no longer fire because its loop returned).
+    // Stop the storage worker BEFORE anything else is torn down. Its queue is drained and freed
+    // here rather than waited on: pending jobs are dropped, never awaited forever.
+    storage_run = false;
+    if(storage_thread) {
+        furi_thread_join(storage_thread);
+        furi_thread_free(storage_thread);
+        storage_thread = NULL;
+    }
+    furi_mutex_acquire(storage_mutex, FuriWaitForever);
+    while(storage_tail != storage_head) {
+        free(storage_q[storage_tail].data);
+        storage_tail = (uint8_t)((storage_tail + 1) % STORAGE_Q);
+    }
+    furi_mutex_release(storage_mutex);
+    furi_mutex_free(storage_mutex);
+    storage_mutex = NULL;
     furi_mutex_free(post_mutex);
     post_mutex = NULL;
 
