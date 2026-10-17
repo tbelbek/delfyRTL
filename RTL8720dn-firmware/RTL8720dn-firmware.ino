@@ -3065,11 +3065,24 @@ void loop() {
     // Poll the listen socket at most every 20 ms. loop() runs thousands of times a second, and
     // calling server.available() (accept) that often makes the SDK spew
     // "[ERROR] Accept connection failed" non-stop and burns CPU while barely helping latency.
+    // Adaptive interval on top of that: every accept() on an idle socket still prints
+    // "[ERROR] Accept connection failed", so at a fixed 20 ms that is 50 lines/s of noise that
+    // swamps the debug log AND floods the Flipper's UART RX (which has a 127-byte hardware ring).
+    // Back off while accepts keep coming back empty, up to 640 ms, and snap back to 20 ms the
+    // moment a real client appears - so portal latency is unaffected for the user.
     static uint32_t last_accept_ms = 0;
+    static uint32_t accept_gap_ms = 20;
     uint32_t now_ms = millis();
-    bool poll_ok = (now_ms - last_accept_ms) >= 20;
+    bool poll_ok = (now_ms - last_accept_ms) >= accept_gap_ms;
     if(poll_ok) last_accept_ms = now_ms;
     WiFiClient client = poll_ok ? server.available() : WiFiClient();
+    if(poll_ok) {
+      if(client) {
+        accept_gap_ms = 20;                       // a real client: back to the responsive rate
+      } else if(accept_gap_ms < 640) {
+        accept_gap_ms *= 2;                       // idle: keep quiet
+      }
+    }
     if (client) {
       //client.setRecvTimeout(500);
       String request;
