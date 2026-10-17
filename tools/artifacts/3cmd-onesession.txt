@@ -1,0 +1,85 @@
+CHANNEL raw=[CHANNEL 8
+] set=[8]
+DEBUG: APMAC 00:E0:4C:AA:BB:CC
+MAC en bytes: 00:E0:4C:AA:BB:CC:
+PORTAL host: delfyav.com
+WLAN 0 0
+WLAN 1 0
+DEBUG: CREATING APDEBUG: DELFYAVDEBUG: 8DEBUG: CREATING AP 2
+LwIP_DHCP: dhcp stop.
+Deinitializing WIFI ...
+WIFI deinitialized
+Initializing WIFI ...
+WIFI initialized
+IPv4 enabled
+
+Starting AP ...
+DELFYAV started
+DHCP: retargeted netif 0 -> 192.168.4.1
+DHCP: server up on :67 (bind=0, ap_netif=0x1002e278, opt114=http://delfyav.com/cp.json)
+
+ [INFO] server_drv.cpp: WiFi server is set to non-blocking mode
+
+ [INFO] Listen socket successfully
+
+[INFO] Socket connect successfully 
+WLAN 0 3
+
+[rltk_wlan_control] netif is DOWN
+ioctl[RTKIOCGIWMODE] errorWLAN 1 -1
+DEBUG: Starting BSSID DELFYAV
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
+ [ERROR] Accept connection failed
+
