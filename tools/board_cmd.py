@@ -7,13 +7,26 @@ The firmware's loop() also reads USB Serial, so this doubles as an out-of-band c
 channel (e.g. "STOP" to tear the AP down when the FAP is hung).
 
 Usage:  python3 board_cmd.py "STOP"     [--wait 2.0] [--read 3000]
+        python3 board_cmd.py --seq "CHANNEL 11" "APSTART myAP"   # ONE port session
 
-TRAP (cost a whole false diagnosis): the flag *values* used to leak into the command.
+TRAP 1 (cost a whole false diagnosis): the flag *values* used to leak into the command.
 The old parser only dropped args that started with "--", so
     board_cmd.py "APSTART DELFYAP" --wait 14 --read 8000
 sent "APSTART DELFYAP 14 8000" and the firmware created an AP with the SSID
 "DELFYAP 14 8000" - the AP was beaconing all along, we just scanned the wrong name and
 concluded "the AP never comes up". Consume each flag's value explicitly (below).
+
+TRAP 2 (cost another one): opening/closing the CH340 RESETS the BW16, so every setting the
+firmware keeps in a global is lost between two calls of this script. "CHANNEL 11" followed by
+a separate "APSTART myAP" leaves ap_channel empty, createAP() falls back to its default 6, and
+the channel looks ignored - a firmware bug that is not one. State-setting commands must share
+ONE port session with the command that consumes them: use --seq.
+
+TRAP 3: the firmware drains BOTH UARTs into one line buffer and, once the buffer ends in '\n',
+runs the giant if/else chain and then clears the whole buffer. Two commands that land in the
+same loop() pass are therefore processed as the FIRST one only - the second is silently
+dropped. --seq writes each command and waits REFRESH_GAP_S between them so that each arrives in
+its own pass.
 """
 import sys
 import time
@@ -22,15 +35,26 @@ import serial
 
 PORT = "/dev/cu.usbserial-20220"
 
+# Gap between the commands of a --seq run: long enough that the firmware's loop() picks each one
+# up in its own pass (see TRAP 3), short enough to keep a multi-command setup quick.
+REFRESH_GAP_S = 0.35
+
 # Flags whose *next* argument is their value and must never reach the board.
 VALUE_FLAGS = {"--wait": float, "--read": int}
 
 
 def parse_args(argv):
-    """Split argv into (command, wait, read), consuming flag values explicitly."""
+    """Split argv into (commands, wait, read), consuming flag values explicitly.
+
+    Without --seq the arguments form ONE command (joined with spaces). With --seq each argument
+    is a separate command, sent as its own line inside the single port session, so any state an
+    earlier line sets is still there for the later ones (TRAP 2), each in its own loop() pass
+    (TRAP 3).
+    """
     cmd_parts = []
     wait = 2.0
     read = 4000
+    seq = False
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -45,13 +69,17 @@ def parse_args(argv):
                 read = v
             i += 2
             continue
+        if a == "--seq":
+            seq = True
+            i += 1
+            continue
         cmd_parts.append(a)
         i += 1
-    return " ".join(cmd_parts), wait, read
+    return (cmd_parts if seq else [" ".join(cmd_parts)]), wait, read
 
 
 def main():
-    cmd, wait, read = parse_args(sys.argv[1:])
+    cmds, wait, read = parse_args(sys.argv[1:])
 
     s = serial.Serial(PORT, 115200, timeout=0.3)
     try:
@@ -61,7 +89,12 @@ def main():
         pass
     time.sleep(0.3)
     s.reset_input_buffer()
-    s.write((cmd + "\n").encode())
+    for n, cmd in enumerate(cmds):
+        if n:
+            # One command per loop() pass: two lines delivered together are collapsed into the
+            # first one by the firmware's chain (TRAP 3) and the second is lost.
+            time.sleep(REFRESH_GAP_S)
+        s.write((cmd + "\n").encode())
     time.sleep(wait)
     sys.stdout.write(s.read(read).decode("utf-8", "replace"))
     s.close()
