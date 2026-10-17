@@ -709,24 +709,6 @@ static void json_escape(const char* in, char* out, size_t cap) {
     out[o] = '\0';
 }
 
-// DIAGNOSTIC (crash hunt, temporary): append a breadcrumb SYNCHRONOUSLY so that a crash+reboot -
-// which wipes the RAM log - still leaves the last steps on the SD card. Costs a write per call, so it
-// is only wired to rare events. Remove once the intermittent OOM is understood.
-static void trace_crumb(const char* what, uint32_t v) {
-    Storage* st = furi_record_open(RECORD_STORAGE);
-    storage_common_mkdir(st, "/ext/delfy");
-    File* f = storage_file_alloc(st);
-    if(storage_file_open(f, "/ext/delfy/trace.txt", FSAM_WRITE, FSOM_OPEN_APPEND)) {
-        char b[96];
-        int n = snprintf(
-            b, sizeof(b), "%lu %s %lu\n", (unsigned long)furi_get_tick(), what, (unsigned long)v);
-        storage_file_write(f, b, (size_t)n);
-        storage_file_close(f);
-    }
-    storage_file_free(f);
-    furi_record_close(RECORD_STORAGE);
-}
-
 // Session-scoped artifact path: /ext/delfy/sessions/<session id>/<name>, directory created here.
 // These artifacts used to have FIXED root filenames ("creds.txt", "audit.json", "pmkid.22000"), so
 // every run silently overwrote the previous run's evidence - a captured credential line, an audit
@@ -1101,7 +1083,6 @@ void scan_networks_scene_on_exit(void* context) {
     furi_timer_stop(app->busyTimer);
 }
 void list_networks_scene_on_enter(void* context) {
-    trace_crumb("enter:list", 0);
     FURI_LOG_D(TAG, __func__);
     delfyRTL* app = context;
     // Sort by signal strength (strongest first) so the most useful APs are on top. The
@@ -2206,7 +2187,6 @@ static void delfy_send_portal_sel(delfyRTL* app) {
 }
 
 void wifi_hub_scene_on_enter(void* context) {
-    trace_crumb("enter:hub", 0);
     delfyRTL* app = context;
     delfy_ident(app);
     submenu_reset(app->submenu);
@@ -2335,7 +2315,6 @@ static void tools_item_callback(void* context, uint32_t index) {
 }
 
 void tools_menu_scene_on_enter(void* context) {
-    trace_crumb("enter:tools", 0);
     delfyRTL* app = context;
     submenu_reset(app->submenu);
     // The header names the AP the tools are aimed at instead of the board's fw version: the
@@ -4247,7 +4226,6 @@ static bool channel_map_input(InputEvent* event, void* context) {
 }
 
 void channel_map_scene_on_enter(void* context) {
-    trace_crumb("enter:chmap", 0);
     delfyRTL* app = context;
     with_view_model(
         app->chanMapView,
@@ -4608,7 +4586,6 @@ static void delfy_show_result(delfyRTL* app, uint32_t scene_id) {
 
 static bool delfyRTL_custom_callback(void* context, uint32_t custom_event) {
     FURI_LOG_D(TAG, __func__);
-    trace_crumb("ev", custom_event);
     furi_assert(context);
     delfyRTL* app = context;
     // Deferred GUI transitions posted from the UART worker thread (runs on the GUI thread).
@@ -4696,7 +4673,6 @@ static void uart_gui_tick(void* context) {
         // ONE call. An earlier attempt did "callback first, fall back if it returns false", which
         // runs an unconsumed scene event twice (and possibly against a different current scene once
         // the first call has moved it).
-        trace_crumb("drain", ev);
         (void)delfyRTL_custom_callback(app, ev);
     }
     // Re-identify an unidentified board. The app learns the capability string once, from the reply
@@ -5166,7 +5142,6 @@ static delfyRTL* app_alloc() {
     post_tail = 0;
     post_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     furi_check(post_mutex);
-    trace_crumb("alloc", 0);
     // Storage worker first, so any line that arrives once the UART worker starts already has
     // somewhere to hand its snapshot.
     storage_head = 0;
