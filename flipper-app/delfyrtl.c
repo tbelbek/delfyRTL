@@ -2589,6 +2589,47 @@ static void delfy_settings_load(void) {
     furi_record_close(RECORD_STORAGE);
 }
 
+// --- In-app self-test (architect D.5) ---------------------------------------------------------
+// A scripted navigation loop driven by the GUI tick. It uses the SAME calls the menus use
+// (scene_manager_handle_custom_event / previous_scene) and never calls a scene's on_enter() to fake
+// a transition, so what it exercises is the production path. Each step is breadcrumbed with diag()
+// together with the ACTUAL current scene, so a crash or a stuck step leaves the exact place - and it
+// needs no external RPC at all, which is what makes the "app alone" measurement possible.
+#define ST_LAPS 3
+#define ST_STEPS 10
+static uint8_t st_lap = 0;
+static uint8_t st_step = 0;
+static uint32_t st_due = 0;
+static volatile bool st_active = false;
+
+static void selftest_step(delfyRTL* app) {
+    diag(8, (uint32_t)st_step, (uint32_t)st_lap);
+    diag(10, (uint32_t)scene_manager_get_current_scene(app->scene_manager), 0);   // actual scene
+    switch(st_step) {
+    case 0: scene_manager_handle_custom_event(app->scene_manager, WifiHub); break;
+    case 1: scene_manager_handle_custom_event(app->scene_manager, ScanWifi); break;
+    case 2: break;                                    // scan runs
+    case 3: break;                                    // wait for SCAN:OK / deadline
+    case 4: scene_manager_handle_custom_event(app->scene_manager, ListWifis); break;
+    case 5: break;                                    // list built
+    case 6: scene_manager_previous_scene(app->scene_manager); break;
+    case 7: scene_manager_handle_custom_event(app->scene_manager, ChannelMap); break;
+    case 8: scene_manager_previous_scene(app->scene_manager); break;
+    case 9: scene_manager_previous_scene(app->scene_manager); break;   // hub -> main
+    default: break;
+    }
+    st_step++;
+    if(st_step >= ST_STEPS) {
+        st_step = 0;
+        st_lap++;
+        if(st_lap >= ST_LAPS) {
+            st_active = false;
+            diag(9, (uint32_t)st_lap, 0);            // finished
+            view_dispatcher_stop(app->view_dispatcher);
+        }
+    }
+}
+
 static void settings_channel_cb(VariableItem* item) {
     set_channel_idx = variable_item_get_current_value_index(item);
     variable_item_set_current_value_text(item, set_channels[set_channel_idx]);
@@ -2605,6 +2646,13 @@ static void settings_vibro_cb(VariableItem* item) {
     set_vibro = variable_item_get_current_value_index(item) != 0;
     variable_item_set_current_value_text(item, set_vibro ? "on" : "off");
     delfy_settings_save();
+}
+static void settings_selftest_cb(VariableItem* item) {
+    st_active = variable_item_get_current_value_index(item) != 0;
+    st_lap = 0;
+    st_step = 0;
+    st_due = furi_get_tick();
+    diag(7, st_active ? 1u : 0u, (uint32_t)ST_LAPS);
 }
 static void settings_save_cb(VariableItem* item) {
     set_save = variable_item_get_current_value_index(item) != 0;
@@ -2641,6 +2689,13 @@ void settings_scene_on_enter(void* context) {
     item = variable_item_list_add(app->variableList, "Save results", 2, settings_save_cb, app);
     variable_item_set_current_value_index(item, set_save ? 1 : 0);
     variable_item_set_current_value_text(item, set_save ? "on" : "off");
+
+    // Diagnostic self-test (architect D.5). Last row on purpose: adding it does not shift the row
+    // indices the other callbacks rely on.
+    item = variable_item_list_add(
+        app->variableList, "Self-test", 2, settings_selftest_cb, app);
+    variable_item_set_current_value_index(item, st_active ? 1 : 0);
+    variable_item_set_current_value_text(item, st_active ? "on" : "off");
 
     view_dispatcher_switch_to_view(app->view_dispatcher, settingsView);
 }
@@ -4750,6 +4805,15 @@ static void uart_gui_tick(void* context) {
         // the first call has moved it).
         diag(4, ev, 0);
         (void)delfyRTL_custom_callback(app, ev);
+    }
+    // Self-test driver (architect D.5): one step when due. Longer pauses around the scan so the
+    // board has time to answer, which is what the production flow waits for too.
+    if(st_active) {
+        uint32_t nowt = furi_get_tick();
+        if((int32_t)(nowt - st_due) >= 0) {
+            st_due = nowt + furi_ms_to_ticks((st_step == 2 || st_step == 3) ? 1500 : 300);
+            selftest_step(app);
+        }
     }
     // One heap/queue sample per second: the leak detector. memmgr_get_minimum_free_heap() is a
     // minimum since BOOT, so a falling free_now together with a falling boot_min proves memory is
