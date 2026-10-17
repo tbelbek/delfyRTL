@@ -709,11 +709,29 @@ static void json_escape(const char* in, char* out, size_t cap) {
     out[o] = '\0';
 }
 
+// Session-scoped artifact path: /ext/delfy/sessions/<session id>/<name>, directory created here.
+// These artifacts used to have FIXED root filenames ("creds.txt", "audit.json", "pmkid.22000"), so
+// every run silently overwrote the previous run's evidence - a captured credential line, an audit
+// record or a PMKID hash was simply gone. Settings stay at a fixed path on purpose: they are
+// configuration, not evidence.
+static void delfy_artifact_path(char* out, size_t cap, const char* name) {
+    Storage* st = furi_record_open(RECORD_STORAGE);
+    storage_common_mkdir(st, "/ext/delfy");
+    storage_common_mkdir(st, "/ext/delfy/sessions");
+    char dir[96];
+    snprintf(dir, sizeof(dir), "/ext/delfy/sessions/%s", delfy_session_id);
+    storage_common_mkdir(st, dir);
+    furi_record_close(RECORD_STORAGE);
+    snprintf(out, cap, "%s/%s", dir, name);
+}
+
 static void audit_write_json(const char* kind, int frames) {    Storage* st = furi_record_open(RECORD_STORAGE);
     storage_common_mkdir(st, "/ext/delfy");
     furi_record_close(RECORD_STORAGE);
     char esc_ssid[96];
     json_escape(audit_ssid, esc_ssid, sizeof(esc_ssid));
+    char apath[160];
+    delfy_artifact_path(apath, sizeof(apath), "audit.json");
     char buf[256];
     int n = snprintf(
         buf,
@@ -731,7 +749,7 @@ static void audit_write_json(const char* kind, int frames) {    Storage* st = fu
     char* snap = malloc((size_t)n);
     if(snap) {
         memcpy(snap, buf, (size_t)n);
-        if(!storage_submit("/ext/delfy/audit.json", snap, (size_t)n, false)) free(snap);
+        if(!storage_submit(apath, snap, (size_t)n, false)) free(snap);
     }
     audit_mode = false;
 }
@@ -743,10 +761,12 @@ static void write_wpa_file(void) {
     storage_common_mkdir(st, "/ext/delfy");
     furi_record_close(RECORD_STORAGE);
     size_t len = strlen(wpa_lines);
+    char apath[160];
+    delfy_artifact_path(apath, sizeof(apath), "pmkid.22000");
     char* snap = malloc(len);
     if(snap) {
         memcpy(snap, wpa_lines, len);
-        if(!storage_submit("/ext/delfy/pmkid.22000", snap, len, false)) free(snap);
+        if(!storage_submit(apath, snap, len, false)) free(snap);
     }
 }
 
@@ -764,6 +784,8 @@ static void creds_append_sd(const char* line) {
         stamp, sizeof(stamp), "[%04d-%02d-%02d %02d:%02d:%02d] ",
         dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second);
     size_t llen = strlen(line);
+    char apath[160];
+    delfy_artifact_path(apath, sizeof(apath), "creds.txt");
     size_t total = (size_t)n + llen + 1;
     char* snap = malloc(total);
     if(snap) {
@@ -771,7 +793,7 @@ static void creds_append_sd(const char* line) {
         memcpy(snap + n, line, llen);
         snap[n + llen] = '\n';
         // append=true -> the worker opens with FSOM_OPEN_APPEND, preserving the old semantics.
-        if(!storage_submit("/ext/delfy/creds.txt", snap, total, true)) free(snap);
+        if(!storage_submit(apath, snap, total, true)) free(snap);
     }
 }
 
@@ -787,16 +809,12 @@ static void delfy_ident(delfyRTL* app);
 static void delfy_save_scan(const char* kind, const char* body) {
     if(!kind) return;
     if(!set_save) return;   // E4: "Save results" off -> nothing is written
-    Storage* st = furi_record_open(RECORD_STORAGE);
-    storage_common_mkdir(st, "/ext/delfy");
-    storage_common_mkdir(st, "/ext/delfy/sessions");
-    char dir[96];
-    snprintf(dir, sizeof(dir), "/ext/delfy/sessions/%s", delfy_session_id);
-    storage_common_mkdir(st, dir);
+    char name[48];
+    snprintf(name, sizeof(name), "%s.txt", kind);
+    char path[160];
+    delfy_artifact_path(path, sizeof(path), name);   // same helper the other artifacts use
     DateTime dt;
     furi_hal_rtc_get_datetime(&dt);
-    char path[160];
-    snprintf(path, sizeof(path), "%s/%s.txt", dir, kind);
     char hdr[96];
     int n = snprintf(
         hdr,
@@ -819,7 +837,6 @@ static void delfy_save_scan(const char* kind, const char* body) {
         if(blen) memcpy(snap + n, body, blen);
         if(!storage_submit(path, snap, total, false)) free(snap);   // queue full -> drop, no block
     }
-    furi_record_close(RECORD_STORAGE);
 }
 
 // Build "BSSID|SSID|ch|rssi|security" lines for the whole scanned AP list and save it.
