@@ -3084,14 +3084,20 @@ void loop() {
     bool poll_ok = (now_ms - last_accept_ms) >= accept_gap_ms;
     if(poll_ok) last_accept_ms = now_ms;
     WiFiClient client = poll_ok ? server.available() : WiFiClient();
+    // A failed accept is NOT distinguishable with operator bool(): WiFiClient::operator bool() is
+    // just "_sock >= 0", and getAvailable() hands back a non-negative value even when the SDK has
+    // already printed "Accept connection failed". That is why the first version of this backoff
+    // never engaged and why the main block below parsed an empty client on every poll. Ask for a
+    // real TCP connection instead - the request loop already uses connected() for the same reason.
+    bool real_client = client && client.connected();
     if(poll_ok) {
-      if(client) {
+      if(real_client) {
         accept_gap_ms = 20;                       // a real client: back to the responsive rate
       } else if(accept_gap_ms < 640) {
         accept_gap_ms *= 2;                       // idle: keep quiet
       }
     }
-    if (client) {
+    if (real_client) {
       //client.setRecvTimeout(500);
       String request;
       request.reserve(256);  // Reservamos memoria para evitar fragmentación
