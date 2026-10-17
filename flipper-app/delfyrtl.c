@@ -540,6 +540,10 @@ typedef enum {
 } CustoAPInputEvent;
 
 bool scanFinish = false;
+// The board now answers SCAN:FAIL when its scan did not complete (it used to print SCAN:OK no
+// matter what). Without this flag the app would send LIST anyway and show whatever stale results
+// happened to be in RAM - the empty list this bug produced.
+bool scanFailed = false;
 
 bool parse_mac(const char* mac_str, uint8_t* out_bytes) {
     if(!mac_str || !out_bytes) return false;
@@ -986,8 +990,14 @@ void scan_networks_scene_on_enter(void* context) {
     // furi_delay_ms - the race being removed. uart_gui_tick watches the same wait on the dispatcher
     // thread and sends LIST when it expires (or earlier, when SCAN:OK arrives).
     app->scan_waiting = true;
-    app->scan_deadline = furi_get_tick() + furi_ms_to_ticks((uint32_t)set_scan_wait * 1000U);
+    // The deadline is a BACKSTOP, not the expected exit: the board answers SCAN:OK (or SCAN:FAIL)
+    // when its scan actually finishes, and a scan can take longer than the configured wait - the
+    // old deadline then fired first and the following LIST raced the board's own scan, which is
+    // why the result list came back empty. Wait for the reply, with a generous cap.
+    app->scan_deadline =
+        furi_get_tick() + furi_ms_to_ticks((uint32_t)set_scan_wait * 1000U + 20000U);
     scanFinish = false;
+    scanFailed = false;
     uart_helper_send(app->uart_helper, "SCAN\n", 5);
 }
 bool scan_networks_scene_on_event(void* context, SceneManagerEvent event) {
@@ -4574,11 +4584,20 @@ static void uart_gui_tick(void* context) {
         uart_process_line(line, app);
         furi_string_free(line);
     }
-    if(app->scan_waiting && (scanFinish || (int32_t)(furi_get_tick() - app->scan_deadline) >= 0)) {
+    if(app->scan_waiting &&
+       (scanFinish || scanFailed || (int32_t)(furi_get_tick() - app->scan_deadline) >= 0)) {
         app->scan_waiting = false;
-        submenu_reset(app->submenu);
-        uart_helper_send(app->uart_helper, "LIST\n", 5);
-        scene_manager_previous_scene(app->scene_manager);
+        if(scanFailed) {
+            // Say it failed instead of listing stale RAM contents as if they were fresh results.
+            snprintf(message, sizeof(message), "Scan failed - try again");
+            snprintf(popupHeader, sizeof(popupHeader), "Error");
+            scene_manager_previous_scene(app->scene_manager);
+            post_event(app, DELFY_EVT_POPUP);
+        } else {
+            submenu_reset(app->submenu);
+            uart_helper_send(app->uart_helper, "LIST\n", 5);
+            scene_manager_previous_scene(app->scene_manager);
+        }
     }
 }
 
@@ -4628,6 +4647,9 @@ void uart_process_line(FuriString* line, void* context) {
     } else if(strncmp(furi_string_get_cstr(line), "SCAN:OK", 7) == 0) {
         scanFinish = true;
         FURI_LOG_D(TAG, "SCAN FINISH");
+    } else if(strncmp(furi_string_get_cstr(line), "SCAN:FAIL", 9) == 0) {
+        scanFailed = true;
+        FURI_LOG_D(TAG, "SCAN FAILED (board)");
     } else if(strncmp(furi_string_get_cstr(line), "EV:", 3) == 0) {
         char buffer[128];
         strncpy(buffer, furi_string_get_cstr(line), sizeof(buffer) - 1);

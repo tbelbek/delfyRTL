@@ -481,6 +481,13 @@ int scanNetworks(int miliseconds) {
       delay(100);
     }
     digitalWrite(LED_B,true);
+    // Report a completion timeout. scan_done is the DRIVER's completion event: if it never arrives
+    // the results are stale/partial, and returning success here silently produced an empty list
+    // that the host could not distinguish from a real one.
+    if(!scan_done) {
+      DEBUG_SER_PRINT(" scan completion TIMEOUT after "+(String)maxwait+" ms (no scan_done)\n");
+      return 1;
+    }
     DEBUG_SER_PRINT(" done! n="+(String)scan_results.size()+"\n");
     return 0;
   } else {
@@ -1663,9 +1670,17 @@ void loop() {
       while (scanNetworks(5000) && ++scan_tries < 2) {
         delay(1000);
       }
-      if(scan_tries >= 2) DEBUG_SER_PRINT("SCAN: gave up after 2 tries");
-      Serial1.print("SCAN:OK\n");
-      Serial.print("SCAN:OK\n");
+      // SCAN:OK used to be printed unconditionally, even when both attempts failed - the host then
+      // waited for a LIST that had nothing in it and showed an empty result list with no
+      // explanation. Say what actually happened instead.
+      if(scan_tries >= 2) {
+        DEBUG_SER_PRINT("SCAN: FAILED after 2 tries");
+        Serial1.print("SCAN:FAIL\n");
+        Serial.print("SCAN:FAIL\n");
+      } else {
+        Serial1.print("SCAN:OK\n");
+        Serial.print("SCAN:OK\n");
+      }
       
     }else if(readString.substring(0,4)=="STOP"){
       DEBUG_SER_PRINT("Stop deauthing\n");
