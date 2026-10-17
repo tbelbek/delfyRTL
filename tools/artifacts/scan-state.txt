@@ -1,0 +1,6 @@
+DEBUG: Stop randomSSID
+DEBUG: Scanning WiFi networks (5000 ms)...
+DEBUG: wifi get band type:2
+DEBUG: scan results cleared...DEBUG:  done! n=14
+SCAN:OK
+IDENT:brand=DELFY;fw=1.0.0;proto=1;caps=DSEBHLICKRTFA;board=BW16
