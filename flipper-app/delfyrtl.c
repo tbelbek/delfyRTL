@@ -289,6 +289,8 @@ typedef struct delfyRTL {
     uint8_t channelAP;
     char fw_version[16]; // from the board's IDENT (HELLO handshake)
     char fw_caps[16];    // capability letters, e.g. "DSEBH"
+    uint8_t ident_attempts;   // HELLO attempts made (architect: bounded to 3)
+    uint32_t ident_last_tick; // when the last HELLO went out
     View* chanMapView;   // G: channel-map canvas view
     View* cardView;      // card-grid main menu
     View* busyView;      // animated "working" screen (name + spinner, no dolphin)
@@ -2250,7 +2252,18 @@ static void wifi_hub_cb(void* context, uint32_t index) {
 // if that reply is missed (board still booting) the UI stayed on "(no IDENT)" forever.
 // Retrying on each main/hub/help entry makes it self-heal.
 static void delfy_ident(delfyRTL* app) {
-    if(app->fw_version[0] == '\0') uart_helper_send(app->uart_helper, "HELLO\n", 6);
+    diag(19, 0, 0);
+    // Bounded (architect): at most three attempts, 3 s apart, and never again once identified. The
+    // previous version retried forever while fw_caps stayed empty - every 3 s, for the whole session,
+    // and each call oscillated the free heap by ~6 KB, which is what made allocations fail later.
+    if(app->fw_caps[0] != '\0' || app->ident_attempts >= 3) return;
+    uint32_t now = furi_get_tick();
+    if(app->ident_attempts != 0 && (uint32_t)(now - app->ident_last_tick) < furi_ms_to_ticks(3000))
+        return;
+    app->ident_last_tick = now;
+    app->ident_attempts++;
+    if(app->ident_attempts > 1) diag(18, app->ident_attempts, 0);
+    uart_helper_send(app->uart_helper, "HELLO\n", 6);
 }
 
 // C2: tell the board which portal to serve. "Rotate" (index CAPTIVE_PORTAL_SIZE-1) enables the
@@ -2405,7 +2418,7 @@ void tools_menu_scene_on_enter(void* context) {
     char hdr[32];
     if(app->fw_caps[0] == '\0') {
         // No board (or one that has not answered): the capability-gated rows are gone, so say why.
-        snprintf(hdr, sizeof(hdr), "Tools: no board");
+        snprintf(hdr, sizeof(hdr), "Tools: unidentified");
     } else if(app->wifiCount > 0 && app->selectedWifi >= 0 && app->selectedWifi < app->wifiCount) {
         snprintf(
             hdr,
@@ -4839,14 +4852,7 @@ static void uart_gui_tick(void* context) {
     // ROM download mode by a test), fw_caps stayed empty for the rest of the session and, since
     // item 0.6, every capability-gated row disappeared with no way back. Ask again until it
     // answers, a few seconds apart, and stop as soon as we have an identity.
-    if(app->fw_caps[0] == '\0') {
-        static uint32_t last_hello = 0;
-        uint32_t nowt = furi_get_tick();
-        if(last_hello == 0 || (uint32_t)(nowt - last_hello) >= furi_ms_to_ticks(3000)) {
-            last_hello = nowt;
-            uart_helper_send(app->uart_helper, "HELLO\n", 6);
-        }
-    }
+    if(app->fw_caps[0] == '\0' && app->ident_attempts < 3) delfy_ident(app);
     // A failed save is worth interrupting for - the alternative was silence, so the user believed
     // the artifact was on the card. Consumed ONCE per failure via the sequence number, never once
     // per tick: each popup pushes a scene, and the scene history has no depth limit.
@@ -5214,6 +5220,7 @@ void uart_process_line(FuriString* line, void* context) {
             if(n >= sizeof(app->fw_caps)) n = sizeof(app->fw_caps) - 1;
             memcpy(app->fw_caps, cp + 5, n);
             app->fw_caps[n] = '\0';
+            diag(20, (uint32_t)n, 0);                    // caps received
             post_event(app, DELFY_EVT_REIDENTIFIED);   // let the current menu rebuild
         }
         FURI_LOG_I(TAG, "IDENT fw=%s caps=%s", app->fw_version, app->fw_caps);
@@ -5337,6 +5344,8 @@ static delfyRTL* app_alloc() {
     app->rickIndex = 0;
     app->fw_version[0] = '\0';
     app->fw_caps[0] = '\0';
+    app->ident_attempts = 0;
+    app->ident_last_tick = 0;
     app->bleAdvHex[0] = '\0';
     app->ibeaconUuid[0] = '\0';
     app->scene_manager = scene_manager_alloc(&delfyRTL_scene_manager_handlers, app);
@@ -5464,7 +5473,7 @@ static delfyRTL* app_alloc() {
     uart_helper_set_baud_rate(app->uart_helper, DEVICE_BAUDRATE);
     uart_helper_set_delimiter(app->uart_helper, LINE_DELIMITER, INCLUDE_LINE_DELIMITER);
     uart_helper_set_callback(app->uart_helper, uart_enqueue_line, app);
-    uart_helper_send(app->uart_helper, "HELLO\n", 6); // A: ask the board to advertise caps
+    delfy_ident(app); // A: ask the board to advertise caps (bounded, see delfy_ident)
 
     app->timer = furi_timer_alloc(animation_timer_callback, FuriTimerTypePeriodic, app);
     return app;
