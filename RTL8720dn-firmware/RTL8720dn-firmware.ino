@@ -210,18 +210,20 @@ void createAP(char* ssid, char* channel, char* password){
   // apActivate() fails with "ioctl[RTKIOCSIWFREQ] error / Operation failed!". Note the trap: setting
   // the channel directly on the running interface succeeds *while in STA mode* - success there says
   // nothing about the AP-mode path, which is why three attempts at promisc/mode/pre-setting all
-  // missed. Assign (do not OR) the mode, sync Arduino's private cache, then force a checked restart.
+  // missed. Assign (do not OR) the mode: apbegin's own re-init then picks RTW_MODE_AP.
   {
     int want = atoi(channel);
     if(want < 1 || want > 165) want = 6;
     snprintf(ap_channel, sizeof(ap_channel), "%d", want);   // keep the request authoritative
     arduino_wifi_mode_check = 0x10;                          // discard the concurrent/STA bits
-    // (WiFiClass::init() is private in this core; apbegin -> WiFiDrv::wifiDriverInit() does
-    //  the driver/lwIP bring-up, and the mode cache is what we just wrote above.)
-    if(wifi_off() < 0) DEBUG_SER_PRINT("wifi_off failed");
-    delay(50);
-    if(wifi_on(RTW_MODE_AP) < 0) DEBUG_SER_PRINT("wifi_on(AP) failed");
-    delay(150);
+    // That one assignment IS the mode fix: apbegin() -> WiFiDrv::wifiDriverInit() reads this
+    // cache (0x10 -> RTW_MODE_AP) and, when it disagrees with the driver's current mode, runs
+    // its own dhcps_deinit(); wifi_off(); wifi_on(RTW_MODE_AP). We used to repeat that restart
+    // here by hand: redundant (apbegin does it right afterwards anyway), it only widened the
+    // window where WLAN0 is down (wext_get_mode printed "WLAN 0 0 / netif is DOWN" plus
+    // ioctl[RTKIOCGIWMODE] error), and its checks were wrong - wifi_off()/wifi_on() return
+    // non-zero on SUCCESS in this SDK, so the log read "wifi_off failed / wifi_on(AP) failed"
+    // while both calls had actually worked. Misleading enough to send us after the wrong bug.
     wifi_set_promisc(0 /*RTW_PROMISC_DISABLE*/, NULL, 0);
   }
   const char* ifname = WLAN0_NAME;
@@ -239,6 +241,12 @@ void createAP(char* ssid, char* channel, char* password){
   DEBUG_SER_PRINT("CREATING AP");
   DEBUG_SER_PRINT(ssid);
   DEBUG_SER_PRINT(channel);
+  // status is a GLOBAL that still holds WL_CONNECTED from any earlier AP in this session.
+  // Without this reset the retry loop below is skipped on a 2nd start: apbegin() is never
+  // called, the AP that the mode change just took down is never restarted, and we still set
+  // apActive=true with HTTP/DHCP/DNS up - EXACTLY the "AP starts, servers run, nothing on the
+  // air" symptom we chased. Reset it and test the FRESH result.
+  status = WL_IDLE_STATUS;
   int tries = 0;
   while (status != WL_CONNECTED && tries < 6) {
     DEBUG_SER_PRINT("CREATING AP 2");
@@ -247,6 +255,7 @@ void createAP(char* ssid, char* channel, char* password){
       }else{
         status = WiFi.apbegin(ssid, password, channel, (uint8_t) 0);
       }
+      if(status == WL_CONNECTED) break;
       delay(1000);
       tries++;
   }
@@ -259,7 +268,9 @@ void createAP(char* ssid, char* channel, char* password){
   // Replace the SDK DHCP server with ours so we can advertise option 114 (RFC 8910),
   // which is what actually triggers Android 11+ captive-portal auto-open.
   dhcps_deinit();
-  start_DHCP_Server(cpUri);
+  // The AP interface is chosen by the same rule the core's apActivate() uses: with our forced
+  // 0x10 mode cache that is WLAN0/xnetif[0]; 0x11 (concurrent) would be xnetif[1].
+  start_DHCP_Server(cpUri, (arduino_wifi_mode_check == 0x11) ? 1 : 0);
 
   unbind_dns();
   delay(1000);

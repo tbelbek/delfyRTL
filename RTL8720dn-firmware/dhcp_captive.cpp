@@ -15,36 +15,32 @@ extern "C" struct netif xnetif[];
 
 static struct udp_pcb *dhcp_pcb = NULL;
 static struct netif *ap_netif = NULL;
+static int ap_ifindex = 0;   // which xnetif[] carries the AP - set by start_DHCP_Server()
 // Option-114 captive-portal URL (set by the sketch at AP start; host-based, not the IP).
 static char dhcp_cp_uri[96] = "http://192.168.4.1/cp.json";
 
-// apbegin always brings the SoftAP up at 192.168.1.1 (WiFiDrv default; setting it via
-// WiFi.config() before apbegin breaks the channel ioctl). Retarget that netif to our
-// captive subnet (DHCP_AP_IP) here instead, after the AP is already up.
+// Move the SoftAP netif off the SDK default (192.168.1.1) onto our captive subnet.
+//
+// Which netif? The core's apActivate() chooses it from arduino_wifi_mode_check:
+//   0x11 (STA_AP) -> WLAN1 / xnetif[1];  anything else -> WLAN0 / xnetif[0].
+// createAP() forces 0x10 for a pure softAP, so the AP is xnetif[0]. Use that same rule (passed
+// in as ap_if) instead of the old "find whichever netif holds 192.168.1.1" search: if the SDK's
+// default AP IP ever differs, that search matches nothing and the fallback (xnetif[1]) is the
+// WRONG interface in pure AP mode - every DHCP offer would then leave through a dead netif and
+// no client would ever get a lease.
 static void retarget_ap_netif(void) {
-    for (int i = 0; i < 2; i++) {
-        ip4_addr_t *a = ip_2_ip4(&xnetif[i].ip_addr);
-        if (ip4_addr1(a) == 192 && ip4_addr2(a) == 168 && ip4_addr3(a) == 1 && ip4_addr4(a) == 1) {
-            ip4_addr_t nip, nmask, ngw;
-            IP4_ADDR(&nip,  DHCP_AP_IP[0], DHCP_AP_IP[1], DHCP_AP_IP[2], DHCP_AP_IP[3]);
-            IP4_ADDR(&nmask, DHCP_AP_MASK[0], DHCP_AP_MASK[1], DHCP_AP_MASK[2], DHCP_AP_MASK[3]);
-            IP4_ADDR(&ngw,  DHCP_AP_IP[0], DHCP_AP_IP[1], DHCP_AP_IP[2], DHCP_AP_IP[3]);
-            netif_set_addr(&xnetif[i], &nip, &nmask, &ngw);
-            printf("DHCP: retargeted netif %d -> %d.%d.%d.%d\n", i,
-                   DHCP_AP_IP[0], DHCP_AP_IP[1], DHCP_AP_IP[2], DHCP_AP_IP[3]);
-        }
-    }
+    ip4_addr_t nip, nmask, ngw;
+    IP4_ADDR(&nip,  DHCP_AP_IP[0], DHCP_AP_IP[1], DHCP_AP_IP[2], DHCP_AP_IP[3]);
+    IP4_ADDR(&nmask, DHCP_AP_MASK[0], DHCP_AP_MASK[1], DHCP_AP_MASK[2], DHCP_AP_MASK[3]);
+    IP4_ADDR(&ngw,  DHCP_AP_IP[0], DHCP_AP_IP[1], DHCP_AP_IP[2], DHCP_AP_IP[3]);
+    netif_set_addr(&xnetif[ap_ifindex], &nip, &nmask, &ngw);
+    printf("DHCP: retargeted netif %d -> %d.%d.%d.%d\n", ap_ifindex,
+           DHCP_AP_IP[0], DHCP_AP_IP[1], DHCP_AP_IP[2], DHCP_AP_IP[3]);
 }
 
-// Pick the netif that owns the AP IP (DHCP_AP_IP), regardless of index/mode.
+// The AP netif, by the same interface rule apActivate() used.
 static struct netif *find_ap_netif(void) {
-    for (int i = 0; i < 2; i++) {
-        ip4_addr_t *a = ip_2_ip4(&xnetif[i].ip_addr);
-        if (ip4_addr1(a) == DHCP_AP_IP[0] && ip4_addr2(a) == DHCP_AP_IP[1] &&
-            ip4_addr3(a) == DHCP_AP_IP[2] && ip4_addr4(a) == DHCP_AP_IP[3])
-            return &xnetif[i];
-    }
-    return &xnetif[1];  // fallback: SoftAP index in concurrent mode
+    return &xnetif[ap_ifindex];
 }
 
 // Same lwip raw-UDP callback shape delfy uses for DNS (cast on udp_recv below).
@@ -74,12 +70,13 @@ static void dhcp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     pbuf_free(op);
 }
 
-void start_DHCP_Server(const char *cp_uri) {
+void start_DHCP_Server(const char *cp_uri, int ap_if) {
     if (cp_uri && cp_uri[0]) {                 // remember the portal URL for option 114
         strncpy(dhcp_cp_uri, cp_uri, sizeof(dhcp_cp_uri) - 1);
         dhcp_cp_uri[sizeof(dhcp_cp_uri) - 1] = 0;
     }
     if (dhcp_pcb != NULL) return;
+    ap_ifindex = (ap_if == 1) ? 1 : 0;    // same rule apActivate() used to pick WLAN0/WLAN1
     retarget_ap_netif();          // move SoftAP from 192.168.1.1 to our captive subnet
     ap_netif = find_ap_netif();
     dhcp_pcb = udp_new();
