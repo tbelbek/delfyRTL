@@ -299,6 +299,48 @@ typedef struct delfyRTL {
     char ibeaconUuid[40];// #6: iBeacon UUID hex (typed)
 } delfyRTL;
 
+// --- Non-blocking custom-event ring (prioritised plan, item #1) ------------------------------
+// The dispatcher's own custom-event queue holds 16 entries and
+// view_dispatcher_send_custom_event() waits FOREVER when it is full (furi_message_queue_put with
+// FuriWaitForever + furi_check). Producers here are the 10 ms UART tick - which runs ON the
+// dispatcher thread, so a full queue is a self-deadlock - and the periodic FuriTimer callbacks,
+// where blocking stalls the whole timer service. So events go through this app-owned ring
+// instead: producers append (never blocking, never losing the newest event) and the tick drains
+// it on the GUI thread through the same scene_manager_handle_custom_event() the dispatcher uses.
+// On overflow the OLDEST entry is dropped: the UI wants the newest state, and every event in the
+// ring is a UI refresh or a completion the scene can re-derive.
+#define POST_RING 64
+static uint32_t post_ring[POST_RING];
+static volatile uint8_t post_head = 0;
+static volatile uint8_t post_tail = 0;
+static FuriMutex* post_mutex = NULL;
+
+// Safe from any thread. Holds the mutex for a handful of instructions; never waits on the GUI.
+static void post_event(delfyRTL* app, uint32_t ev) {
+    UNUSED(app);                     // kept so call sites read the same as the dispatcher API
+    if(!post_mutex) return;          // allocated first in app_alloc, freed last in app_free
+    furi_mutex_acquire(post_mutex, FuriWaitForever);
+    uint8_t next = (uint8_t)((post_head + 1) % POST_RING);
+    if(next == post_tail) post_tail = (uint8_t)((post_tail + 1) % POST_RING); // full: drop oldest
+    post_ring[post_head] = ev;
+    post_head = next;
+    furi_mutex_release(post_mutex);
+}
+
+// GUI thread only (the tick). False when nothing is pending.
+static bool take_event(uint32_t* ev) {
+    if(!post_mutex) return false;
+    bool ok = false;
+    furi_mutex_acquire(post_mutex, FuriWaitForever);
+    if(post_tail != post_head) {
+        *ev = post_ring[post_tail];
+        post_tail = (uint8_t)((post_tail + 1) % POST_RING);
+        ok = true;
+    }
+    furi_mutex_release(post_mutex);
+    return ok;
+}
+
 // Model for the animated "working" screen (busyView): spinner phase + a countdown.
 typedef struct {
     uint8_t phase;
@@ -1015,7 +1057,7 @@ void info_wifi_button_press(GuiButtonType result, InputType type, void* context)
     uint32_t ev = DELFY_EVT_INFO_EDIT;
     if(result == GuiButtonTypeCenter) ev = DELFY_EVT_INFO_DEAUTH;
     else if(result == GuiButtonTypeRight) ev = DELFY_EVT_INFO_EVIL;
-    view_dispatcher_send_custom_event(app->view_dispatcher, ev);
+    post_event(app, ev);
 }
 void info_wifi_scene_on_enter(void* context) {
     FURI_LOG_D(TAG, __func__);
@@ -1240,7 +1282,7 @@ void mac_type_change_call_back(VariableItem* item) {
     // config_*_scene_on_enter(), which starts with variable_item_list_reset() - i.e. it frees the
     // items of the list whose change callback we are inside right now. Post the rebuild and let the
     // scene's on_event do it between frames (the same rule the Info screen buttons follow).
-    view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_REBUILD_VIL);
+    post_event(app, DELFY_EVT_REBUILD_VIL);
 }
 
 static void delfy_start_capture(delfyRTL* app, bool grab) {
@@ -2826,13 +2868,13 @@ void beacon_info_scene_on_exit(void* context) {
 static void karma_timer_cb(void* context) {
     delfyRTL* app = context;
     // Poll from the timer thread via a custom event; the scene then sends KARMALIST.
-    view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_KARMA_POLL);
+    post_event(app, DELFY_EVT_KARMA_POLL);
 }
 
 // F1: same pattern - the tick only posts an event, the scene does the work on the GUI thread.
 static void script_timer_cb(void* context) {
     delfyRTL* app = context;
-    view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_SCRIPT_TICK);
+    post_event(app, DELFY_EVT_SCRIPT_TICK);
 }
 
 static void karma_button_cb(GuiButtonType result, InputType type, void* context);
@@ -2913,7 +2955,7 @@ static void karma_button_cb(GuiButtonType result, InputType type, void* context)
         snprintf(cmd, sizeof(cmd), karma_trap ? "TRAP 1 %d\n" : "KARMA 1 %d\n", karma_chan_sel);
         uart_helper_send(app->uart_helper, cmd, strlen(cmd));
     }
-    view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_KARMA);
+    post_event(app, DELFY_EVT_KARMA);
 }
 
 void karma_scene_on_enter(void* context) {
@@ -3231,7 +3273,7 @@ static void rec_save(delfyRTL* app) {
     snprintf(popupHeader, sizeof(popupHeader), "Macro");
     // rec_save() runs inside uart_process_line (UART worker thread), so pushing a scene directly
     // is not safe - post it and let the dispatcher do it on the GUI thread.
-    view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+    post_event(app, DELFY_EVT_POPUP);
 }
 
 static void rec_scene_build(delfyRTL* app);
@@ -3249,7 +3291,7 @@ static void rec_item_cb(void* context, uint32_t index) {
     // Do NOT rebuild the submenu here: resetting the view from inside its own callback leaves the
     // submenu walking a freed model and crashes the Flipper on the next key. Post an event instead
     // and rebuild between frames (same class of bug as the widget-input crash).
-    view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_REC_REFRESH);
+    post_event(app, DELFY_EVT_REC_REFRESH);
 }
 
 static void rec_scene_build(delfyRTL* app) {
@@ -3427,18 +3469,18 @@ static void batch_item_cb(void* context, uint32_t index) {
     delfyRTL* app = context;
     if(index == (uint32_t)batch_n + 1) { // Run
         batch_cursor = (uint8_t)index;
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_BATCH_RUN);
+        post_event(app, DELFY_EVT_BATCH_RUN);
         return;
     }
     if(index == (uint32_t)batch_n) { // Clear marks
         batch_count = 0;
         batch_cursor = (uint8_t)index;
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_BATCH_REFRESH);
+        post_event(app, DELFY_EVT_BATCH_REFRESH);
         return;
     }
     batch_cursor = (uint8_t)index;
     batch_toggle((int)index);
-    view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_BATCH_REFRESH);
+    post_event(app, DELFY_EVT_BATCH_REFRESH);
 }
 
 // Rows only; batch_scene_on_enter owns the reset and the view switch.
@@ -3608,7 +3650,7 @@ static void busy_timer_cb(void* context) {
     // spun forever with no way out besides BACK. ~36 s at 120 ms/tick -> "Timeout" popup.
     if(++busy_ticks >= 300) {
         busy_ticks = 0;
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_BUSY_TIMEOUT);
+        post_event(app, DELFY_EVT_BUSY_TIMEOUT);
     }
 }
 
@@ -4037,7 +4079,7 @@ void security_change_callback(VariableItem* item) {
     app->securityAP = index;
     // Post, never call config_ap_scene_on_enter() here: it resets the list we are dispatching from
     // (the password row appears/disappears with the security type).
-    view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_REBUILD_VIL);
+    post_event(app, DELFY_EVT_REBUILD_VIL);
 }
 
 void channel_change_callback(VariableItem* item) {
@@ -4046,7 +4088,7 @@ void channel_change_callback(VariableItem* item) {
     delfyRTL* app = variable_item_get_context(item);
     //variable_item_set_current_value_text(item, securityType[index]);
     app->channelAP = index;
-    view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_REBUILD_VIL);
+    post_event(app, DELFY_EVT_REBUILD_VIL);
 }
 
 void config_ap_change_call_back(void* context, uint32_t index) {
@@ -4058,9 +4100,9 @@ void config_ap_change_call_back(void* context, uint32_t index) {
         // This is the variable item list's ENTER callback, so anything that touches views here runs
         // inside the list's own dispatch. Post the transition instead; config_ap_scene_on_event
         // performs it between frames.
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_AP_EDIT_NAME);
+        post_event(app, DELFY_EVT_AP_EDIT_NAME);
     } else if((int)index == app->ap_idx_pass) {
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_AP_EDIT_PASSWORD);
+        post_event(app, DELFY_EVT_AP_EDIT_PASSWORD);
     } else if((int)index == app->ap_idx_load) {
         scene_manager_next_scene(app->scene_manager, portalListScene); // pick .html from /ext/delfy/portals
     } else if((int)index == app->ap_idx_start) {
@@ -4366,6 +4408,15 @@ static void uart_enqueue_line(FuriString* line, void* context) {
 // that custom events posted by the line handlers are serviced in between.
 static void uart_gui_tick(void* context) {
     delfyRTL* app = context;
+    // Drain the app-owned event ring FIRST. These are the events the producers (this tick, the
+    // UART line handlers, the timer callbacks) must not hand to the dispatcher directly, because
+    // view_dispatcher_send_custom_event() blocks forever on a full queue. The scene manager runs
+    // exactly the on_event handlers the dispatcher would have run, just without the 16-slot queue.
+    uint32_t ev;
+    for(int i = 0; i < 16; i++) {
+        if(!take_event(&ev)) break;
+        scene_manager_handle_custom_event(app->scene_manager, ev);
+    }
     FuriString* line;
     // Several lines per tick. This callback runs on the dispatcher (GUI) thread, and with a 10 ms
     // period eight lines per tick is 800 lines/s - far past anything the board emits, at a fraction
@@ -4442,7 +4493,7 @@ void uart_process_line(FuriString* line, void* context) {
             strcat(credentials, "\n");
         }
         creds_append_sd(token);   // also persist to /ext/delfy/creds.txt
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_CREDS);
+        post_event(app, DELFY_EVT_CREDS);
     } else if(strncmp(furi_string_get_cstr(line), "ERROR:", 6) == 0) {
         char buffer[128];
         strncpy(buffer, furi_string_get_cstr(line), sizeof(buffer) - 1);
@@ -4461,7 +4512,7 @@ void uart_process_line(FuriString* line, void* context) {
         } else {
             snprintf(message, sizeof(message), "%s", token);
             snprintf(popupHeader, sizeof(popupHeader), "ERROR");
-            view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+            post_event(app, DELFY_EVT_POPUP);
         }
     } else if(strncmp(furi_string_get_cstr(line), "HSCAP:", 6) == 0) {
         // Board header before a HSFRAME dump: "HSCAP: ch=N count=N".
@@ -4491,7 +4542,7 @@ void uart_process_line(FuriString* line, void* context) {
         // watched: BTM/CSA always print their own line first, and two popups would stack.
         snprintf(message, sizeof(message), "%s", furi_string_get_cstr(line));
         snprintf(popupHeader, sizeof(popupHeader), "Sent");
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+        post_event(app, DELFY_EVT_POPUP);
     } else if(strncmp(furi_string_get_cstr(line), "HSDONE:", 7) == 0) {
         uint16_t written = 0;
         if(batch_active) {
@@ -4522,14 +4573,14 @@ void uart_process_line(FuriString* line, void* context) {
                 qual,
                 hs_channel);
             snprintf(popupHeader, sizeof(popupHeader), "Capture done");
-            view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+            post_event(app, DELFY_EVT_POPUP);
         }
     } else if(strncmp(furi_string_get_cstr(line), "PMFDONE:", 8) == 0) {
         snprintf(recon_title, sizeof(recon_title), "PMF / WPA3");
         const char* s = strstr(furi_string_get_cstr(line), "aps=");
         sess_pmf = s ? atoi(s + 4) : 0;
         delfy_save_scan("pmf", recon_text);
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
+        post_event(app, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "PMF:", 4) == 0) {
         // A6: classify "<mac>|<ssid>|akm=N|sae=N|mfp=cap|req" into a WPA3/WPA2 verdict so the
         // recon view reads like an inventory (and transition-mode downgrades stand out).
@@ -4555,7 +4606,7 @@ void uart_process_line(FuriString* line, void* context) {
         const char* s = strstr(furi_string_get_cstr(line), "n=");
         sess_stas = s ? atoi(s + 2) : 0;
         delfy_save_scan("stations", recon_text);
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
+        post_event(app, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "STA:", 4) == 0) {
         recon_append(furi_string_get_cstr(line) + 4);
     } else if(strncmp(furi_string_get_cstr(line), "DEAUTHDONE:", 11) == 0) {
@@ -4563,14 +4614,14 @@ void uart_process_line(FuriString* line, void* context) {
         const char* s = strstr(furi_string_get_cstr(line), "n=");
         sess_deauth = s ? atoi(s + 2) : 0;
         delfy_save_scan("deauth_ids", recon_text);
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
+        post_event(app, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "DEAUTH:", 7) == 0) {
         recon_append(furi_string_get_cstr(line) + 7);
     } else if(strncmp(furi_string_get_cstr(line), "CLIDONE:", 8) == 0) {
         // A2: the board finished the tracker window - keep the timeline in the session folder.
         snprintf(recon_title, sizeof(recon_title), "Client tracker");
         delfy_save_scan("clients", recon_text);
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
+        post_event(app, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "CLI:", 4) == 0) {
         recon_append(furi_string_get_cstr(line) + 4);
     } else if(strncmp(furi_string_get_cstr(line), "PROBEDONE:", 10) == 0) {
@@ -4578,27 +4629,27 @@ void uart_process_line(FuriString* line, void* context) {
         const char* s = strstr(furi_string_get_cstr(line), "n=");
         sess_probes += s ? atoi(s + 2) : 0;
         delfy_save_scan("probe", recon_text);
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
+        post_event(app, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "PROBE:", 6) == 0) {
         recon_append(furi_string_get_cstr(line) + 6);
     } else if(strncmp(furi_string_get_cstr(line), "CSASTAS:", 8) == 0) {
         // B2b: per-station unicast announcements
         snprintf(popupHeader, sizeof(popupHeader), "CSA unicast");
         snprintf(message, sizeof(message), "Sent to %s stations", furi_string_get_cstr(line) + 8);
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+        post_event(app, DELFY_EVT_POPUP);
     } else if(strncmp(furi_string_get_cstr(line), "CSA:", 4) == 0) {
         // B2: what the board actually sent
         snprintf(popupHeader, sizeof(popupHeader), "CSA");
         snprintf(message, sizeof(message), "Sent %s", furi_string_get_cstr(line) + 4);
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+        post_event(app, DELFY_EVT_POPUP);
     } else if(strncmp(furi_string_get_cstr(line), "APCLONE:", 8) == 0) {
         snprintf(message, sizeof(message), "Cloned %s", furi_string_get_cstr(line) + 8);
         snprintf(popupHeader, sizeof(popupHeader), "AP clone");
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+        post_event(app, DELFY_EVT_POPUP);
     } else if(strncmp(furi_string_get_cstr(line), "PROBEFLOOD:", 11) == 0) {
         snprintf(message, sizeof(message), "Sent %s probes", furi_string_get_cstr(line) + 11);
         snprintf(popupHeader, sizeof(popupHeader), "Probe flood");
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+        post_event(app, DELFY_EVT_POPUP);
     } else if(strncmp(furi_string_get_cstr(line), "RECDONE:", 8) == 0) {
         // F5: the board finished dumping the recording - save it as a runnable script.
         rec_save(app);
@@ -4627,7 +4678,7 @@ void uart_process_line(FuriString* line, void* context) {
             }
             delfy_save_scan("karma", o > 0 ? body : "(none)\n");
         }
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_KARMA);
+        post_event(app, DELFY_EVT_KARMA);
     } else if(strncmp(furi_string_get_cstr(line), "KARMA:", 6) == 0) {
         // on/off ack - the scene shows live state from the KARMALIST polls instead
     } else if(strncmp(furi_string_get_cstr(line), "TRAPSTAT:", 9) == 0) {
@@ -4645,7 +4696,7 @@ void uart_process_line(FuriString* line, void* context) {
                     snprintf(trap_state, sizeof(trap_state), "%.*s", l, ap);
                 }
             }
-            view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_KARMA);
+            post_event(app, DELFY_EVT_KARMA);
         }
     } else if(strncmp(furi_string_get_cstr(line), "TRAPCTL:", 8) == 0) {
         // C1: Trap on/off ack
@@ -4663,10 +4714,10 @@ void uart_process_line(FuriString* line, void* context) {
                 captive_portals[app->captivePortal]);
             delfy_save_scan("trap", body);
         }
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_KARMA);
+        post_event(app, DELFY_EVT_KARMA);
     } else if(strncmp(furi_string_get_cstr(line), "TRAPFAIL", 8) == 0) {
         snprintf(trap_state, sizeof(trap_state), "(clone failed - still KARMA)");
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_KARMA);
+        post_event(app, DELFY_EVT_KARMA);
     } else if(strncmp(furi_string_get_cstr(line), "PORTALHASH:", 11) == 0) {
         // Reply to our PORTALHASH request: len + FNV-1a of what the board actually holds.
         // (Parsed with strtol — sscanf is not in the firmware export table.)
@@ -4677,12 +4728,12 @@ void uart_process_line(FuriString* line, void* context) {
         bool ok = (len == (unsigned)portal_exp_len) && (h == (unsigned long)portal_exp_hash);
         snprintf(popupHeader, sizeof(popupHeader), ok ? "Portal OK" : "Portal MISMATCH");
         snprintf(message, sizeof(message), "SD %u / board %u B", (unsigned)portal_exp_len, len);
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+        post_event(app, DELFY_EVT_POPUP);
     } else if(strncmp(furi_string_get_cstr(line), "PMKIDDONE:", 10) == 0) {
         if(audit_mode) audit_write_json("pmkid", 0);
         write_wpa_file();
         snprintf(recon_title, sizeof(recon_title), "PMKID");
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
+        post_event(app, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "PMKID:", 6) == 0 ||
               strncmp(furi_string_get_cstr(line), "WPA*01*", 7) == 0) {
         const char* s = furi_string_get_cstr(line);
@@ -4715,22 +4766,22 @@ void uart_process_line(FuriString* line, void* context) {
     } else if(strncmp(furi_string_get_cstr(line), "BLEDONE:", 8) == 0) {
         snprintf(recon_title, sizeof(recon_title), "BLE");
         delfy_save_scan("ble", recon_text);
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
+        post_event(app, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "BLESPAM:", 8) == 0) {
         // reply is "BLESPAM:off <count>" -> show just the count
         const char* s = furi_string_get_cstr(line) + 8;
         const char* sp = strchr(s, ' ');
         snprintf(message, sizeof(message), "Sent %s payloads", sp ? sp + 1 : s);
         snprintf(popupHeader, sizeof(popupHeader), "BLE spam");
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+        post_event(app, DELFY_EVT_POPUP);
     } else if(strncmp(furi_string_get_cstr(line), "GATT:done", 9) == 0) {
         snprintf(recon_title, sizeof(recon_title), "GATT");
         delfy_save_scan("gatt", recon_text);
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_RECON);
+        post_event(app, DELFY_EVT_RECON);
     } else if(strncmp(furi_string_get_cstr(line), "GATT:connect-failed", 19) == 0) {
         snprintf(message, sizeof(message), "Connect failed");
         snprintf(popupHeader, sizeof(popupHeader), "GATT");
-        view_dispatcher_send_custom_event(app->view_dispatcher, DELFY_EVT_POPUP);
+        post_event(app, DELFY_EVT_POPUP);
     } else if(strncmp(furi_string_get_cstr(line), "GATT:", 5) == 0) {
         recon_append(furi_string_get_cstr(line) + 5);
     } else if(strncmp(furi_string_get_cstr(line), "BLE:", 4) == 0) {
@@ -4818,6 +4869,12 @@ static void animation_timer_callback(void* context) {
 
 static delfyRTL* app_alloc() {
     FURI_LOG_D(TAG, __func__);
+    // First, before anything that can produce an event (the UART worker starts inside
+    // uart_helper_alloc below, and the timers are created later): the ring's mutex.
+    post_head = 0;
+    post_tail = 0;
+    post_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    furi_check(post_mutex);
     delfyRTL* app = malloc(sizeof(delfyRTL));
     app->ssidAPLength = 32;
     //app->ssidAPLength = 0;
@@ -5007,6 +5064,10 @@ static void app_free(delfyRTL* app) {
         furi_string_free(leftover);
     }
     furi_message_queue_free(app->uart_lines);
+    // Last, now that every producer is gone (all timers stopped above, the UART worker joined in
+    // uart_helper_free, and the dispatcher's tick can no longer fire because its loop returned).
+    furi_mutex_free(post_mutex);
+    post_mutex = NULL;
 
     view_dispatcher_remove_view(app->view_dispatcher, mainMenuView);
     view_dispatcher_remove_view(app->view_dispatcher, scannedWifisView);
