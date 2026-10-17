@@ -349,6 +349,10 @@ static FuriThread* storage_thread = NULL;
 static volatile bool storage_run = false;
 static volatile uint16_t storage_dropped = 0;
 static char storage_status[64] = "";   // last outcome, for a status screen
+// Set by the worker on any failure (short write / cannot open). The GUI tick turns it into a popup:
+// a failed save used to be completely silent, so the screen showed "saved" (or a frame count) while
+// nothing had reached the card.
+static volatile bool storage_failed = false;
 
 // Called from any thread. Takes ownership of data on success; returns false (and the caller frees)
 // when the queue is full, so nothing ever blocks here.
@@ -394,8 +398,9 @@ static int32_t storage_worker(void* context) {
             size_t w = storage_file_write(f, job.data, job.len);
             if(w != job.len) {
                 // Short write: the card may be full. Say so instead of pretending it saved.
-                snprintf(storage_status, sizeof(storage_status), "short write %u/%u",
+                snprintf(storage_status, sizeof(storage_status), "SD full? %u/%u bytes",
                          (unsigned)w, (unsigned)job.len);
+                storage_failed = true;
                 FURI_LOG_E(TAG, "storage short write %s %u/%u", job.path, (unsigned)w,
                            (unsigned)job.len);
             } else {
@@ -405,6 +410,7 @@ static int32_t storage_worker(void* context) {
             storage_file_close(f);
         } else {
             snprintf(storage_status, sizeof(storage_status), "no SD / open failed");
+            storage_failed = true;
             FURI_LOG_E(TAG, "storage open failed %s", job.path);
         }
         storage_file_free(f);
@@ -522,6 +528,9 @@ typedef enum {
 // "Start AP" from the Create-AP list. The action used to run inline in the list's enter callback
 // (state commands + a scene switch, with four 150 ms sleeps between them).
 #define DELFY_EVT_AP_START 0x2013
+// The board's capability string arrived - possibly late. Menus are built once in on_enter, so a
+// board that was silent at startup left the Tools screen showing "no board" forever.
+#define DELFY_EVT_REIDENTIFIED 0x2014
 // B1: raw payload of the last KARMALIST reply ("<n>|ssid|ssid|..."), rendered by the KARMA scene.
 static char karma_list[192];
 // C1: same scene drives both modes - plain KARMA (answer probes) and Trap (clone the network for
@@ -2362,8 +2371,13 @@ void tools_menu_scene_on_enter(void* context) {
 }
 
 bool tools_menu_scene_on_event(void* context, SceneManagerEvent event) {
-    UNUSED(context);
-    UNUSED(event);
+    delfyRTL* app = context;
+    if(event.type == SceneManagerEventTypeCustom && event.event == DELFY_EVT_REIDENTIFIED) {
+        // The identity arrived after this menu was built. Rebuild it in place - safe here, because
+        // on_event runs between frames, not inside the menu's own input dispatch.
+        tools_menu_scene_on_enter(app);
+        return true;
+    }
     return false;
 }
 
@@ -4620,6 +4634,26 @@ static void uart_gui_tick(void* context) {
         if(!take_event(&ev)) break;
         scene_manager_handle_custom_event(app->scene_manager, ev);
     }
+    // OPEN (round 28): calling the dispatcher's custom-event callback here - which is what owns the
+    // shared outcomes (result view, popup scene, creds + vibration) - crashed the device with
+    // "out of memory". Until that is understood, the ring deliberately does NOT reach the global
+    // handler, so popups and the results view are KNOWN BROKEN (regression from item #1).
+    // Re-identify an unidentified board. The app learns the capability string once, from the reply
+    // to HELLO at startup - so if the board happened to be silent right then (mid-boot, or held in
+    // ROM download mode by a test), fw_caps stayed empty for the rest of the session and, since
+    // item 0.6, every capability-gated row disappeared with no way back. Ask again until it
+    // answers, a few seconds apart, and stop as soon as we have an identity.
+    if(app->fw_caps[0] == '\0') {
+        static uint32_t last_hello = 0;
+        uint32_t nowt = furi_get_tick();
+        if(last_hello == 0 || (uint32_t)(nowt - last_hello) >= furi_ms_to_ticks(3000)) {
+            last_hello = nowt;
+            uart_helper_send(app->uart_helper, "HELLO\n", 6);
+        }
+    }
+    // A failed save is recorded in storage_status / storage_failed by the worker (see below). It is
+    // NOT turned into a popup here yet: raising it goes through DELFY_EVT_POPUP, which needs the
+    // global handler that is currently disabled for the reason noted above.
     FuriString* line;
     // Several lines per tick. This callback runs on the dispatcher (GUI) thread, and with a 10 ms
     // period eight lines per tick is 800 lines/s - far past anything the board emits, at a fraction
@@ -4976,6 +5010,7 @@ void uart_process_line(FuriString* line, void* context) {
             if(n >= sizeof(app->fw_caps)) n = sizeof(app->fw_caps) - 1;
             memcpy(app->fw_caps, cp + 5, n);
             app->fw_caps[n] = '\0';
+            post_event(app, DELFY_EVT_REIDENTIFIED);   // let the current menu rebuild
         }
         FURI_LOG_I(TAG, "IDENT fw=%s caps=%s", app->fw_version, app->fw_caps);
     } else if(strncmp(furi_string_get_cstr(line), "BLEDONE:", 8) == 0) {
