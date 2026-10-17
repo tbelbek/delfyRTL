@@ -628,7 +628,12 @@ static void hs_stream(int ch) {
 // --- P1: channel hop ---
 static volatile bool hopping = false;
 static volatile uint32_t hop_interval_ms = 500;
-static const uint8_t hop_channels[] = {1,2,3,4,5,6,7,8,9,10,11,12,13};
+// Mutable so the host can choose the plan (HOPCH). The default is 2.4 GHz only; a dual-band plan is
+// e.g. "HOPCH 1,6,11,36,40,44,48". Hopping is receive-side, so DFS channels are allowed here (only
+// TX refuses them) - but note the board has ONE radio: an active softAP and a hopping receiver
+// cannot both be right, and the mode change tears the AP down. That is the operator's call.
+static uint8_t hop_channels[24] = {1,2,3,4,5,6,7,8,9,10,11,12,13};
+static volatile uint8_t hop_count = 13;
 
 // --- P2: PMF/WPA3 classification from the RSN IE of beacons / probe responses ---
 // The scan API (rtw_scan_result_t, wifi_structures.h) exposes only a coarse security
@@ -1830,6 +1835,23 @@ void loop() {
       Serial.println(dbg); Serial1.println(dbg);
 
 
+    }else if(readString.substring(0,5)=="HOPCH"){
+      // HOPCH 1,6,11,36,48  -> receive sweep plan (dual-band allowed; TX still refuses DFS).
+      int sp = readString.indexOf(' ');
+      String list = (sp > 0) ? readString.substring(sp + 1) : String("");
+      uint8_t n = 0;
+      int start = 0;
+      while(start >= 0 && n < sizeof(hop_channels)) {
+        int comma = list.indexOf(',', start);
+        String tok = (comma < 0) ? list.substring(start) : list.substring(start, comma);
+        int ch = tok.toInt();
+        if(ch >= 1 && ch <= 165) hop_channels[n++] = (uint8_t)ch;
+        start = (comma < 0) ? -1 : comma + 1;
+      }
+      if(n > 0) hop_count = n;
+      char hb[48];
+      snprintf(hb, sizeof(hb), "HOPCHSET:%u", (unsigned)hop_count);
+      Serial.println(hb); Serial1.println(hb);
     }else if(readString.substring(0,5)=="APMAC"){
       String mac;
       mac = readString.substring(6,readString.length()-1);
@@ -2888,8 +2910,13 @@ void loop() {
     static uint8_t hop_idx = 0;
     if (millis() - last_hop >= hop_interval_ms) {
       last_hop = millis();
-      hop_idx = (hop_idx + 1) % (uint8_t)sizeof(hop_channels);
+      hop_idx = (hop_idx + 1) % (hop_count ? hop_count : 1);
       wext_set_channel(WLAN0_NAME, hop_channels[hop_idx]);
+      // Log every hop: without this there is no artifact proving which channels were actually swept,
+      // and a plan the host set is otherwise unverifiable from outside.
+      char hb[24];
+      snprintf(hb, sizeof(hb), "HOPCH:%u", (unsigned)hop_channels[hop_idx]);
+      Serial.println(hb); Serial1.println(hb);
       digitalWrite(LED_G, !digitalRead(LED_G));
     }
   }
